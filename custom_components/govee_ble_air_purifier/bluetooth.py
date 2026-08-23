@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from contextlib import suppress
 from typing import Any
@@ -33,6 +34,23 @@ def exception_detail(error: BaseException) -> str:
     return f"{type(error).__name__}: {message or repr(error)}"
 
 
+def exception_chain_detail(error: BaseException) -> str:
+    """Return the complete explicit/implicit exception chain on one line."""
+    details: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        details.append(exception_detail(current))
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif not current.__suppress_context__:
+            current = current.__context__
+        else:
+            current = None
+    return " <- ".join(details)
+
+
 class BluetoothUnavailableError(ConnectionError):
     """Raised when there is no usable Bluetooth route to the purifier."""
 
@@ -53,6 +71,7 @@ class HomeAssistantBluetoothEnvironment:
         self.address = address
         self._advertisement_event = asyncio.Event()
         self._cancel_advertisement: Callable[[], None] | None = None
+        self._last_callback_time: float | None = None
 
     async def async_start(self) -> None:
         """Listen passively for a fresh route to the configured address."""
@@ -74,6 +93,7 @@ class HomeAssistantBluetoothEnvironment:
         self._advertisement_event.set()
 
     def _advertisement_received(self, service_info: Any, *_: Any) -> None:
+        self._last_callback_time = time.monotonic()
         _LOGGER.debug(
             "Advertisement received for %s: name=%s source=%s rssi=%s "
             "connectable=%s",
@@ -122,6 +142,8 @@ class HomeAssistantBluetoothEnvironment:
                 "source": None,
                 "rssi": None,
                 "tx_power": None,
+                "advertisement_age_seconds": None,
+                "callback_age_seconds": self._callback_age(),
                 "error": exception_detail(err),
             }
         if service_info is None:
@@ -131,14 +153,32 @@ class HomeAssistantBluetoothEnvironment:
                 "source": None,
                 "rssi": None,
                 "tx_power": None,
+                "advertisement_age_seconds": None,
+                "callback_age_seconds": self._callback_age(),
             }
+        advertisement_time = getattr(service_info, "time", None)
+        advertisement_age = (
+            max(0.0, time.monotonic() - advertisement_time)
+            if isinstance(advertisement_time, int | float)
+            else None
+        )
         return {
             "present": True,
             "name": getattr(service_info, "name", None),
             "source": getattr(service_info, "source", None),
             "rssi": getattr(service_info, "rssi", None),
             "tx_power": getattr(service_info, "tx_power", None),
+            "advertisement_age_seconds": (
+                round(advertisement_age, 3) if advertisement_age is not None else None
+            ),
+            "callback_age_seconds": self._callback_age(),
         }
+
+    def _callback_age(self) -> float | None:
+        """Return seconds since this integration directly saw an advertisement."""
+        if self._last_callback_time is None:
+            return None
+        return round(max(0.0, time.monotonic() - self._last_callback_time), 3)
 
     def address_is_present(self) -> bool:
         """Return whether a connectable scanner can currently see the address."""
@@ -191,6 +231,12 @@ class GattTransport:
         self._wire_tx_count = 0
         self._wire_rx_count = 0
         self._last_error: str | None = None
+        self._connection_stage = "idle"
+        self._connection_started_at: float | None = None
+        self._stage_started_at: float | None = None
+        self._pre_return_disconnects = 0
+        self._last_disconnect_stage: str | None = None
+        self._last_disconnect_elapsed: float | None = None
 
     @property
     def generation(self) -> int:
@@ -212,7 +258,33 @@ class GattTransport:
             "wire_tx_count": self._wire_tx_count,
             "wire_rx_count": self._wire_rx_count,
             "last_error": self._last_error,
+            "connection_stage": self._connection_stage,
+            "pre_return_disconnects": self._pre_return_disconnects,
+            "last_disconnect_stage": self._last_disconnect_stage,
+            "last_disconnect_elapsed_seconds": self._last_disconnect_elapsed,
         }
+
+    def _set_stage(self, stage: str) -> None:
+        """Record the current GATT stage and its monotonic start time."""
+        self._connection_stage = stage
+        self._stage_started_at = time.monotonic()
+
+    def _elapsed(self, started_at: float | None = None) -> float:
+        """Return monotonic seconds since a connection or stage began."""
+        started = started_at
+        if started is None:
+            started = self._connection_started_at
+        if started is None:
+            return 0.0
+        return max(0.0, time.monotonic() - started)
+
+    def _failure_summary(self, error: BaseException) -> str:
+        """Describe a transport failure without hiding its stage or cause chain."""
+        return (
+            f"stage={self._connection_stage}; elapsed={self._elapsed():.3f}s; "
+            f"pre_return_disconnects={self._pre_return_disconnects}; "
+            f"cause={exception_chain_detail(error)}"
+        )
 
     def set_disconnect_callback(self, callback: DisconnectCallback | None) -> None:
         """Set the callback invoked for an unexpected current disconnect."""
@@ -224,6 +296,11 @@ class GattTransport:
         self._generation += 1
         generation = self._generation
         self._loop = asyncio.get_running_loop()
+        self._connection_started_at = time.monotonic()
+        self._pre_return_disconnects = 0
+        self._last_disconnect_stage = None
+        self._last_disconnect_elapsed = None
+        self._set_stage("establish_connection")
         self._connection_attempts += 1
         _LOGGER.debug(
             "Connecting to %s at %s: generation=%d attempt=%d timeout=%.1fs "
@@ -248,7 +325,7 @@ class GattTransport:
                     max_attempts=CONNECT_ATTEMPTS,
                 )
         except Exception as err:
-            self._last_error = exception_detail(err)
+            self._last_error = self._failure_summary(err)
             _LOGGER.debug(
                 "Bluetooth connection failed for %s at %s generation=%d: %s",
                 self.name,
@@ -267,22 +344,41 @@ class GattTransport:
                 await client.disconnect()
             raise BluetoothUnavailableError("Connection was superseded")
 
+        connector_elapsed = self._elapsed()
+        self._set_stage("resolve_characteristics")
         self._client = client
+        services = client.services
+        service_count = len(getattr(services, "services", {}))
+        _LOGGER.debug(
+            "Bluetooth connector returned for %s at %s: generation=%d "
+            "elapsed=%.3fs connected=%s services=%d "
+            "pre_return_disconnects=%d",
+            self.name,
+            device.address,
+            generation,
+            connector_elapsed,
+            client.is_connected,
+            service_count,
+            self._pre_return_disconnects,
+        )
         try:
-            self._resolve_characteristics(client.services)
+            self._resolve_characteristics(services)
         except Exception as err:
-            self._last_error = exception_detail(err)
+            self._last_error = self._failure_summary(err)
             await self.async_disconnect()
-            raise
+            raise GattTransportError(self._last_error) from err
 
         self._successful_connections += 1
         self._last_error = None
+        self._set_stage("connected")
         _LOGGER.debug(
-            "Connected to %s at %s: generation=%d successful_connections=%d",
+            "Connected to %s at %s: generation=%d successful_connections=%d "
+            "elapsed=%.3fs",
             self.name,
             device.address,
             generation,
             self._successful_connections,
+            self._elapsed(),
         )
         return generation
 
@@ -316,6 +412,7 @@ class GattTransport:
         client = self._require_client()
         generation = self._generation
         self._notification_callback = callback
+        self._set_stage("subscribe_notifications")
 
         def notification_received(_: Any, data: bytearray) -> None:
             if generation != self._generation:
@@ -348,12 +445,20 @@ class GattTransport:
                 self._notify_characteristic, notification_received
             )
         except Exception as err:
-            self._last_error = exception_detail(err)
+            self._last_error = self._failure_summary(err)
             raise GattTransportError(
                 "Unable to subscribe to notifications; "
                 f"generation={generation}; cause={self._last_error}"
             ) from err
-        _LOGGER.debug("Notification subscription active: generation=%d", generation)
+        subscribe_elapsed = self._elapsed(self._stage_started_at)
+        self._set_stage("notifications_active")
+        _LOGGER.debug(
+            "Notification subscription active: generation=%d elapsed=%.3fs "
+            "connection_elapsed=%.3fs",
+            generation,
+            subscribe_elapsed,
+            self._elapsed(),
+        )
 
     async def async_write(self, data: bytes) -> None:
         """Write one frame using ATT Write Command (without response)."""
@@ -393,6 +498,7 @@ class GattTransport:
         if client is None:
             return
 
+        self._set_stage("disconnecting")
         _LOGGER.debug(
             "Disconnecting %s: generation=%d connected=%s",
             self.name,
@@ -409,6 +515,7 @@ class GattTransport:
             self.name,
             self._generation,
         )
+        self._set_stage("disconnected")
 
     def _require_client(self) -> BleakClientWithServiceCache:
         client = self._client
@@ -419,6 +526,24 @@ class GattTransport:
     def _disconnected_from_bleak(
         self, disconnected_client: BleakClientWithServiceCache, generation: int
     ) -> None:
+        if (
+            generation == self._generation
+            and self._connection_stage == "establish_connection"
+            and self._client is None
+        ):
+            # Record this synchronously so a connector exception cannot overtake
+            # the event-loop callback and hide the failed internal connection.
+            self._pre_return_disconnects += 1
+            self._last_disconnect_stage = self._connection_stage
+            self._last_disconnect_elapsed = round(self._elapsed(), 3)
+            _LOGGER.debug(
+                "%s disconnected before establish_connection returned: "
+                "generation=%d elapsed=%.3fs count=%d",
+                self.name,
+                generation,
+                self._last_disconnect_elapsed,
+                self._pre_return_disconnects,
+            )
         loop = self._loop
         if loop is None:
             return
@@ -429,16 +554,44 @@ class GattTransport:
     def _handle_disconnected(
         self, disconnected_client: BleakClientWithServiceCache, generation: int
     ) -> None:
-        if generation != self._generation or disconnected_client is not self._client:
+        if generation != self._generation:
+            _LOGGER.debug(
+                "Ignoring disconnect callback from stale generation=%d "
+                "current_generation=%d stage=%s",
+                generation,
+                self._generation,
+                self._connection_stage,
+            )
+            return
+        if disconnected_client is not self._client:
+            _LOGGER.debug(
+                "Ignoring disconnect callback from unowned client: "
+                "generation=%d stage=%s elapsed=%.3fs",
+                generation,
+                self._connection_stage,
+                self._elapsed(),
+            )
             return
         self._client = None
         self._notification_callback = None
         self._notify_characteristic = None
         self._command_characteristic = None
+        disconnected_stage = self._connection_stage
+        disconnected_elapsed = round(self._elapsed(), 3)
+        self._last_disconnect_stage = disconnected_stage
+        self._last_disconnect_elapsed = disconnected_elapsed
+        self._last_error = (
+            f"unexpected_disconnect; stage={disconnected_stage}; "
+            f"elapsed={disconnected_elapsed:.3f}s"
+        )
+        self._set_stage("disconnected")
         _LOGGER.debug(
-            "%s disconnected unexpectedly: generation=%d wire_tx=%d wire_rx=%d",
+            "%s disconnected unexpectedly: generation=%d stage=%s "
+            "elapsed=%.3fs wire_tx=%d wire_rx=%d",
             self.name,
             generation,
+            disconnected_stage,
+            disconnected_elapsed,
             self._wire_tx_count,
             self._wire_rx_count,
         )

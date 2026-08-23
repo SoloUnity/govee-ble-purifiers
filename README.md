@@ -72,7 +72,10 @@ not replayed indefinitely.
 Connection and protocol failures always appear in Home Assistant's normal log.
 They include the failed stage, request name, retry count, number of received
 frames, unmatched-frame samples, and the underlying Bleak exception when one is
-available.
+available. Connection failures additionally report elapsed time, disconnects
+that occurred before GATT discovery returned, and both the selected and current
+Bluetooth routes. Route details include the adapter or proxy source, RSSI, and
+advertisement age so a stale route can be distinguished from a weak fresh one.
 
 For frame-by-frame diagnostics, add this to `configuration.yaml` and restart
 Home Assistant:

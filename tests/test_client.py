@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from custom_components.govee_ble_air_purifier import client as client_module
-from custom_components.govee_ble_air_purifier.bluetooth import GattTransportError
+from custom_components.govee_ble_air_purifier.bluetooth import (
+    BluetoothUnavailableError,
+    GattTransportError,
+)
 from custom_components.govee_ble_air_purifier.client import (
     CommandDeadlineExceeded,
     ReliablePurifierClient,
@@ -98,6 +102,32 @@ def test_old_generation_callbacks_are_ignored() -> None:
 
     assert client._frame_queue.empty()
     assert not client._disconnected.is_set()
+
+
+@pytest.mark.asyncio
+async def test_connection_error_surfaces_selected_and_current_routes() -> None:
+    """Normal HA errors contain the route evidence needed for diagnosis."""
+    client = make_client()
+    environment = client._environment
+    transport = client._transport
+    environment.get_connectable_device = lambda: SimpleNamespace(  # type: ignore[attr-defined,method-assign]
+        name="ihoment_H7129_TEST",
+        address=environment.address,
+    )
+    transport.set_disconnect_callback = lambda _: None  # type: ignore[attr-defined,method-assign]
+
+    async def fail_connect(_: object) -> None:
+        raise BluetoothUnavailableError("connector timed out")
+
+    transport.async_connect = fail_connect  # type: ignore[attr-defined,method-assign]
+
+    with pytest.raises(BluetoothUnavailableError) as raised:
+        await client._connect_initialize_and_run()
+
+    message = str(raised.value)
+    assert "connector timed out" in message
+    assert "selected_route={'present': True, 'source': 'test', 'rssi': -50}" in message
+    assert "current_route={'present': True, 'source': 'test', 'rssi': -50}" in message
 
 
 @pytest.mark.asyncio

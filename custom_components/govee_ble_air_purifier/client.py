@@ -309,19 +309,29 @@ class ReliablePurifierClient:
             raise BluetoothUnavailableError("No connectable advertisement is present")
 
         self.status = ClientStatus.CONNECTING
+        selected_route = self._environment.route_diagnostics()
         _LOGGER.debug(
             "Connectable device selected for cycle=%d: name=%s address=%s route=%s",
             self._connection_cycles,
             device.name,
             device.address,
-            self._environment.route_diagnostics(),
+            selected_route,
         )
         self._transport.set_disconnect_callback(
             lambda disconnected_generation: self._on_disconnected(
                 session_generation, disconnected_generation
             )
         )
-        transport_generation = await self._transport.async_connect(device)
+        try:
+            transport_generation = await self._transport.async_connect(device)
+        except (BluetoothUnavailableError, GattTransportError) as err:
+            route_summary = (
+                f"selected_route={selected_route}; "
+                f"current_route={self._environment.route_diagnostics()}"
+            )
+            if isinstance(err, BluetoothUnavailableError):
+                raise BluetoothUnavailableError(f"{err}; {route_summary}") from err
+            raise GattTransportError(f"{err}; {route_summary}") from err
         if transport_generation != self._transport.generation:
             raise GattTransportError("Connection generation changed unexpectedly")
 
