@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import re
+from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any, override
 
 import voluptuous as vol
@@ -14,28 +15,19 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import format_mac
 
 from .bluetooth import BluetoothUnavailableError
-from .const import CONF_MODEL, DOMAIN, INTEGRATION_NAME, SUPPORTED_MODELS
+from .const import CONF_MODEL, DOMAIN, INTEGRATION_NAME
 from .coordinator import GoveeDataUpdateCoordinator
 from .models import Model
 
-_MAC_WITHOUT_SEPARATORS = re.compile(r"^[0-9A-Fa-f]{12}$")
-_MAC_WITH_SEPARATORS = re.compile(
-    r"^[0-9A-Fa-f]{2}(?P<separator>[:-])"
-    r"[0-9A-Fa-f]{2}(?P=separator)"
-    r"[0-9A-Fa-f]{2}(?P=separator)"
-    r"[0-9A-Fa-f]{2}(?P=separator)"
-    r"[0-9A-Fa-f]{2}(?P=separator)[0-9A-Fa-f]{2}$"
-)
 
+@dataclass(frozen=True, slots=True)
+class DiscoveredPurifier:
+    """A supported connectable purifier currently known to Home Assistant."""
 
-def _normalize_address(value: str) -> str:
-    """Validate a MAC and return Home Assistant's transport-facing form."""
-    address = value.strip()
-    if _MAC_WITH_SEPARATORS.fullmatch(address):
-        address = address.replace("-", "").replace(":", "")
-    elif not _MAC_WITHOUT_SEPARATORS.fullmatch(address):
-        raise ValueError("Invalid Bluetooth address")
-    return format_mac(address).upper()
+    address: str
+    name: str
+    model: str
+    rssi: int
 
 
 def _unique_id_from_address(address: str) -> str:
@@ -44,11 +36,50 @@ def _unique_id_from_address(address: str) -> str:
 
 
 def _model_from_name(name: str | None) -> str | None:
-    """Infer a supported model only when it is present in the local name."""
+    """Infer a model from the two documented purifier name families."""
     if not name:
         return None
     normalized = name.upper()
-    return next((model for model in SUPPORTED_MODELS if model in normalized), None)
+    if normalized.startswith("GVH7124"):
+        return Model.H7124.value
+    if normalized.startswith("IHOMENT_H7129_"):
+        return Model.H7129.value
+    return None
+
+
+def _discover_purifiers(
+    service_infos: Iterable[BluetoothServiceInfoBleak],
+) -> tuple[DiscoveredPurifier, ...]:
+    """Return supported discoveries ordered from strongest to weakest signal."""
+    discovered = []
+    for service_info in service_infos:
+        model = _model_from_name(service_info.name)
+        if model is None or not service_info.connectable:
+            continue
+        discovered.append(
+            DiscoveredPurifier(
+                address=service_info.address,
+                name=service_info.name,
+                model=model,
+                rssi=service_info.rssi,
+            )
+        )
+    return tuple(
+        sorted(
+            discovered,
+            key=lambda device: (-device.rssi, device.name, device.address),
+        )
+    )
+
+
+def _discovery_options(
+    discoveries: tuple[DiscoveredPurifier, ...],
+) -> dict[str, str]:
+    """Build address-backed labels without exposing addresses to the user."""
+    return {
+        device.address: f"{device.name} ({'Near' if index == 0 else 'Far'})"
+        for index, device in enumerate(discoveries)
+    }
 
 
 async def _async_validate_purifier(
@@ -88,12 +119,15 @@ class GoveeBleAirPurifierConfigFlow(ConfigFlow, domain=DOMAIN):
         """Handle a connectable Bluetooth discovery."""
         if not discovery_info.connectable:
             return self.async_abort(reason="not_connectable")
+        model = _model_from_name(discovery_info.name)
+        if model is None:
+            return self.async_abort(reason="unsupported_device")
         address = discovery_info.address
         await self.async_set_unique_id(_unique_id_from_address(address))
         self._abort_if_unique_id_configured()
 
         self._discovery_info = discovery_info
-        self._discovered_model = _model_from_name(discovery_info.name)
+        self._discovered_model = model
         self.context["title_placeholders"] = {
             "name": discovery_info.name or INTEGRATION_NAME
         }
@@ -105,10 +139,12 @@ class GoveeBleAirPurifierConfigFlow(ConfigFlow, domain=DOMAIN):
         """Confirm a purifier found by Bluetooth."""
         if self._discovery_info is None:
             return self.async_abort(reason="discovery_expired")
+        if self._discovered_model is None:
+            return self.async_abort(reason="unsupported_device")
 
         errors: dict[str, str] = {}
         if user_input is not None:
-            model = self._discovered_model or user_input[CONF_MODEL]
+            model = self._discovered_model
             address = self._discovery_info.address
             try:
                 await _async_validate_purifier(
@@ -125,15 +161,11 @@ class GoveeBleAirPurifierConfigFlow(ConfigFlow, domain=DOMAIN):
                     data={CONF_ADDRESS: address, CONF_MODEL: model},
                 )
 
-        schema = vol.Schema({})
-        if self._discovered_model is None:
-            schema = vol.Schema({vol.Required(CONF_MODEL): vol.In(SUPPORTED_MODELS)})
-        else:
-            self._set_confirm_only()
+        self._set_confirm_only()
 
         return self.async_show_form(
             step_id="bluetooth_confirm",
-            data_schema=schema,
+            data_schema=vol.Schema({}),
             description_placeholders={
                 "name": self._discovery_info.name or INTEGRATION_NAME,
             },
@@ -144,15 +176,35 @@ class GoveeBleAirPurifierConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Set up a currently discoverable purifier manually."""
+        """Choose a currently discovered purifier without entering an address."""
         errors: dict[str, str] = {}
-        normalized_input: dict[str, Any] = user_input or {}
+        configured_ids = {
+            entry.unique_id
+            for entry in self._async_current_entries()
+            if entry.unique_id is not None
+        }
+        discoveries = tuple(
+            device
+            for device in _discover_purifiers(
+                bluetooth.async_discovered_service_info(
+                    self.hass,
+                    connectable=True,
+                )
+            )
+            if _unique_id_from_address(device.address) not in configured_ids
+        )
+
+        if not discoveries:
+            return self.async_abort(reason="no_devices_found")
 
         if user_input is not None:
-            try:
-                address = _normalize_address(user_input[CONF_ADDRESS])
-            except ValueError:
-                errors[CONF_ADDRESS] = "invalid_address"
+            address = user_input[CONF_ADDRESS]
+            discovery = next(
+                (device for device in discoveries if device.address == address),
+                None,
+            )
+            if discovery is None:
+                errors["base"] = "not_discovered"
             else:
                 device = bluetooth.async_ble_device_from_address(
                     self.hass, address, connectable=True
@@ -160,43 +212,35 @@ class GoveeBleAirPurifierConfigFlow(ConfigFlow, domain=DOMAIN):
                 if device is None:
                     errors["base"] = "not_discovered"
                 else:
-                    model = user_input[CONF_MODEL]
                     await self.async_set_unique_id(_unique_id_from_address(address))
                     self._abort_if_unique_id_configured()
                     try:
                         await _async_validate_purifier(
                             self.hass,
                             address=address,
-                            model=model,
-                            name=device.name,
+                            model=discovery.model,
+                            name=discovery.name,
                         )
                     except BluetoothUnavailableError:
                         errors["base"] = "cannot_connect"
                     else:
                         return self.async_create_entry(
-                            title=device.name or f"Govee {model}",
-                            data={CONF_ADDRESS: address, CONF_MODEL: model},
+                            title=discovery.name,
+                            data={
+                                CONF_ADDRESS: address,
+                                CONF_MODEL: discovery.model,
+                            },
                         )
 
-            normalized_input = {**user_input}
-            if CONF_ADDRESS not in errors:
-                normalized_input[CONF_ADDRESS] = address
-
-        address_field = (
-            vol.Required(CONF_ADDRESS, default=normalized_input[CONF_ADDRESS])
-            if normalized_input.get(CONF_ADDRESS)
-            else vol.Required(CONF_ADDRESS)
-        )
+        options = _discovery_options(discoveries)
+        address_field = vol.Required(CONF_ADDRESS)
+        if user_input is not None and user_input[CONF_ADDRESS] in options:
+            address_field = vol.Required(
+                CONF_ADDRESS,
+                default=user_input[CONF_ADDRESS],
+            )
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
-                {
-                    address_field: str,
-                    vol.Required(
-                        CONF_MODEL,
-                        default=normalized_input.get(CONF_MODEL, SUPPORTED_MODELS[0]),
-                    ): vol.In(SUPPORTED_MODELS),
-                }
-            ),
+            data_schema=vol.Schema({address_field: vol.In(options)}),
             errors=errors,
         )

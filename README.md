@@ -26,18 +26,19 @@ negotiates a fresh encrypted session for every Bluetooth connection.
    category.
 2. Download **Govee BLE Air Purifier**.
 3. Restart Home Assistant.
-4. Go to **Settings > Devices & services > Add integration** and select
-   **Govee BLE Air Purifier**.
+4. Home Assistant should discover nearby supported purifiers automatically. You
+   can also go to **Settings > Devices & services > Add integration**, select
+   **Govee BLE Air Purifier**, and choose a discovered purifier from the list.
 
 The purifier must be visible to a connectable Home Assistant Bluetooth adapter
 or Bluetooth proxy during setup. Close the Govee app before setup because the
 purifier permits only one Bluetooth central connection at a time.
 
-The captured protocol does not establish a safe advertisement signature, so
-the first release intentionally asks for the Bluetooth MAC address and exact
-model. It does not claim unrelated Govee advertisements through an overly broad
-manifest matcher. The config flow already supports Bluetooth confirmation for a
-future narrow matcher once one is verified.
+The integration matches the observed advertised-name families `GVH7124*` and
+`ihoment_H7129_*`; the model is inferred from that name. Manual setup never asks
+for a Bluetooth address. It lists unconfigured discoveries by advertised name,
+labels the strongest current signal **Near**, and labels the remaining devices
+**Far**. The address is retained internally only as the stable device identity.
 
 ## Data updates
 

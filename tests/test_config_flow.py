@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant
@@ -12,8 +13,9 @@ from homeassistant.data_entry_flow import FlowResultType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.govee_ble_air_purifier.config_flow import (
+    _discover_purifiers,
+    _discovery_options,
     _model_from_name,
-    _normalize_address,
 )
 from custom_components.govee_ble_air_purifier.const import CONF_MODEL, DOMAIN
 
@@ -42,21 +44,41 @@ def _prepare_bluetooth_test_environment(
 pytestmark = pytest.mark.usefixtures("enable_custom_integrations")
 
 
-async def test_user_flow_creates_one_entry_per_address(
+def _service_info(
+    name: str,
+    address: str,
+    rssi: int,
+    *,
+    connectable: bool = True,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        name=name,
+        address=address,
+        rssi=rssi,
+        connectable=connectable,
+    )
+
+
+async def test_user_flow_selects_discovered_purifier_without_address_entry(
     hass: HomeAssistant,
 ) -> None:
-    """A visible connectable purifier creates an address-keyed entry."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    """Manual setup chooses a named discovery and infers its model."""
+    discovery = _service_info(
+        "ihoment_H7129_BEDROOM",
+        "AA:BB:CC:DD:EE:FF",
+        -48,
     )
-    assert result["type"] is FlowResultType.FORM
 
-    device = SimpleNamespace(name="Govee H7129")
     with (
+        patch(
+            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "async_discovered_service_info",
+            return_value=(discovery,),
+        ),
         patch(
             "custom_components.govee_ble_air_purifier.config_flow."
             "bluetooth.async_ble_device_from_address",
-            return_value=device,
+            return_value=SimpleNamespace(name=discovery.name),
         ),
         patch(
             "custom_components.govee_ble_air_purifier.config_flow."
@@ -64,43 +86,54 @@ async def test_user_flow_creates_one_entry_per_address(
             new_callable=AsyncMock,
         ) as validate,
     ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+        assert result["type"] is FlowResultType.FORM
+        assert result["data_schema"]({CONF_ADDRESS: discovery.address}) == {
+            CONF_ADDRESS: discovery.address
+        }
+        with pytest.raises(vol.Invalid):
+            result["data_schema"]({CONF_ADDRESS: "00:00:00:00:00:00"})
+
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
-            {CONF_ADDRESS: "AA-BB-CC-DD-EE-FF", CONF_MODEL: "H7129"},
+            {CONF_ADDRESS: discovery.address},
         )
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert result["title"] == "Govee H7129"
+    assert result["title"] == discovery.name
     assert result["data"] == {
-        CONF_ADDRESS: "AA:BB:CC:DD:EE:FF",
+        CONF_ADDRESS: discovery.address,
         CONF_MODEL: "H7129",
     }
-    validate.assert_awaited_once()
+    validate.assert_awaited_once_with(
+        hass,
+        address=discovery.address,
+        model="H7129",
+        name=discovery.name,
+    )
 
 
-async def test_user_flow_requires_current_connectable_discovery(
+async def test_user_flow_aborts_when_no_supported_device_is_visible(
     hass: HomeAssistant,
 ) -> None:
-    """Manual setup does not store an unreachable address."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    """Manual setup never falls back to a typed Bluetooth address."""
     with patch(
-        "custom_components.govee_ble_air_purifier.config_flow."
-        "bluetooth.async_ble_device_from_address",
-        return_value=None,
+        "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+        "async_discovered_service_info",
+        return_value=(),
     ):
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {CONF_ADDRESS: "AA:BB:CC:DD:EE:FF", CONF_MODEL: "H7124"},
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
         )
 
-    assert result["type"] is FlowResultType.FORM
-    assert result["errors"] == {"base": "not_discovered"}
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "no_devices_found"
 
 
-async def test_duplicate_address_is_aborted(hass: HomeAssistant) -> None:
-    """A normalized address can belong to only one config entry."""
+async def test_duplicate_bluetooth_discovery_is_aborted(hass: HomeAssistant) -> None:
+    """A discovered address can belong to only one config entry."""
     entry = MockConfigEntry(
         domain=DOMAIN,
         unique_id="aa:bb:cc:dd:ee:ff",
@@ -108,18 +141,15 @@ async def test_duplicate_address_is_aborted(hass: HomeAssistant) -> None:
     )
     entry.add_to_hass(hass)
 
+    discovery = MagicMock()
+    discovery.address = "AA:BB:CC:DD:EE:FF"
+    discovery.name = "GVH7124ABCD"
+    discovery.connectable = True
     result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
+        DOMAIN,
+        context={"source": config_entries.SOURCE_BLUETOOTH},
+        data=discovery,
     )
-    with patch(
-        "custom_components.govee_ble_air_purifier.config_flow."
-        "bluetooth.async_ble_device_from_address",
-        return_value=SimpleNamespace(name="Govee H7124"),
-    ):
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {CONF_ADDRESS: "AABBCCDDEEFF", CONF_MODEL: "H7124"},
-        )
 
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "already_configured"
@@ -131,7 +161,7 @@ async def test_bluetooth_flow_confirms_and_infers_model(
     """A narrow future Bluetooth matcher can use the confirmation flow."""
     discovery = MagicMock()
     discovery.address = "AA:BB:CC:DD:EE:FF"
-    discovery.name = "Govee H7129 ABCD"
+    discovery.name = "ihoment_H7129_ABCD"
     discovery.connectable = True
 
     with patch(
@@ -154,8 +184,29 @@ async def test_bluetooth_flow_confirms_and_infers_model(
     assert result["data"][CONF_ADDRESS] == "AA:BB:CC:DD:EE:FF"
 
 
-def test_address_and_model_normalization() -> None:
-    """Stable addresses and conservative name inference are deterministic."""
-    assert _normalize_address("AA-BB-CC-DD-EE-FF") == "AA:BB:CC:DD:EE:FF"
-    assert _model_from_name("Govee H7124 1234") == "H7124"
+def test_model_inference_accepts_only_supported_advertised_names() -> None:
+    """Model inference follows the two narrow manifest matcher families."""
+    assert _model_from_name("GVH7124ABCD") == "H7124"
+    assert _model_from_name("ihoment_H7129_ABCD") == "H7129"
+    assert _model_from_name("Govee H7124 1234") is None
     assert _model_from_name("Generic Govee device") is None
+
+
+def test_discovery_options_rank_near_and_far_without_showing_addresses() -> None:
+    """The strongest device is Near and Bluetooth addresses stay hidden."""
+    discoveries = _discover_purifiers(
+        (
+            _service_info("ihoment_H7129_BASEMENT", "22:22:22:22:22:22", -82),
+            _service_info("GVH7124BEDROOM", "11:11:11:11:11:11", -41),
+            _service_info("Other device", "33:33:33:33:33:33", -20),
+        )
+    )
+
+    assert [device.name for device in discoveries] == [
+        "GVH7124BEDROOM",
+        "ihoment_H7129_BASEMENT",
+    ]
+    assert _discovery_options(discoveries) == {
+        "11:11:11:11:11:11": "GVH7124BEDROOM (Near)",
+        "22:22:22:22:22:22": "ihoment_H7129_BASEMENT (Far)",
+    }

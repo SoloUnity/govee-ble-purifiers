@@ -4,36 +4,29 @@
     "step": {
       "user": {
         "title": "Add a Govee BLE air purifier",
-        "description": "Enter the Bluetooth address of a purifier that Home Assistant can currently see. Close the Govee app first because the purifier accepts only one Bluetooth connection.",
+        "description": "Choose a purifier currently visible to a connectable Home Assistant Bluetooth adapter or proxy. Near is the device with the strongest current signal. Close the Govee app first because the purifier accepts only one Bluetooth connection.",
         "data": {
-          "address": "Bluetooth address",
-          "model": "Model"
+          "address": "Purifier"
         },
         "data_description": {
-          "address": "The purifier's Bluetooth MAC address, for example AA:BB:CC:DD:EE:FF.",
-          "model": "Select the exact model printed on the purifier."
+          "address": "Select the purifier you want Home Assistant to configure."
         }
       },
       "bluetooth_confirm": {
         "title": "Add {name}",
-        "description": "Set up this nearby Govee BLE air purifier? Close the Govee app first because the purifier accepts only one Bluetooth connection.",
-        "data": {
-          "model": "Model"
-        },
-        "data_description": {
-          "model": "Select the exact model printed on the purifier when it cannot be determined from the advertised name."
-        }
+        "description": "Set up this nearby Govee BLE air purifier? Close the Govee app first because the purifier accepts only one Bluetooth connection."
       }
     },
     "error": {
       "cannot_connect": "Could not connect to and initialize the purifier. Make sure it is powered on, in Bluetooth range, and not connected to the Govee app.",
-      "invalid_address": "Enter a valid Bluetooth MAC address.",
       "not_discovered": "Home Assistant cannot currently see this purifier from a connectable Bluetooth adapter or proxy."
     },
     "abort": {
       "already_configured": "This purifier is already configured.",
       "discovery_expired": "The Bluetooth discovery is no longer available.",
-      "not_connectable": "This discovery did not come from a Bluetooth adapter or proxy that can connect to the purifier."
+      "no_devices_found": "No unconfigured Govee H7124 or H7129 air purifiers are currently visible. Make sure the purifier is powered on, in range, and disconnected from the Govee app.",
+      "not_connectable": "This discovery did not come from a Bluetooth adapter or proxy that can connect to the purifier.",
+      "unsupported_device": "The discovered Bluetooth device does not advertise as a supported Govee H7124 or H7129 purifier."
     }
   },
   "entity": {
