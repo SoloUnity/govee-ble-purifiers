@@ -94,6 +94,23 @@ deliberately never logged; decrypted application frames are available at debug
 level. Debug output can contain Bluetooth addresses and device-specific metadata,
 so redact those before posting logs publicly.
 
+## PacketLogger trace extraction
+
+Apple PacketLogger `.pklg` files can be reduced to purifier advertisements,
+connection setup, GATT discovery, and ATT traffic with the included extractor:
+
+```bash
+python3 scripts/extract_air_purifier_trace.py \
+  --model h7129 \
+  --address 5C:E7:53:F9:6A:7D \
+  --output h7129-extract.txt \
+  "/path/to/H7129 Negotiation.pklg"
+```
+
+The source capture is read-only. The output retains original PacketLogger
+record numbers, absolute and connection-relative timestamps, direction,
+connection handle, L2CAP channel, decoded ATT operation, and raw bytes.
+
 ## Removal
 
 Remove the purifier under **Settings > Devices & services**, then remove the
