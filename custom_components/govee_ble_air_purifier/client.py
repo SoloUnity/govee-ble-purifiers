@@ -578,18 +578,18 @@ class ReliablePurifierClient:
 
         frame_task = asyncio.create_task(self._frame_queue.get())
         disconnect_task = asyncio.create_task(self._disconnected.wait())
-        done, pending = await asyncio.wait(
-            (frame_task, disconnect_task),
-            timeout=remaining,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for task in pending:
-            task.cancel()
-        for task in pending:
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        tasks = (frame_task, disconnect_task)
+        try:
+            done, _ = await asyncio.wait(
+                tasks,
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         if not done:
             raise TimeoutError
@@ -603,18 +603,18 @@ class ReliablePurifierClient:
         frame_task = asyncio.create_task(self._frame_queue.get())
         operation_task = asyncio.create_task(self._operation_event.wait())
         disconnect_task = asyncio.create_task(self._disconnected.wait())
-        done, pending = await asyncio.wait(
-            (frame_task, operation_task, disconnect_task),
-            timeout=timeout,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for task in pending:
-            task.cancel()
-        for task in pending:
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        tasks = (frame_task, operation_task, disconnect_task)
+        try:
+            done, _ = await asyncio.wait(
+                tasks,
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         if disconnect_task in done and disconnect_task.result():
             raise GattTransportError("Purifier disconnected")

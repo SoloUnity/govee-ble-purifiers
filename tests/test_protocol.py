@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from custom_components.govee_ble_air_purifier.frame import build_frame
+from custom_components.govee_ble_air_purifier.frame import FrameError, build_frame
 from custom_components.govee_ble_air_purifier.models import (
     AirQualityEvent,
     DeviceProfile,
@@ -130,7 +130,9 @@ def test_initialization_and_refresh_order() -> None:
     assert len(h7129_requests) == 24
     for descriptor, prefix in zip(h7124_requests, base_prefixes, strict=True):
         assert descriptor.frame.hex().startswith(prefix)
-    assert h7129_requests[:23] == h7124_requests
+    assert tuple(request.frame for request in h7129_requests[:23]) == tuple(
+        request.frame for request in h7124_requests
+    )
     assert h7129_requests[23].frame == bytes.fromhex(
         "ab 02 02 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 aa"
     )
@@ -186,17 +188,50 @@ def test_unrelated_notification_does_not_complete_transaction() -> None:
     assert matcher.feed(build_frame(b"\xaa\x05\x00")) is MatchResult.COMPLETE
 
 
-def test_zero_payload_and_exact_echo_boundaries() -> None:
+def test_capability_value_zero_payload_and_exact_echo_boundaries() -> None:
     """Capability requests use their documented single-response boundaries."""
 
     requests = _protocol().initialization_requests()
-    zero_payload = _protocol().new_response_matcher(requests[0])
+    b2_value = _protocol().new_response_matcher(requests[0])
+    b2_zero = _protocol().new_response_matcher(requests[0])
     exact_echo = _protocol().new_response_matcher(requests[8])
 
-    assert zero_payload.feed(build_frame(b"\x33\xb2\x01")) is MatchResult.IGNORED
-    assert zero_payload.feed(build_frame(b"\x33\xb2")) is MatchResult.COMPLETE
+    observed_b2 = bytes.fromhex(
+        "33 b2 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 80"
+    )
+    assert b2_value.feed(observed_b2) is MatchResult.COMPLETE
+    assert b2_zero.feed(build_frame(b"\x33\xb2")) is MatchResult.COMPLETE
     assert exact_echo.feed(build_frame(b"\xaa\x1e\x01\x03")) is MatchResult.IGNORED
     assert exact_echo.feed(requests[8].frame) is MatchResult.COMPLETE
+
+
+def test_capability_b2_rejects_unobserved_response_shapes() -> None:
+    """The physical finding does not broaden matching beyond its known shape."""
+
+    descriptor = _protocol().initialization_requests()[0]
+
+    wrong_prefix = _protocol().new_response_matcher(descriptor)
+    unknown_value = _protocol().new_response_matcher(descriptor)
+    nonzero_tail = _protocol().new_response_matcher(descriptor)
+
+    assert wrong_prefix.feed(build_frame(b"\x33\xb5\x01")) is MatchResult.IGNORED
+    assert unknown_value.feed(build_frame(b"\x33\xb2\x02")) is MatchResult.IGNORED
+    assert nonzero_tail.feed(build_frame(b"\x33\xb2\x01\x01")) is MatchResult.IGNORED
+
+    invalid_checksum = bytearray(build_frame(b"\x33\xb2\x01"))
+    invalid_checksum[-1] ^= 0x01
+    with pytest.raises(FrameError):
+        _protocol().new_response_matcher(descriptor).feed(invalid_checksum)
+
+
+def test_h7129_capability_b2_rule_is_unchanged() -> None:
+    """The physical H7124 finding does not alter the H7129 response boundary."""
+
+    protocol = _protocol(Model.H7129)
+    descriptor = protocol.initialization_requests()[0]
+    matcher = protocol.new_response_matcher(descriptor)
+
+    assert matcher.feed(build_frame(b"\x33\xb2\x01")) is MatchResult.IGNORED
 
 
 def test_power_confirmation_waits_for_applied_aa01_state() -> None:

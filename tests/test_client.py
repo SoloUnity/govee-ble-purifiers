@@ -119,6 +119,42 @@ async def test_current_disconnect_interrupts_transaction_immediately() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancelling_transaction_wait_cleans_up_child_tasks() -> None:
+    """Shutdown cannot leave Queue.get or Event.wait tasks pending."""
+    client = make_client()
+    before = set(asyncio.all_tasks())
+    wait_task = asyncio.create_task(
+        client._async_next_transaction_frame(asyncio.get_running_loop().time() + 60)
+    )
+    await asyncio.sleep(0)
+    child_tasks = set(asyncio.all_tasks()) - before - {wait_task}
+    assert len(child_tasks) == 2
+
+    wait_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await wait_task
+
+    assert all(task.done() for task in child_tasks)
+
+
+@pytest.mark.asyncio
+async def test_cancelling_idle_wait_cleans_up_child_tasks() -> None:
+    """Idle-loop cancellation cleans up all three temporary wait tasks."""
+    client = make_client()
+    before = set(asyncio.all_tasks())
+    wait_task = asyncio.create_task(client._async_wait_for_ready_work(60))
+    await asyncio.sleep(0)
+    child_tasks = set(asyncio.all_tasks()) - before - {wait_task}
+    assert len(child_tasks) == 3
+
+    wait_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await wait_task
+
+    assert all(task.done() for task in child_tasks)
+
+
+@pytest.mark.asyncio
 async def test_connection_loop_retries_after_link_failure() -> None:
     """A failed connection cycle becomes unavailable, backs off, and retries."""
     client = make_client()
