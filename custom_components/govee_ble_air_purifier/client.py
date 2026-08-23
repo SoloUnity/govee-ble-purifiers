@@ -1,0 +1,630 @@
+"""Reliable, serialized purifier client for unreliable BLE links."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import random
+from collections import deque
+from collections.abc import Callable
+from contextlib import suppress
+from dataclasses import dataclass, replace
+from enum import Enum
+
+from .bluetooth import (
+    BluetoothUnavailableError,
+    GattTransport,
+    GattTransportError,
+    HomeAssistantBluetoothEnvironment,
+)
+from .channel import (
+    ChannelError,
+    H7129SessionChannel,
+    PlaintextChannel,
+    SecureChannel,
+)
+from .models import (
+    AirQualityEvent,
+    DeviceProfile,
+    DeviceStateEvent,
+    FanModeEvent,
+    Model,
+    NightLightColorEvent,
+    NightLightStateEvent,
+    ProtocolCommand,
+    PurifierState,
+    RefreshRequestedEvent,
+    SecurityMode,
+    SetFanMode,
+    SetNightLightBrightness,
+    SetNightLightColor,
+    SetNightLightPower,
+    SetPower,
+)
+from .protocol import GoveePurifierProtocol, MatchResult, RequestDescriptor
+
+_LOGGER = logging.getLogger(__name__)
+
+POLL_INTERVAL = 3.0
+H7124_INITIAL_POLL_DELAY = 1.936
+TRANSACTION_TIMEOUT = 3.0
+INITIALIZATION_ATTEMPTS = 2
+COMMAND_DEADLINE = 30.0
+COMMAND_SEND_ATTEMPTS = 3
+STARTUP_TIMEOUT = 35.0
+BETWEEN_REQUEST_DELAY = 0.001
+BACKOFF_MIN = 1.0
+BACKOFF_MAX = 60.0
+BACKOFF_RESET_AFTER = 30.0
+
+StateCallback = Callable[[PurifierState], None]
+AvailabilityCallback = Callable[[bool, Exception | None], None]
+
+
+class ClientStatus(str, Enum):
+    """Operational state of the long-running purifier client."""
+
+    STOPPED = "stopped"
+    WAITING_FOR_ADVERTISEMENT = "waiting_for_advertisement"
+    CONNECTING = "connecting"
+    SUBSCRIBING = "subscribing"
+    NEGOTIATING = "negotiating"
+    INITIALIZING = "initializing"
+    READY = "ready"
+    BACKOFF = "backoff"
+
+
+class PurifierClientError(ConnectionError):
+    """Base class for reliable-client errors."""
+
+
+class TransactionTimeoutError(PurifierClientError):
+    """Raised when the device does not complete a request in time."""
+
+
+class CommandDeadlineExceeded(PurifierClientError):
+    """Raised when a control could not be confirmed within its bounded window."""
+
+
+class CommandSuperseded(PurifierClientError):
+    """Raised when a newer pending control replaces an older one."""
+
+
+@dataclass(slots=True)
+class _Operation:
+    command: ProtocolCommand
+    future: asyncio.Future[None]
+    deadline: float
+    send_attempts: int = 0
+
+
+class ReliablePurifierClient:
+    """Own connection recovery, one-in-flight transactions, and cached state."""
+
+    def __init__(
+        self,
+        *,
+        environment: HomeAssistantBluetoothEnvironment,
+        transport: GattTransport,
+        protocol: GoveePurifierProtocol,
+        profile: DeviceProfile,
+        state_callback: StateCallback,
+        availability_callback: AvailabilityCallback,
+    ) -> None:
+        self._environment = environment
+        self._transport = transport
+        self._protocol = protocol
+        self._profile = profile
+        self._state_callback = state_callback
+        self._availability_callback = availability_callback
+
+        self.state = PurifierState()
+        self.status = ClientStatus.STOPPED
+        self._channel: SecureChannel | None = None
+        self._runner: asyncio.Task[None] | None = None
+        self._stopping = asyncio.Event()
+        self._disconnected = asyncio.Event()
+        self._frame_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._operations: deque[_Operation] = deque()
+        self._active_operation: _Operation | None = None
+        self._operation_event = asyncio.Event()
+        self._first_ready: asyncio.Future[None] | None = None
+        self._session_generation = 0
+        self._refresh_pending = False
+        self._refresh_running = False
+        self._next_poll_due = 0.0
+        self._ready_since: float | None = None
+
+    @property
+    def is_ready(self) -> bool:
+        return self.status is ClientStatus.READY
+
+    async def async_start(self) -> None:
+        """Start recovery and wait for the first complete initialization."""
+        if self._runner is not None:
+            return
+
+        self._stopping.clear()
+        self._first_ready = asyncio.get_running_loop().create_future()
+        await self._environment.async_start()
+        self._runner = asyncio.create_task(
+            self._run(), name=f"govee-purifier-{self._environment.address}"
+        )
+        try:
+            async with asyncio.timeout(STARTUP_TIMEOUT):
+                await asyncio.shield(self._first_ready)
+        except asyncio.CancelledError:
+            await self.async_shutdown()
+            raise
+        except Exception as err:
+            # Cancel only after a bounded setup window. Home Assistant may then
+            # retry the config entry instead of leaving a hidden task behind.
+            await self.async_shutdown()
+            raise BluetoothUnavailableError(
+                f"Purifier {self._environment.address} did not become ready"
+            ) from err
+
+    async def async_shutdown(self) -> None:
+        """Stop recovery, fail outstanding controls, and release BLE resources."""
+        self._stopping.set()
+        self._operation_event.set()
+        active_operation = self._active_operation
+        runner = self._runner
+        self._runner = None
+        if runner is not None:
+            runner.cancel()
+            try:
+                await runner
+            except asyncio.CancelledError:
+                pass
+
+        channel = self._channel
+        self._channel = None
+        if channel is not None:
+            channel.invalidate()
+        await self._transport.async_disconnect()
+        await self._environment.async_stop()
+        if active_operation is not None and not active_operation.future.done():
+            active_operation.future.set_exception(
+                PurifierClientError("Purifier client stopped")
+            )
+        self._fail_all_operations(PurifierClientError("Purifier client stopped"))
+        self._set_available(False, None)
+        self.status = ClientStatus.STOPPED
+
+    async def async_execute(self, command: ProtocolCommand) -> None:
+        """Execute one absolute control within a bounded recovery window."""
+        if self._runner is None:
+            raise PurifierClientError("Purifier client is not running")
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[None] = loop.create_future()
+        operation = _Operation(command, future, loop.time() + COMMAND_DEADLINE)
+        self._coalesce_pending(operation)
+        self._operations.append(operation)
+        self._operation_event.set()
+
+        try:
+            async with asyncio.timeout(COMMAND_DEADLINE):
+                await asyncio.shield(future)
+        except TimeoutError as err:
+            if not future.done():
+                future.cancel()
+            with suppress(ValueError):
+                self._operations.remove(operation)
+            raise CommandDeadlineExceeded(
+                f"Command was not confirmed within {COMMAND_DEADLINE:.0f} seconds"
+            ) from err
+        except asyncio.CancelledError:
+            if not future.done():
+                future.cancel()
+            with suppress(ValueError):
+                self._operations.remove(operation)
+            raise
+
+    async def _run(self) -> None:
+        backoff = BACKOFF_MIN
+        while not self._stopping.is_set():
+            try:
+                await self._connect_initialize_and_run()
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                _LOGGER.debug(
+                    "Purifier connection cycle failed: %s", err, exc_info=True
+                )
+                stable_for = (
+                    asyncio.get_running_loop().time() - self._ready_since
+                    if self._ready_since is not None
+                    else 0.0
+                )
+                if stable_for >= BACKOFF_RESET_AFTER:
+                    backoff = BACKOFF_MIN
+                self._set_available(False, err)
+            finally:
+                self._ready_since = None
+                channel = self._channel
+                self._channel = None
+                if channel is not None:
+                    channel.invalidate()
+                await self._transport.async_disconnect()
+
+            if self._stopping.is_set():
+                break
+            self.status = ClientStatus.BACKOFF
+            await self._async_backoff(backoff)
+            backoff = min(BACKOFF_MAX, backoff * 2)
+
+    async def _connect_initialize_and_run(self) -> None:
+        self._session_generation += 1
+        session_generation = self._session_generation
+        self._disconnected.clear()
+        self._drain_frame_queue()
+        self._refresh_pending = False
+        self._refresh_running = False
+        self._invalidate_connection_scoped_state()
+
+        self.status = ClientStatus.WAITING_FOR_ADVERTISEMENT
+        device = self._environment.get_connectable_device()
+        if device is None:
+            device = await self._environment.async_wait_for_device(BACKOFF_MIN)
+        if device is None:
+            raise BluetoothUnavailableError("No connectable advertisement is present")
+
+        self.status = ClientStatus.CONNECTING
+        self._transport.set_disconnect_callback(
+            lambda disconnected_generation: self._on_disconnected(
+                session_generation, disconnected_generation
+            )
+        )
+        transport_generation = await self._transport.async_connect(device)
+        if transport_generation != self._transport.generation:
+            raise GattTransportError("Connection generation changed unexpectedly")
+
+        def callback(frame: bytes) -> None:
+            self._on_plaintext_frame(session_generation, frame)
+
+        if self._profile.security is SecurityMode.H7129_SESSION:
+            self.status = ClientStatus.NEGOTIATING
+            channel: SecureChannel = H7129SessionChannel(self._transport, callback)
+        else:
+            self.status = ClientStatus.SUBSCRIBING
+            channel = PlaintextChannel(self._transport, callback)
+        self._channel = channel
+        await channel.async_establish()
+
+        self.status = ClientStatus.INITIALIZING
+        await self._async_run_sweep(
+            self._protocol.initialization_requests(),
+            attempts=INITIALIZATION_ATTEMPTS,
+        )
+
+        self.status = ClientStatus.READY
+        loop = asyncio.get_running_loop()
+        self._ready_since = loop.time()
+        initial_poll_delay = (
+            H7124_INITIAL_POLL_DELAY
+            if self._profile.model is Model.H7124
+            else POLL_INTERVAL
+        )
+        self._next_poll_due = loop.time() + initial_poll_delay
+        self._set_available(True, None)
+        if self._first_ready is not None and not self._first_ready.done():
+            self._first_ready.set_result(None)
+        await self._async_ready_loop()
+
+    async def _async_ready_loop(self) -> None:
+        while not self._stopping.is_set():
+            self._discard_expired_operations()
+
+            if self._operations:
+                operation = self._operations.popleft()
+                self._active_operation = operation
+                try:
+                    await self._async_execute_operation(operation)
+                finally:
+                    self._active_operation = None
+                continue
+
+            if self._refresh_pending:
+                # An idle ee-aa capture began its refresh at about +1 ms.
+                await asyncio.sleep(BETWEEN_REQUEST_DELAY)
+                await self._async_run_sweep(
+                    self._protocol.refresh_requests(),
+                    attempts=1,
+                    is_refresh=True,
+                )
+                continue
+
+            loop = asyncio.get_running_loop()
+            if loop.time() >= self._next_poll_due:
+                await self._async_execute_descriptor(
+                    self._protocol.device_state_poll(),
+                    attempts=1,
+                    is_periodic_poll=True,
+                )
+                continue
+
+            await self._async_wait_for_ready_work(
+                max(0.0, self._next_poll_due - loop.time())
+            )
+
+    async def _async_execute_operation(self, operation: _Operation) -> None:
+        if operation.future.done():
+            return
+        loop = asyncio.get_running_loop()
+        if loop.time() >= operation.deadline:
+            operation.future.set_exception(CommandDeadlineExceeded())
+            return
+
+        # Initialization after every reconnect re-queries the relevant state.
+        # If an ambiguous previous write was actually applied, do not replay it.
+        if self._command_is_satisfied(operation.command):
+            operation.future.set_result(None)
+            return
+
+        operation.send_attempts += 1
+        descriptor = self._protocol.command_request(operation.command)
+        try:
+            await self._async_execute_descriptor(descriptor, attempts=1)
+        except Exception:
+            if (
+                not operation.future.done()
+                and loop.time() < operation.deadline
+                and operation.send_attempts < COMMAND_SEND_ATTEMPTS
+            ):
+                self._operations.appendleft(operation)
+                self._operation_event.set()
+            elif not operation.future.done():
+                operation.future.set_exception(
+                    CommandDeadlineExceeded(
+                        "Command remained unconfirmed after bounded retries"
+                    )
+                )
+            raise
+        else:
+            if not operation.future.done():
+                operation.future.set_result(None)
+
+    async def _async_run_sweep(
+        self,
+        descriptors: tuple[RequestDescriptor, ...],
+        *,
+        attempts: int,
+        is_refresh: bool = False,
+    ) -> None:
+        if is_refresh:
+            self._refresh_running = True
+            self._refresh_pending = False
+        try:
+            for index, descriptor in enumerate(descriptors):
+                await self._async_execute_descriptor(descriptor, attempts=attempts)
+                if index + 1 < len(descriptors):
+                    await asyncio.sleep(BETWEEN_REQUEST_DELAY)
+        finally:
+            if is_refresh:
+                self._refresh_running = False
+
+    async def _async_execute_descriptor(
+        self,
+        descriptor: RequestDescriptor,
+        *,
+        attempts: int,
+        is_periodic_poll: bool = False,
+    ) -> tuple[bytes, ...]:
+        channel = self._channel
+        if channel is None or not channel.ready:
+            raise ChannelError("Application channel is not ready")
+
+        for attempt in range(attempts):
+            matcher = self._protocol.new_response_matcher(descriptor)
+            await channel.async_send(descriptor.frame)
+            if is_periodic_poll:
+                # This is deliberately write-to-write, not response-to-write.
+                self._next_poll_due = asyncio.get_running_loop().time() + POLL_INTERVAL
+            deadline = asyncio.get_running_loop().time() + TRANSACTION_TIMEOUT
+
+            try:
+                while not matcher.complete:
+                    frame = await self._async_next_transaction_frame(deadline)
+                    self._process_plaintext_frame(frame)
+                    result = matcher.feed(frame)
+                    if result is MatchResult.COMPLETE:
+                        return matcher.frames
+            except TimeoutError:
+                if attempt + 1 == attempts:
+                    break
+
+        raise TransactionTimeoutError(
+            f"Timed out waiting for {descriptor.name} response"
+        )
+
+    async def _async_next_transaction_frame(self, deadline: float) -> bytes:
+        loop = asyncio.get_running_loop()
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise TimeoutError
+
+        frame_task = asyncio.create_task(self._frame_queue.get())
+        disconnect_task = asyncio.create_task(self._disconnected.wait())
+        done, pending = await asyncio.wait(
+            (frame_task, disconnect_task),
+            timeout=remaining,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        for task in pending:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        if not done:
+            raise TimeoutError
+        if disconnect_task in done and disconnect_task.result():
+            if not frame_task.done():
+                frame_task.cancel()
+            raise GattTransportError("Purifier disconnected during transaction")
+        return frame_task.result()
+
+    async def _async_wait_for_ready_work(self, timeout: float) -> None:
+        frame_task = asyncio.create_task(self._frame_queue.get())
+        operation_task = asyncio.create_task(self._operation_event.wait())
+        disconnect_task = asyncio.create_task(self._disconnected.wait())
+        done, pending = await asyncio.wait(
+            (frame_task, operation_task, disconnect_task),
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        for task in pending:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        if disconnect_task in done and disconnect_task.result():
+            raise GattTransportError("Purifier disconnected")
+        if frame_task in done:
+            self._process_plaintext_frame(frame_task.result())
+        if operation_task in done:
+            self._operation_event.clear()
+
+    def _process_plaintext_frame(self, frame: bytes) -> None:
+        event = self._protocol.decode(frame)
+        new_state = self.state
+        if isinstance(event, DeviceStateEvent) and event.power is not None:
+            new_state = replace(new_state, power=event.power)
+        elif isinstance(event, FanModeEvent) and event.mode is not None:
+            new_state = replace(new_state, fan_mode=event.mode)
+        elif isinstance(event, NightLightStateEvent):
+            changes: dict[str, object] = {}
+            if event.power is not None:
+                changes["light_power"] = event.power
+            if 1 <= event.brightness <= 100:
+                changes["light_brightness"] = event.brightness
+            if changes:
+                new_state = replace(new_state, **changes)
+        elif (
+            isinstance(event, NightLightColorEvent)
+            and event.color_available
+            and not event.acknowledgement_only
+        ):
+            assert event.red is not None
+            assert event.green is not None
+            assert event.blue is not None
+            new_state = replace(
+                new_state, light_rgb=(event.red, event.green, event.blue)
+            )
+        elif isinstance(event, AirQualityEvent):
+            new_state = replace(
+                new_state,
+                pm25=event.pm25_ug_m3,
+                filter_life=event.filter_life,
+            )
+        elif isinstance(event, RefreshRequestedEvent):
+            # The short sweep is documented only for an active H7129 session.
+            if (
+                self._profile.security is SecurityMode.H7129_SESSION
+                and not self._refresh_running
+            ):
+                self._refresh_pending = True
+
+        if new_state != self.state:
+            self.state = new_state
+            self._state_callback(new_state)
+
+    def _command_is_satisfied(self, command: ProtocolCommand) -> bool:
+        if isinstance(command, SetPower):
+            return self.state.power is command.on
+        if isinstance(command, SetFanMode):
+            return self.state.fan_mode is command.mode
+        if isinstance(command, SetNightLightPower):
+            return self.state.light_power is command.on
+        if isinstance(command, SetNightLightBrightness):
+            return self.state.light_brightness == command.percent
+        if isinstance(command, SetNightLightColor):
+            # H7129 may answer the startup color query with the value-less fc
+            # form, while 3a color frames are acknowledgement echoes only.
+            # Cached RGB therefore cannot safely suppress an ambiguous retry.
+            return False
+        return False
+
+    def _invalidate_connection_scoped_state(self) -> None:
+        """Forget values startup cannot authoritatively query after reconnect."""
+        if self.state.fan_mode is not None:
+            self.state = replace(self.state, fan_mode=None)
+
+    def _on_plaintext_frame(self, generation: int, frame: bytes) -> None:
+        if generation != self._session_generation or self._stopping.is_set():
+            return
+        self._frame_queue.put_nowait(frame)
+
+    def _on_disconnected(
+        self,
+        session_generation: int,
+        disconnected_transport_generation: int,
+    ) -> None:
+        if (
+            session_generation != self._session_generation
+            or disconnected_transport_generation != self._transport.generation
+        ):
+            return
+        channel = self._channel
+        if channel is not None:
+            channel.invalidate()
+        self._disconnected.set()
+
+    def _set_available(self, available: bool, error: Exception | None) -> None:
+        self._availability_callback(available, error)
+
+    def _coalesce_pending(self, replacement: _Operation) -> None:
+        key = type(replacement.command)
+        retained: deque[_Operation] = deque()
+        while self._operations:
+            pending = self._operations.popleft()
+            if type(pending.command) is key and not pending.future.done():
+                pending.future.set_exception(
+                    CommandSuperseded("A newer control superseded this request")
+                )
+            else:
+                retained.append(pending)
+        self._operations = retained
+
+    def _discard_expired_operations(self) -> None:
+        now = asyncio.get_running_loop().time()
+        retained: deque[_Operation] = deque()
+        while self._operations:
+            operation = self._operations.popleft()
+            if operation.future.done():
+                continue
+            if now >= operation.deadline:
+                operation.future.set_exception(CommandDeadlineExceeded())
+            else:
+                retained.append(operation)
+        self._operations = retained
+        if not self._operations:
+            self._operation_event.clear()
+
+    def _fail_all_operations(self, error: Exception) -> None:
+        while self._operations:
+            operation = self._operations.popleft()
+            if not operation.future.done():
+                operation.future.set_exception(error)
+
+    def _drain_frame_queue(self) -> None:
+        while True:
+            try:
+                self._frame_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+
+    async def _async_backoff(self, delay: float) -> None:
+        jittered_delay = delay * random.uniform(0.8, 1.2)
+        try:
+            async with asyncio.timeout(jittered_delay):
+                await self._stopping.wait()
+        except TimeoutError:
+            pass

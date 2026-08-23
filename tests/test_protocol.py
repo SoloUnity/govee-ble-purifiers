@@ -1,0 +1,297 @@
+"""Tests for typed purifier commands, events, and transaction matching."""
+
+from __future__ import annotations
+
+import pytest
+
+from custom_components.govee_ble_air_purifier.frame import build_frame
+from custom_components.govee_ble_air_purifier.models import (
+    AirQualityEvent,
+    DeviceProfile,
+    DeviceStateEvent,
+    FanMode,
+    FanModeEvent,
+    Model,
+    NightLightColorEvent,
+    NightLightStateEvent,
+    ProtocolCommand,
+    QueryAirQuality,
+    QueryDeviceState,
+    QueryNightLightColor,
+    QueryNightLightState,
+    RefreshRequestedEvent,
+    SetFanMode,
+    SetNightLightBrightness,
+    SetNightLightColor,
+    SetNightLightPower,
+    SetPower,
+)
+from custom_components.govee_ble_air_purifier.protocol import (
+    GoveePurifierProtocol,
+    MatchResult,
+    ProtocolError,
+)
+
+
+def _protocol(model: Model = Model.H7124) -> GoveePurifierProtocol:
+    return GoveePurifierProtocol(DeviceProfile.for_model(model))
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (SetPower(False), "330100" + "00" * 16 + "32"),
+        (SetPower(True), "330101" + "00" * 16 + "33"),
+        (SetFanMode(FanMode.LOW), "3a050101" + "00" * 15 + "3f"),
+        (SetFanMode(FanMode.MEDIUM), "3a050102" + "00" * 15 + "3c"),
+        (SetFanMode(FanMode.HIGH), "3a050103" + "00" * 15 + "3d"),
+        (SetFanMode(FanMode.SLEEP), "3a050500" + "00" * 15 + "3a"),
+        (SetFanMode(FanMode.AUTO), "3a0503000014" + "00" * 13 + "28"),
+        (SetFanMode(FanMode.TURBO), "3a050700" + "00" * 15 + "38"),
+        (SetNightLightPower(False), "3a1b010100" + "00" * 14 + "21"),
+        (SetNightLightPower(True), "3a1b010101" + "00" * 14 + "20"),
+        (SetNightLightBrightness(50), "3a1b010232" + "00" * 14 + "10"),
+        (SetNightLightColor(255, 0, 0), "3a1b050dff" + "00" * 14 + "d6"),
+    ],
+)
+def test_h7124_documented_control_vectors(
+    command: ProtocolCommand, expected: str
+) -> None:
+    """Typed controls reproduce the reference's exact twenty-byte frames."""
+
+    assert _protocol().encode(command) == bytes.fromhex(expected)
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (QueryDeviceState(), "aa01" + "00" * 17 + "ab"),
+        (QueryNightLightState(), "aa1b01" + "00" * 16 + "b0"),
+        (QueryNightLightColor(), "aa1b05" + "00" * 16 + "b4"),
+        (QueryAirQuality(), "aa19" + "00" * 17 + "b3"),
+    ],
+)
+def test_documented_query_vectors(command: ProtocolCommand, expected: str) -> None:
+    """The only steady poll and the on-demand state queries match captures."""
+
+    assert _protocol().encode(command) == bytes.fromhex(expected)
+
+
+def test_h7129_auto_uses_model_specific_parameter() -> None:
+    """H7129 Auto uses 0x12 rather than H7124's 0x14."""
+
+    assert _protocol(Model.H7129).encode(SetFanMode(FanMode.AUTO)) == bytes.fromhex(
+        "3a 05 03 00 00 12 00 00 00 00 00 00 00 00 00 00 00 00 00 2e"
+    )
+
+
+@pytest.mark.parametrize("percent", [0, 101])
+def test_reject_invalid_brightness(percent: int) -> None:
+    """The protocol documents only whole percentages from one through 100."""
+
+    with pytest.raises(ProtocolError):
+        _protocol().encode(SetNightLightBrightness(percent))
+
+
+def test_initialization_and_refresh_order() -> None:
+    """The public descriptors reproduce the documented 23/24 and short sweeps."""
+
+    h7124 = _protocol(Model.H7124)
+    h7129 = _protocol(Model.H7129)
+    base_prefixes = [
+        "33b2",
+        "33b5",
+        "aa01",
+        "aa0500",
+        "aa0501",
+        "aa0503",
+        "aa1b01",
+        "aa1b05",
+        "aa1e0102",
+        "aa10",
+        "aa08",
+        "aa26",
+        "aa16",
+        "aa17",
+        "aa19",
+        "aa0710",
+        "aa0711",
+        "aa0706",
+        "aa0720",
+        "aa1f",
+        "ab0102",
+        "ab0105",
+        "ab0104",
+    ]
+
+    h7124_requests = h7124.initialization_requests()
+    h7129_requests = h7129.initialization_requests()
+    assert len(h7124_requests) == 23
+    assert len(h7129_requests) == 24
+    for descriptor, prefix in zip(h7124_requests, base_prefixes, strict=True):
+        assert descriptor.frame.hex().startswith(prefix)
+    assert h7129_requests[:23] == h7124_requests
+    assert h7129_requests[23].frame == bytes.fromhex(
+        "ab 02 02 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 aa"
+    )
+
+    refresh = h7129.refresh_requests()
+    assert len(refresh) == 14
+    assert refresh == h7124_requests[1:15]
+    assert h7129.device_state_poll().frame == build_frame(b"\xaa\x01")
+
+
+def test_multipart_response_completion_and_duplicate() -> None:
+    """Nine metadata fragments complete only at the documented ab-ff terminator."""
+
+    descriptor = _protocol().initialization_requests()[22]
+    matcher = _protocol().new_response_matcher(descriptor)
+
+    for fragment in range(8):
+        result = matcher.feed(build_frame(bytes((0xAB, fragment))))
+        assert result is MatchResult.ACCEPTED
+        assert not matcher.complete
+        if fragment == 3:
+            assert (
+                matcher.feed(build_frame(bytes((0xAB, fragment))))
+                is MatchResult.ACCEPTED
+            )
+
+    assert matcher.feed(build_frame(b"\xab\xff")) is MatchResult.COMPLETE
+    assert matcher.complete
+    assert len(matcher.frames) == 9
+
+
+def test_h7129_additional_metadata_matching() -> None:
+    """The additional response must contain its four-byte selector."""
+
+    protocol = _protocol(Model.H7129)
+    matcher = protocol.new_response_matcher(protocol.initialization_requests()[23])
+
+    assert matcher.feed(build_frame(b"\xab\x00\x02\x02\x00\x02")) is MatchResult.IGNORED
+    assert (
+        matcher.feed(build_frame(b"\xab\x00\x55\x02\x02\x00\x01"))
+        is MatchResult.COMPLETE
+    )
+
+
+def test_unrelated_notification_does_not_complete_transaction() -> None:
+    """Unsolicited status remains useful but cannot finish another request."""
+
+    descriptor = _protocol().initialization_requests()[3]  # aa-05-00
+    matcher = _protocol().new_response_matcher(descriptor)
+
+    assert matcher.feed(build_frame(b"\xee\x19")) is MatchResult.IGNORED
+    assert matcher.feed(build_frame(b"\xaa\x05\x01")) is MatchResult.IGNORED
+    assert matcher.feed(build_frame(b"\xaa\x05\x00")) is MatchResult.COMPLETE
+
+
+def test_zero_payload_and_exact_echo_boundaries() -> None:
+    """Capability requests use their documented single-response boundaries."""
+
+    requests = _protocol().initialization_requests()
+    zero_payload = _protocol().new_response_matcher(requests[0])
+    exact_echo = _protocol().new_response_matcher(requests[8])
+
+    assert zero_payload.feed(build_frame(b"\x33\xb2\x01")) is MatchResult.IGNORED
+    assert zero_payload.feed(build_frame(b"\x33\xb2")) is MatchResult.COMPLETE
+    assert exact_echo.feed(build_frame(b"\xaa\x1e\x01\x03")) is MatchResult.IGNORED
+    assert exact_echo.feed(requests[8].frame) is MatchResult.COMPLETE
+
+
+def test_power_confirmation_waits_for_applied_aa01_state() -> None:
+    """A local write/echo does not prove that purifier power was applied."""
+
+    protocol = _protocol()
+    matcher = protocol.new_response_matcher(protocol.command_request(SetPower(True)))
+
+    assert matcher.feed(build_frame(b"\x33\x01\x01")) is MatchResult.IGNORED
+    assert matcher.feed(build_frame(b"\xaa\x01\x00")) is MatchResult.IGNORED
+    assert matcher.feed(build_frame(b"\xaa\x01\x01")) is MatchResult.COMPLETE
+
+
+@pytest.mark.parametrize(
+    ("mode", "notification"),
+    [
+        (FanMode.LOW, "ee050101"),
+        (FanMode.AUTO, "ee0503000012"),
+        (FanMode.SLEEP, "ee050503"),
+        (FanMode.TURBO, "ee050703"),
+    ],
+)
+def test_h7129_mode_confirmation_uses_authoritative_notification(
+    mode: FanMode, notification: str
+) -> None:
+    """Mode matching handles H7129's retained byte 3 for Sleep and Turbo."""
+
+    protocol = _protocol(Model.H7129)
+    matcher = protocol.new_response_matcher(protocol.command_request(SetFanMode(mode)))
+
+    assert (
+        matcher.feed(build_frame(bytes.fromhex(notification))) is MatchResult.COMPLETE
+    )
+
+
+def test_rgb_fc_response_completes_query_without_replacing_color() -> None:
+    """H7129's checksum-valid fc response has no usable RGB value."""
+
+    protocol = _protocol(Model.H7129)
+    frame = build_frame(bytes.fromhex("aa 1b 05 fc"))
+    event = protocol.decode(frame)
+    matcher = protocol.new_response_matcher(
+        protocol.command_request(QueryNightLightColor())
+    )
+
+    assert isinstance(event, NightLightColorEvent)
+    assert not event.color_available
+    assert event.red is event.green is event.blue is None
+    assert matcher.feed(frame) is MatchResult.COMPLETE
+
+
+def test_decode_documented_notifications() -> None:
+    """Authoritative physical changes and status updates become typed events."""
+
+    protocol = _protocol(Model.H7129)
+    state = protocol.decode(build_frame(bytes.fromhex("aa 01 01 00 81 00 05")))
+    fan = protocol.decode(build_frame(bytes.fromhex("ee 05 05 03")))
+    light = protocol.decode(build_frame(bytes.fromhex("ee 1b 01 01 64")))
+    status = protocol.decode(
+        bytes.fromhex("ee 19 81 00 03 01 00 49 00 00 00 00 00 00 00 00 00 00 00 3d")
+    )
+    refresh = protocol.decode(build_frame(b"\xee\xaa"))
+
+    assert isinstance(state, DeviceStateEvent)
+    assert state.power is True
+    assert state.volatile_state == 5
+    assert isinstance(fan, FanModeEvent)
+    assert fan.mode is FanMode.SLEEP
+    assert isinstance(light, NightLightStateEvent)
+    assert light.power is True
+    assert light.brightness == 100
+    assert light.unsolicited
+    assert isinstance(status, AirQualityEvent)
+    assert status.pm25_ug_m3 == 3
+    assert status.filter_life == 73
+    assert status.unsolicited
+    assert isinstance(refresh, RefreshRequestedEvent)
+
+
+def test_unknown_auto_parameter_is_not_mislabeled() -> None:
+    """Undocumented H7129 Auto variants remain unknown."""
+
+    event = _protocol(Model.H7129).decode(
+        build_frame(bytes.fromhex("ee 05 03 00 00 99"))
+    )
+
+    assert isinstance(event, FanModeEvent)
+    assert event.mode is None
+
+
+def test_pm25_sentinel_is_unavailable() -> None:
+    """Values above 999, including ff-ff, are never published as PM2.5."""
+
+    event = _protocol().decode(build_frame(bytes.fromhex("aa 19 81 ff ff")))
+
+    assert isinstance(event, AirQualityEvent)
+    assert event.raw_pm25 == 0xFFFF
+    assert event.pm25_ug_m3 is None

@@ -1,0 +1,59 @@
+{
+  "title": "Govee BLE Air Purifier",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Add a Govee BLE air purifier",
+        "description": "Enter the Bluetooth address of a purifier that Home Assistant can currently see. Close the Govee app first because the purifier accepts only one Bluetooth connection.",
+        "data": {
+          "address": "Bluetooth address",
+          "model": "Model"
+        },
+        "data_description": {
+          "address": "The purifier's Bluetooth MAC address, for example AA:BB:CC:DD:EE:FF.",
+          "model": "Select the exact model printed on the purifier."
+        }
+      },
+      "bluetooth_confirm": {
+        "title": "Add {name}",
+        "description": "Set up this nearby Govee BLE air purifier? Close the Govee app first because the purifier accepts only one Bluetooth connection.",
+        "data": {
+          "model": "Model"
+        },
+        "data_description": {
+          "model": "Select the exact model printed on the purifier when it cannot be determined from the advertised name."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect to and initialize the purifier. Make sure it is powered on, in Bluetooth range, and not connected to the Govee app.",
+      "invalid_address": "Enter a valid Bluetooth MAC address.",
+      "not_discovered": "Home Assistant cannot currently see this purifier from a connectable Bluetooth adapter or proxy."
+    },
+    "abort": {
+      "already_configured": "This purifier is already configured.",
+      "discovery_expired": "The Bluetooth discovery is no longer available.",
+      "not_connectable": "This discovery did not come from a Bluetooth adapter or proxy that can connect to the purifier."
+    }
+  },
+  "entity": {
+    "light": {
+      "night_light": {
+        "name": "Night light"
+      }
+    },
+    "sensor": {
+      "pm25": {
+        "name": "PM2.5"
+      },
+      "filter_life": {
+        "name": "Filter life"
+      }
+    }
+  },
+  "exceptions": {
+    "communication_failed": {
+      "message": "The purifier did not confirm the command before the Bluetooth operation timed out."
+    }
+  }
+}
