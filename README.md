@@ -67,6 +67,33 @@ not replayed indefinitely.
 - A purifier connected to the Govee app cannot simultaneously connect to Home
   Assistant.
 
+## Debug logging
+
+Connection and protocol failures always appear in Home Assistant's normal log.
+They include the failed stage, request name, retry count, number of received
+frames, unmatched-frame samples, and the underlying Bleak exception when one is
+available.
+
+For frame-by-frame diagnostics, add this to `configuration.yaml` and restart
+Home Assistant:
+
+```yaml
+logger:
+  logs:
+    custom_components.govee_ble_air_purifier: debug
+    bleak_retry_connector: debug
+    homeassistant.components.bluetooth: debug
+```
+
+Reproduce the problem once, then open **Settings > System > Logs**. The custom
+integration trace records the advertisement route and RSSI, connection
+generation, GATT discovery, notification subscription, transaction names,
+plaintext application frames, response-matcher results, timeouts, disconnects,
+and recovery backoff. H7129 negotiation payloads and session keys are
+deliberately never logged; decrypted application frames are available at debug
+level. Debug output can contain Bluetooth addresses and device-specific metadata,
+so redact those before posting logs publicly.
+
 ## Removal
 
 Remove the purifier under **Settings > Devices & services**, then remove the

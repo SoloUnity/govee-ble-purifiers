@@ -134,10 +134,30 @@ class ReliablePurifierClient:
         self._refresh_running = False
         self._next_poll_due = 0.0
         self._ready_since: float | None = None
+        self._connection_cycles = 0
+        self._plaintext_rx_count = 0
+        self._active_request: str | None = None
+        self._last_error: str | None = None
+        self._last_timeout_summary: str | None = None
 
     @property
     def is_ready(self) -> bool:
         return self.status is ClientStatus.READY
+
+    def diagnostic_snapshot(self) -> dict[str, object]:
+        """Return secret-free runtime evidence for Home Assistant diagnostics."""
+        return {
+            "status": self.status.value,
+            "is_ready": self.is_ready,
+            "session_generation": self._session_generation,
+            "connection_cycles": self._connection_cycles,
+            "plaintext_rx_count": self._plaintext_rx_count,
+            "active_request": self._active_request,
+            "last_error": self._last_error,
+            "last_timeout_summary": self._last_timeout_summary,
+            "route": self._environment.route_diagnostics(),
+            "transport": self._transport.diagnostic_snapshot(),
+        }
 
     async def async_start(self) -> None:
         """Start recovery and wait for the first complete initialization."""
@@ -230,8 +250,15 @@ class ReliablePurifierClient:
             except asyncio.CancelledError:
                 raise
             except Exception as err:
+                self._last_error = f"{type(err).__name__}: {err}"
                 _LOGGER.debug(
-                    "Purifier connection cycle failed: %s", err, exc_info=True
+                    "Purifier connection cycle %d failed at status=%s "
+                    "session_generation=%d: %s",
+                    self._connection_cycles,
+                    self.status.value,
+                    self._session_generation,
+                    self._last_error,
+                    exc_info=True,
                 )
                 stable_for = (
                     asyncio.get_running_loop().time() - self._ready_since
@@ -256,6 +283,7 @@ class ReliablePurifierClient:
             backoff = min(BACKOFF_MAX, backoff * 2)
 
     async def _connect_initialize_and_run(self) -> None:
+        self._connection_cycles += 1
         self._session_generation += 1
         session_generation = self._session_generation
         self._disconnected.clear()
@@ -263,6 +291,15 @@ class ReliablePurifierClient:
         self._refresh_pending = False
         self._refresh_running = False
         self._invalidate_connection_scoped_state()
+        _LOGGER.debug(
+            "Starting purifier connection cycle=%d session_generation=%d "
+            "model=%s security=%s route=%s",
+            self._connection_cycles,
+            session_generation,
+            self._profile.model.value,
+            self._profile.security.value,
+            self._environment.route_diagnostics(),
+        )
 
         self.status = ClientStatus.WAITING_FOR_ADVERTISEMENT
         device = self._environment.get_connectable_device()
@@ -272,6 +309,13 @@ class ReliablePurifierClient:
             raise BluetoothUnavailableError("No connectable advertisement is present")
 
         self.status = ClientStatus.CONNECTING
+        _LOGGER.debug(
+            "Connectable device selected for cycle=%d: name=%s address=%s route=%s",
+            self._connection_cycles,
+            device.name,
+            device.address,
+            self._environment.route_diagnostics(),
+        )
         self._transport.set_disconnect_callback(
             lambda disconnected_generation: self._on_disconnected(
                 session_generation, disconnected_generation
@@ -292,10 +336,24 @@ class ReliablePurifierClient:
             channel = PlaintextChannel(self._transport, callback)
         self._channel = channel
         await channel.async_establish()
+        _LOGGER.debug(
+            "Application channel established: cycle=%d generation=%d channel=%s",
+            self._connection_cycles,
+            session_generation,
+            type(channel).__name__,
+        )
 
         self.status = ClientStatus.INITIALIZING
+        initialization_requests = self._protocol.initialization_requests()
+        _LOGGER.debug(
+            "Starting initialization sweep: cycle=%d requests=%d "
+            "attempts_per_request=%d",
+            self._connection_cycles,
+            len(initialization_requests),
+            INITIALIZATION_ATTEMPTS,
+        )
         await self._async_run_sweep(
-            self._protocol.initialization_requests(),
+            initialization_requests,
             attempts=INITIALIZATION_ATTEMPTS,
         )
 
@@ -308,6 +366,16 @@ class ReliablePurifierClient:
             else POLL_INTERVAL
         )
         self._next_poll_due = loop.time() + initial_poll_delay
+        self._last_error = None
+        self._last_timeout_summary = None
+        _LOGGER.debug(
+            "Purifier ready: cycle=%d session_generation=%d initial_poll_delay=%.3fs "
+            "state=%s",
+            self._connection_cycles,
+            session_generation,
+            initial_poll_delay,
+            self.state,
+        )
         self._set_available(True, None)
         if self._first_ready is not None and not self._first_ready.done():
             self._first_ready.set_result(None)
@@ -398,6 +466,12 @@ class ReliablePurifierClient:
             self._refresh_pending = False
         try:
             for index, descriptor in enumerate(descriptors):
+                _LOGGER.debug(
+                    "Sweep request %d/%d: name=%s",
+                    index + 1,
+                    len(descriptors),
+                    descriptor.name,
+                )
                 await self._async_execute_descriptor(descriptor, attempts=attempts)
                 if index + 1 < len(descriptors):
                     await asyncio.sleep(BETWEEN_REQUEST_DELAY)
@@ -416,28 +490,85 @@ class ReliablePurifierClient:
         if channel is None or not channel.ready:
             raise ChannelError("Application channel is not ready")
 
-        for attempt in range(attempts):
-            matcher = self._protocol.new_response_matcher(descriptor)
-            await channel.async_send(descriptor.frame)
-            if is_periodic_poll:
-                # This is deliberately write-to-write, not response-to-write.
-                self._next_poll_due = asyncio.get_running_loop().time() + POLL_INTERVAL
-            deadline = asyncio.get_running_loop().time() + TRANSACTION_TIMEOUT
+        loop = asyncio.get_running_loop()
+        attempt_summaries: list[str] = []
+        self._active_request = descriptor.name
+        try:
+            for attempt in range(attempts):
+                matcher = self._protocol.new_response_matcher(descriptor)
+                observed_frames: list[bytes] = []
+                ignored_frames: list[bytes] = []
+                started = loop.time()
+                _LOGGER.debug(
+                    "TX transaction: request=%s attempt=%d/%d frame=%s",
+                    descriptor.name,
+                    attempt + 1,
+                    attempts,
+                    descriptor.frame.hex(" "),
+                )
+                await channel.async_send(descriptor.frame)
+                if is_periodic_poll:
+                    # This is deliberately write-to-write, not response-to-write.
+                    self._next_poll_due = loop.time() + POLL_INTERVAL
+                deadline = loop.time() + TRANSACTION_TIMEOUT
 
-            try:
-                while not matcher.complete:
-                    frame = await self._async_next_transaction_frame(deadline)
-                    self._process_plaintext_frame(frame)
-                    result = matcher.feed(frame)
-                    if result is MatchResult.COMPLETE:
-                        return matcher.frames
-            except TimeoutError:
-                if attempt + 1 == attempts:
-                    break
+                try:
+                    while not matcher.complete:
+                        frame = await self._async_next_transaction_frame(deadline)
+                        observed_frames.append(frame)
+                        self._process_plaintext_frame(frame)
+                        result = matcher.feed(frame)
+                        _LOGGER.debug(
+                            "Transaction candidate: request=%s attempt=%d/%d "
+                            "match=%s frame=%s",
+                            descriptor.name,
+                            attempt + 1,
+                            attempts,
+                            result.value,
+                            frame.hex(" "),
+                        )
+                        if result is MatchResult.IGNORED:
+                            ignored_frames.append(frame)
+                        if result is MatchResult.COMPLETE:
+                            _LOGGER.debug(
+                                "Transaction complete: request=%s attempt=%d/%d "
+                                "latency=%.3fs received=%d matched=%d",
+                                descriptor.name,
+                                attempt + 1,
+                                attempts,
+                                loop.time() - started,
+                                len(observed_frames),
+                                len(matcher.frames),
+                            )
+                            return matcher.frames
+                except TimeoutError:
+                    ignored_sample = " | ".join(
+                        frame.hex(" ") for frame in ignored_frames[:4]
+                    )
+                    summary = (
+                        f"attempt {attempt + 1}/{attempts}: "
+                        f"received={len(observed_frames)}, "
+                        f"matched_fragments={len(matcher.frames)}, "
+                        f"ignored={len(ignored_frames)}, "
+                        f"ignored_sample={ignored_sample or 'none'}"
+                    )
+                    attempt_summaries.append(summary)
+                    self._last_timeout_summary = f"request={descriptor.name}; {summary}"
+                    _LOGGER.debug(
+                        "Transaction timeout: request=%s elapsed=%.3fs %s",
+                        descriptor.name,
+                        loop.time() - started,
+                        summary,
+                    )
 
-        raise TransactionTimeoutError(
-            f"Timed out waiting for {descriptor.name} response"
-        )
+            details = "; ".join(attempt_summaries)
+            raise TransactionTimeoutError(
+                f"Timed out waiting for {descriptor.name} response after "
+                f"{attempts} attempt(s) with {TRANSACTION_TIMEOUT:.1f}s deadlines; "
+                f"{details}"
+            )
+        finally:
+            self._active_request = None
 
     async def _async_next_transaction_frame(self, deadline: float) -> bytes:
         loop = asyncio.get_running_loop()
@@ -559,7 +690,24 @@ class ReliablePurifierClient:
 
     def _on_plaintext_frame(self, generation: int, frame: bytes) -> None:
         if generation != self._session_generation or self._stopping.is_set():
+            _LOGGER.debug(
+                "Ignoring plaintext frame from stale/stopped session: "
+                "frame_generation=%d current_generation=%d stopping=%s frame=%s",
+                generation,
+                self._session_generation,
+                self._stopping.is_set(),
+                frame.hex(" "),
+            )
             return
+        self._plaintext_rx_count += 1
+        _LOGGER.debug(
+            "RX plaintext queued: session_generation=%d count=%d active_request=%s "
+            "frame=%s",
+            generation,
+            self._plaintext_rx_count,
+            self._active_request,
+            frame.hex(" "),
+        )
         self._frame_queue.put_nowait(frame)
 
     def _on_disconnected(
@@ -571,13 +719,35 @@ class ReliablePurifierClient:
             session_generation != self._session_generation
             or disconnected_transport_generation != self._transport.generation
         ):
+            _LOGGER.debug(
+                "Ignoring stale disconnect callback: session_generation=%d/%d "
+                "transport_generation=%d/%d",
+                session_generation,
+                self._session_generation,
+                disconnected_transport_generation,
+                self._transport.generation,
+            )
             return
+        _LOGGER.debug(
+            "Current purifier connection dropped: status=%s active_request=%s "
+            "session_generation=%d transport_generation=%d",
+            self.status.value,
+            self._active_request,
+            session_generation,
+            disconnected_transport_generation,
+        )
         channel = self._channel
         if channel is not None:
             channel.invalidate()
         self._disconnected.set()
 
     def _set_available(self, available: bool, error: Exception | None) -> None:
+        _LOGGER.debug(
+            "Purifier availability update: available=%s status=%s error=%s",
+            available,
+            self.status.value,
+            f"{type(error).__name__}: {error}" if error is not None else None,
+        )
         self._availability_callback(available, error)
 
     def _coalesce_pending(self, replacement: _Operation) -> None:
@@ -623,6 +793,12 @@ class ReliablePurifierClient:
 
     async def _async_backoff(self, delay: float) -> None:
         jittered_delay = delay * random.uniform(0.8, 1.2)
+        _LOGGER.debug(
+            "Bluetooth recovery backoff: base=%.1fs jittered=%.3fs next_max=%.1fs",
+            delay,
+            jittered_delay,
+            BACKOFF_MAX,
+        )
         try:
             async with asyncio.timeout(jittered_delay):
                 await self._stopping.wait()

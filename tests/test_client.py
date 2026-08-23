@@ -30,6 +30,9 @@ from custom_components.govee_ble_air_purifier.protocol import GoveePurifierProto
 class FakeEnvironment:
     address = "AA:BB:CC:DD:EE:FF"
 
+    def route_diagnostics(self) -> dict[str, object]:
+        return {"present": True, "source": "test", "rssi": -50}
+
 
 class FakeTransport:
     generation = 7
@@ -39,6 +42,9 @@ class FakeTransport:
 
     async def async_disconnect(self) -> None:
         self.disconnects += 1
+
+    def diagnostic_snapshot(self) -> dict[str, object]:
+        return {"generation": self.generation, "is_connected": False}
 
 
 class PollChannel:
@@ -53,6 +59,18 @@ class PollChannel:
     async def async_send(self, frame: bytes) -> None:
         self.writes.append((asyncio.get_running_loop().time(), frame))
         self.callback(build_frame(b"\xaa\x01\x01"))
+
+    def invalidate(self) -> None:
+        self.ready = False
+
+
+class SilentChannel:
+    """Accept writes without producing any notification."""
+
+    ready = True
+
+    async def async_send(self, _: bytes) -> None:
+        return
 
     def invalidate(self) -> None:
         self.ready = False
@@ -208,3 +226,44 @@ async def test_ambiguous_command_is_bounded_and_reconciled() -> None:
     await client._async_execute_operation(reconciled)
     assert reconciled_future.done()
     assert reconciled_future.exception() is None
+
+
+@pytest.mark.asyncio
+async def test_timeout_reports_zero_received_frames_per_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The HA-facing timeout distinguishes silence from matcher rejection."""
+    monkeypatch.setattr(client_module, "TRANSACTION_TIMEOUT", 0.01)
+    client = make_client()
+    client._channel = SilentChannel()  # type: ignore[assignment]
+    descriptor = client._protocol.initialization_requests()[0]
+
+    with pytest.raises(client_module.TransactionTimeoutError) as raised:
+        await client._async_execute_descriptor(descriptor, attempts=2)
+
+    message = str(raised.value)
+    assert "capability_b2" in message
+    assert "attempt 1/2: received=0" in message
+    assert "attempt 2/2: received=0" in message
+    assert "ignored_sample=none" in message
+
+
+@pytest.mark.asyncio
+async def test_timeout_reports_unmatched_plaintext_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid but unexpected notification is included in timeout evidence."""
+    monkeypatch.setattr(client_module, "TRANSACTION_TIMEOUT", 0.01)
+    client = make_client()
+    client._session_generation = 1
+    channel = PollChannel(lambda frame: client._on_plaintext_frame(1, frame))
+    client._channel = channel  # type: ignore[assignment]
+    descriptor = client._protocol.initialization_requests()[0]
+
+    with pytest.raises(client_module.TransactionTimeoutError) as raised:
+        await client._async_execute_descriptor(descriptor, attempts=1)
+
+    message = str(raised.value)
+    assert "received=1" in message
+    assert "ignored=1" in message
+    assert build_frame(b"\xaa\x01\x01").hex(" ") in message

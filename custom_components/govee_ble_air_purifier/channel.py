@@ -75,24 +75,37 @@ class PlaintextChannel(SecureChannel):
     """Pass validated H7124 application frames through unchanged."""
 
     async def async_establish(self) -> None:
+        _LOGGER.debug("Establishing H7124 plaintext channel")
         self.invalidate()
         await self._transport.async_subscribe(self._wire_received)
         self._ready = True
         # The captured H7124 connection sent its first initialization request
         # about 3 ms after notifications were enabled.
         await asyncio.sleep(FIRST_APPLICATION_DELAY)
+        _LOGGER.debug(
+            "H7124 plaintext channel ready after %.3f-second application delay",
+            FIRST_APPLICATION_DELAY,
+        )
 
     async def async_send(self, plaintext: bytes) -> None:
         if not self._ready:
             raise ChannelNotReadyError("Plaintext channel is not ready")
-        await self._transport.async_write(validate_frame(plaintext))
+        plaintext = validate_frame(plaintext)
+        _LOGGER.debug("H7124 TX plaintext: %s", plaintext.hex(" "))
+        await self._transport.async_write(plaintext)
 
     def _wire_received(self, wire_frame: bytes) -> None:
         try:
             plaintext = validate_frame(wire_frame)
-        except FrameError:
-            _LOGGER.debug("Discarding invalid plaintext notification")
+        except FrameError as err:
+            _LOGGER.debug(
+                "Discarding invalid H7124 notification: length=%d wire=%s error=%s",
+                len(wire_frame),
+                wire_frame.hex(" "),
+                err,
+            )
             return
+        _LOGGER.debug("H7124 RX plaintext: %s", plaintext.hex(" "))
         self._plaintext_callback(plaintext)
 
 
@@ -110,6 +123,7 @@ class H7129SessionChannel(SecureChannel):
 
     async def async_establish(self) -> None:
         """Subscribe, then complete the documented e7-01/e7-02 exchange."""
+        _LOGGER.debug("Establishing H7129 encrypted session channel")
         self.invalidate()
         await self._transport.async_subscribe(self._wire_received)
 
@@ -121,9 +135,14 @@ class H7129SessionChannel(SecureChannel):
             # millisecond preserves that ordering without busy waiting.
             await asyncio.sleep(NEGOTIATION_STEP_DELAY)
             await self._exchange_step(0x02)
-        except (TimeoutError, FrameError, ConnectionError) as err:
+        except (TimeoutError, ValueError, ConnectionError) as err:
+            failed_phase = self._phase
             self.invalidate()
-            raise NegotiationError("H7129 session negotiation failed") from err
+            detail = str(err).strip() or repr(err)
+            raise NegotiationError(
+                "H7129 session negotiation failed during "
+                f"e7-{failed_phase:02x}; cause={type(err).__name__}: {detail}"
+            ) from err
         except asyncio.CancelledError:
             self.invalidate()
             raise
@@ -131,6 +150,11 @@ class H7129SessionChannel(SecureChannel):
         self._phase = 3
         self._ready = True
         await asyncio.sleep(FIRST_APPLICATION_DELAY)
+        _LOGGER.debug(
+            "H7129 session channel ready after %.3f-second application delay; "
+            "session key established but intentionally not logged",
+            FIRST_APPLICATION_DELAY,
+        )
 
         # ee-aa is legal under the communication key during negotiation. It
         # has no state payload, so deliver one coalesced refresh after ready.
@@ -140,13 +164,25 @@ class H7129SessionChannel(SecureChannel):
 
     async def _exchange_step(self, step: int) -> bytes:
         self._phase = step
-        future: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[bytes] = loop.create_future()
         self._phase_future = future
         request = create_negotiation_frame(step)
+        started = loop.time()
+        _LOGGER.debug(
+            "H7129 negotiation TX e7-%02x; random padding and keys are not logged",
+            step,
+        )
         await self._transport.async_write(encrypt_frame(request, COMMUNICATION_KEY))
         try:
             async with asyncio.timeout(NEGOTIATION_PHASE_TIMEOUT):
-                return await future
+                response = await future
+                _LOGGER.debug(
+                    "H7129 negotiation RX e7-%02x completed in %.3f seconds",
+                    step,
+                    loop.time() - started,
+                )
+                return response
         finally:
             if self._phase_future is future:
                 self._phase_future = None
@@ -155,7 +191,9 @@ class H7129SessionChannel(SecureChannel):
         key = self._session_key
         if not self._ready or key is None:
             raise ChannelNotReadyError("H7129 session is not ready")
-        await self._transport.async_write(encrypt_frame(validate_frame(plaintext), key))
+        plaintext = validate_frame(plaintext)
+        _LOGGER.debug("H7129 TX application plaintext: %s", plaintext.hex(" "))
+        await self._transport.async_write(encrypt_frame(plaintext, key))
 
     def invalidate(self) -> None:
         """Forget the negotiated key immediately on any disconnect/failure."""
@@ -185,16 +223,25 @@ class H7129SessionChannel(SecureChannel):
 
         key = self._session_key
         if key is None:
-            _LOGGER.debug("Discarding non-negotiation frame before session ready")
+            _LOGGER.debug(
+                "Discarding non-negotiation H7129 frame before session key: "
+                "wire_length=%d",
+                len(wire_frame),
+            )
             return
 
         session_plaintext = self._try_decrypt(wire_frame, key)
         if session_plaintext is None:
-            _LOGGER.debug("Discarding notification that could not be decrypted")
+            _LOGGER.debug(
+                "Discarding H7129 notification that failed checksum validation "
+                "under both communication and session keys: wire_length=%d",
+                len(wire_frame),
+            )
             return
         if not self._ready:
             _LOGGER.debug("Discarding application frame before session confirmation")
             return
+        _LOGGER.debug("H7129 RX application plaintext: %s", session_plaintext.hex(" "))
         self._plaintext_callback(session_plaintext)
 
     def _handle_negotiation_frame(self, plaintext: bytes) -> None:

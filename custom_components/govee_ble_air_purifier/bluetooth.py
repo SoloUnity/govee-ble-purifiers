@@ -27,6 +27,12 @@ NotificationCallback = Callable[[bytes], None]
 DisconnectCallback = Callable[[int], None]
 
 
+def exception_detail(error: BaseException) -> str:
+    """Return a useful one-line exception description, including empty errors."""
+    message = str(error).strip()
+    return f"{type(error).__name__}: {message or repr(error)}"
+
+
 class BluetoothUnavailableError(ConnectionError):
     """Raised when there is no usable Bluetooth route to the purifier."""
 
@@ -67,14 +73,72 @@ class HomeAssistantBluetoothEnvironment:
             self._cancel_advertisement = None
         self._advertisement_event.set()
 
-    def _advertisement_received(self, *_: Any) -> None:
+    def _advertisement_received(self, service_info: Any, *_: Any) -> None:
+        _LOGGER.debug(
+            "Advertisement received for %s: name=%s source=%s rssi=%s "
+            "connectable=%s",
+            self.address,
+            getattr(service_info, "name", None),
+            getattr(service_info, "source", None),
+            getattr(service_info, "rssi", None),
+            getattr(service_info, "connectable", None),
+        )
         self._advertisement_event.set()
 
     def get_connectable_device(self) -> BLEDevice | None:
         """Return the best currently reachable connectable route."""
-        return bluetooth.async_ble_device_from_address(
+        device = bluetooth.async_ble_device_from_address(
             self._hass, self.address, connectable=True
         )
+        route = self.route_diagnostics()
+        _LOGGER.debug(
+            "Resolved Bluetooth route for %s: device=%s source=%s rssi=%s",
+            self.address,
+            device.name if device is not None else None,
+            route["source"],
+            route["rssi"],
+        )
+        return device
+
+    def route_diagnostics(self) -> dict[str, Any]:
+        """Return secret-free details for the best current HA Bluetooth route."""
+        try:
+            service_info = bluetooth.async_last_service_info(
+                self._hass,
+                self.address,
+                connectable=True,
+            )
+        except Exception as err:
+            # Diagnostics must never prevent an otherwise valid connection.
+            _LOGGER.debug(
+                "Unable to inspect the Home Assistant Bluetooth route for %s: %s",
+                self.address,
+                exception_detail(err),
+                exc_info=True,
+            )
+            return {
+                "present": None,
+                "name": None,
+                "source": None,
+                "rssi": None,
+                "tx_power": None,
+                "error": exception_detail(err),
+            }
+        if service_info is None:
+            return {
+                "present": False,
+                "name": None,
+                "source": None,
+                "rssi": None,
+                "tx_power": None,
+            }
+        return {
+            "present": True,
+            "name": getattr(service_info, "name", None),
+            "source": getattr(service_info, "source", None),
+            "rssi": getattr(service_info, "rssi", None),
+            "tx_power": getattr(service_info, "tx_power", None),
+        }
 
     def address_is_present(self) -> bool:
         """Return whether a connectable scanner can currently see the address."""
@@ -99,6 +163,11 @@ class HomeAssistantBluetoothEnvironment:
             async with asyncio.timeout(timeout):
                 await self._advertisement_event.wait()
         except TimeoutError:
+            _LOGGER.debug(
+                "No fresh connectable advertisement for %s within %.1f seconds",
+                self.address,
+                timeout,
+            )
             return None
 
         return self.get_connectable_device()
@@ -117,6 +186,11 @@ class GattTransport:
         self._write_lock = asyncio.Lock()
         self._generation = 0
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._connection_attempts = 0
+        self._successful_connections = 0
+        self._wire_tx_count = 0
+        self._wire_rx_count = 0
+        self._last_error: str | None = None
 
     @property
     def generation(self) -> int:
@@ -128,6 +202,18 @@ class GattTransport:
         """Return whether the current client reports an active connection."""
         return self._client is not None and self._client.is_connected
 
+    def diagnostic_snapshot(self) -> dict[str, Any]:
+        """Return counters and current transport state without frame contents."""
+        return {
+            "generation": self._generation,
+            "is_connected": self.is_connected,
+            "connection_attempts": self._connection_attempts,
+            "successful_connections": self._successful_connections,
+            "wire_tx_count": self._wire_tx_count,
+            "wire_rx_count": self._wire_rx_count,
+            "last_error": self._last_error,
+        }
+
     def set_disconnect_callback(self, callback: DisconnectCallback | None) -> None:
         """Set the callback invoked for an unexpected current disconnect."""
         self._disconnect_callback = callback
@@ -138,6 +224,17 @@ class GattTransport:
         self._generation += 1
         generation = self._generation
         self._loop = asyncio.get_running_loop()
+        self._connection_attempts += 1
+        _LOGGER.debug(
+            "Connecting to %s at %s: generation=%d attempt=%d timeout=%.1fs "
+            "connector_attempts=%d",
+            self.name,
+            device.address,
+            generation,
+            self._connection_attempts,
+            CONNECT_TIMEOUT,
+            CONNECT_ATTEMPTS,
+        )
 
         try:
             async with asyncio.timeout(CONNECT_TIMEOUT):
@@ -151,8 +248,18 @@ class GattTransport:
                     max_attempts=CONNECT_ATTEMPTS,
                 )
         except Exception as err:
+            self._last_error = exception_detail(err)
+            _LOGGER.debug(
+                "Bluetooth connection failed for %s at %s generation=%d: %s",
+                self.name,
+                device.address,
+                generation,
+                self._last_error,
+                exc_info=True,
+            )
             raise BluetoothUnavailableError(
-                f"Unable to connect to {self.name} at {device.address}"
+                f"Unable to connect to {self.name} at {device.address}; "
+                f"generation={generation}; cause={self._last_error}"
             ) from err
 
         if generation != self._generation:
@@ -163,10 +270,20 @@ class GattTransport:
         self._client = client
         try:
             self._resolve_characteristics(client.services)
-        except Exception:
+        except Exception as err:
+            self._last_error = exception_detail(err)
             await self.async_disconnect()
             raise
 
+        self._successful_connections += 1
+        self._last_error = None
+        _LOGGER.debug(
+            "Connected to %s at %s: generation=%d successful_connections=%d",
+            self.name,
+            device.address,
+            generation,
+            self._successful_connections,
+        )
         return generation
 
     def _resolve_characteristics(self, services: BleakGATTServiceCollection) -> None:
@@ -185,6 +302,14 @@ class GattTransport:
             )
         self._notify_characteristic = notify_characteristic
         self._command_characteristic = command_characteristic
+        _LOGGER.debug(
+            "Resolved purifier GATT characteristics: notify_handle=%s "
+            "notify_properties=%s command_handle=%s command_properties=%s",
+            getattr(notify_characteristic, "handle", None),
+            getattr(notify_characteristic, "properties", None),
+            getattr(command_characteristic, "handle", None),
+            getattr(command_characteristic, "properties", None),
+        )
 
     async def async_subscribe(self, callback: NotificationCallback) -> None:
         """Subscribe to notifications before any transaction is sent."""
@@ -194,17 +319,41 @@ class GattTransport:
 
         def notification_received(_: Any, data: bytearray) -> None:
             if generation != self._generation:
+                _LOGGER.debug(
+                    "Ignoring wire notification from stale generation=%d "
+                    "current_generation=%d length=%d",
+                    generation,
+                    self._generation,
+                    len(data),
+                )
                 return
+            self._wire_rx_count += 1
+            _LOGGER.debug(
+                "RX wire notification: generation=%d count=%d length=%d",
+                generation,
+                self._wire_rx_count,
+                len(data),
+            )
             current_callback = self._notification_callback
             if current_callback is not None:
                 current_callback(bytes(data))
 
+        _LOGGER.debug(
+            "Subscribing to purifier notifications: generation=%d characteristic=%s",
+            generation,
+            NOTIFY_CHARACTERISTIC_UUID,
+        )
         try:
             await client.start_notify(
                 self._notify_characteristic, notification_received
             )
         except Exception as err:
-            raise GattTransportError("Unable to subscribe to notifications") from err
+            self._last_error = exception_detail(err)
+            raise GattTransportError(
+                "Unable to subscribe to notifications; "
+                f"generation={generation}; cause={self._last_error}"
+            ) from err
+        _LOGGER.debug("Notification subscription active: generation=%d", generation)
 
     async def async_write(self, data: bytes) -> None:
         """Write one frame using ATT Write Command (without response)."""
@@ -219,7 +368,18 @@ class GattTransport:
                     self._command_characteristic, data, response=False
                 )
             except Exception as err:
-                raise GattTransportError("Unable to write command frame") from err
+                self._last_error = exception_detail(err)
+                raise GattTransportError(
+                    "Unable to write command frame; "
+                    f"generation={generation}; cause={self._last_error}"
+                ) from err
+            self._wire_tx_count += 1
+            _LOGGER.debug(
+                "TX wire frame: generation=%d count=%d length=%d response=False",
+                generation,
+                self._wire_tx_count,
+                len(data),
+            )
             if generation != self._generation or not client.is_connected:
                 raise GattTransportError("Connection dropped during command write")
 
@@ -233,11 +393,22 @@ class GattTransport:
         if client is None:
             return
 
+        _LOGGER.debug(
+            "Disconnecting %s: generation=%d connected=%s",
+            self.name,
+            self._generation,
+            client.is_connected,
+        )
         # Clearing the client before awaiting makes the Bleak disconnect callback
         # a deliberate/stale disconnect rather than an unexpected one.
         with suppress(Exception):
             if client.is_connected:
                 await client.disconnect()
+        _LOGGER.debug(
+            "Disconnect complete for %s: generation=%d",
+            self.name,
+            self._generation,
+        )
 
     def _require_client(self) -> BleakClientWithServiceCache:
         client = self._client
@@ -264,6 +435,12 @@ class GattTransport:
         self._notification_callback = None
         self._notify_characteristic = None
         self._command_characteristic = None
-        _LOGGER.debug("%s disconnected (generation %s)", self.name, generation)
+        _LOGGER.debug(
+            "%s disconnected unexpectedly: generation=%d wire_tx=%d wire_rx=%d",
+            self.name,
+            generation,
+            self._wire_tx_count,
+            self._wire_rx_count,
+        )
         if self._disconnect_callback is not None:
             self._disconnect_callback(generation)

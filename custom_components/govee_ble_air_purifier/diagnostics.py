@@ -49,6 +49,7 @@ async def async_get_config_entry_diagnostics(
             },
             "client_status": _diagnostic_value(coordinator.client.status),
             "client_ready": coordinator.client.is_ready,
+            "client": coordinator.client.diagnostic_snapshot(),
         },
         "cached_state": {
             field: _diagnostic_value(getattr(state, field, None))
