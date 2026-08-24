@@ -11,6 +11,7 @@ import pytest
 
 from custom_components.govee_ble_air_purifier import client as client_module
 from custom_components.govee_ble_air_purifier.bluetooth import (
+    CONNECTION_ATTEMPT_TIMEOUT,
     BluetoothUnavailableError,
     GattTransportError,
 )
@@ -117,6 +118,17 @@ def test_old_generation_callbacks_are_ignored() -> None:
 
     assert client._frame_queue.empty()
     assert not client._disconnected.is_set()
+
+
+def test_startup_budget_allows_two_complete_connection_cycles() -> None:
+    """Setup can wait for two advertisements and two bounded connections."""
+    maximum_first_backoff = client_module.BACKOFF_MIN * 1.2
+    two_cycle_budget = (
+        2 * (client_module.FRESH_ADVERTISEMENT_TIMEOUT + CONNECTION_ATTEMPT_TIMEOUT)
+        + maximum_first_backoff
+    )
+
+    assert client_module.STARTUP_TIMEOUT >= two_cycle_budget
 
 
 @pytest.mark.asyncio

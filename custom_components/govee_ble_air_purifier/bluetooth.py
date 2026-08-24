@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
 from typing import Any
@@ -22,6 +23,9 @@ NOTIFY_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b10"
 COMMAND_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b11"
 
 CONNECT_ATTEMPTS = 1
+CONNECTION_ATTEMPT_TIMEOUT = 15.0
+CONNECTION_ABORT_TIMEOUT = 5.0
+RECENT_CONNECTION_FAILURE_LIMIT = 4
 ADVERTISEMENT_CHECK_INTERVAL = 0.25
 
 NotificationCallback = Callable[[bytes], None]
@@ -361,6 +365,8 @@ class GattTransport:
     def __init__(self, *, name: str) -> None:
         self.name = name
         self._client: BleakClientWithServiceCache | None = None
+        self._connecting_client: BleakClientWithServiceCache | None = None
+        self._connecting_address: str | None = None
         self._notify_characteristic: Any = None
         self._command_characteristic: Any = None
         self._notification_callback: NotificationCallback | None = None
@@ -379,6 +385,9 @@ class GattTransport:
         self._pre_return_disconnects = 0
         self._last_disconnect_stage: str | None = None
         self._last_disconnect_elapsed: float | None = None
+        self._recent_connection_failures: deque[str] = deque(
+            maxlen=RECENT_CONNECTION_FAILURE_LIMIT
+        )
 
     @property
     def generation(self) -> int:
@@ -404,6 +413,8 @@ class GattTransport:
             "pre_return_disconnects": self._pre_return_disconnects,
             "last_disconnect_stage": self._last_disconnect_stage,
             "last_disconnect_elapsed_seconds": self._last_disconnect_elapsed,
+            "connecting_client_present": self._connecting_client is not None,
+            "recent_connection_failures": list(self._recent_connection_failures),
         }
 
     def _set_stage(self, stage: str) -> None:
@@ -423,10 +434,48 @@ class GattTransport:
     def _failure_summary(self, error: BaseException) -> str:
         """Describe a transport failure without hiding its stage or cause chain."""
         return (
+            f"attempt={self._connection_attempts}; "
             f"stage={self._connection_stage}; elapsed={self._elapsed():.3f}s; "
             f"pre_return_disconnects={self._pre_return_disconnects}; "
             f"cause={exception_chain_detail(error)}"
         )
+
+    def _record_connection_failure(self, detail: str) -> None:
+        """Keep bounded evidence from attempts preceding the final failure."""
+        self._last_error = detail
+        self._recent_connection_failures.append(detail)
+
+    async def _async_abort_connecting_client(self) -> None:
+        """Release a partially established client before another route is tried."""
+        client = self._connecting_client
+        address = self._connecting_address
+        self._connecting_client = None
+        self._connecting_address = None
+        if client is None:
+            return
+
+        self._set_stage("aborting_connection")
+        _LOGGER.debug(
+            "Aborting incomplete Bluetooth connection to %s: generation=%d "
+            "address=%s connected=%s",
+            self.name,
+            self._generation,
+            address,
+            client.is_connected,
+        )
+        try:
+            async with asyncio.timeout(CONNECTION_ABORT_TIMEOUT):
+                await client.disconnect()
+        except Exception as err:
+            _LOGGER.debug(
+                "Incomplete Bluetooth connection cleanup failed for %s at %s: %s",
+                self.name,
+                address,
+                exception_detail(err),
+                exc_info=True,
+            )
+        finally:
+            self._set_stage("connection_aborted")
 
     def set_disconnect_callback(self, callback: DisconnectCallback | None) -> None:
         """Set the callback invoked for an unexpected current disconnect."""
@@ -446,38 +495,79 @@ class GattTransport:
         self._connection_attempts += 1
         _LOGGER.debug(
             "Connecting to %s at %s: generation=%d attempt=%d "
-            "connector_attempts=%d connector_timeout=library_default",
+            "connector_attempts=%d attempt_timeout=%.1fs",
             self.name,
             device.address,
             generation,
             self._connection_attempts,
             CONNECT_ATTEMPTS,
+            CONNECTION_ATTEMPT_TIMEOUT,
         )
 
+        def create_tracked_client(
+            *args: Any, **kwargs: Any
+        ) -> BleakClientWithServiceCache:
+            client = BleakClientWithServiceCache(*args, **kwargs)
+            self._connecting_client = client
+            self._connecting_address = device.address
+            return client
+
         try:
-            client = await establish_connection(
-                BleakClientWithServiceCache,
-                device,
-                self.name,
-                disconnected_callback=lambda connected_client: (
-                    self._disconnected_from_bleak(connected_client, generation)
-                ),
-                max_attempts=CONNECT_ATTEMPTS,
+            async with asyncio.timeout(CONNECTION_ATTEMPT_TIMEOUT):
+                client = await establish_connection(
+                    create_tracked_client,  # type: ignore[arg-type]
+                    device,
+                    self.name,
+                    disconnected_callback=lambda connected_client: (
+                        self._disconnected_from_bleak(connected_client, generation)
+                    ),
+                    max_attempts=CONNECT_ATTEMPTS,
+                )
+        except TimeoutError as err:
+            detail = (
+                f"attempt={self._connection_attempts}; "
+                f"stage={self._connection_stage}; elapsed={self._elapsed():.3f}s; "
+                f"deadline={CONNECTION_ATTEMPT_TIMEOUT:.1f}s; "
+                f"pre_return_disconnects={self._pre_return_disconnects}; "
+                "cause=TimeoutError: connection attempt deadline exceeded"
             )
+            self._record_connection_failure(detail)
+            await self._async_abort_connecting_client()
+            _LOGGER.debug(
+                "Bluetooth connection attempt timed out for %s at %s "
+                "generation=%d: %s",
+                self.name,
+                device.address,
+                generation,
+                detail,
+                exc_info=True,
+            )
+            raise BluetoothUnavailableError(
+                f"Unable to connect to {self.name} at {device.address}; "
+                f"generation={generation}; cause={detail}"
+            ) from err
+        except asyncio.CancelledError:
+            await self._async_abort_connecting_client()
+            raise
         except Exception as err:
-            self._last_error = self._failure_summary(err)
+            detail = self._failure_summary(err)
+            self._record_connection_failure(detail)
+            await self._async_abort_connecting_client()
             _LOGGER.debug(
                 "Bluetooth connection failed for %s at %s generation=%d: %s",
                 self.name,
                 device.address,
                 generation,
-                self._last_error,
+                detail,
                 exc_info=True,
             )
             raise BluetoothUnavailableError(
                 f"Unable to connect to {self.name} at {device.address}; "
-                f"generation={generation}; cause={self._last_error}"
+                f"generation={generation}; cause={detail}"
             ) from err
+
+        self._connecting_client = None
+        self._connecting_address = None
 
         if generation != self._generation:
             with suppress(Exception):

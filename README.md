@@ -82,7 +82,11 @@ advertisement age so a stale route can be distinguished from a weak fresh one.
 On supported Home Assistant versions, failures also include the platform's
 connection reachability and proxy-slot diagnosis. Setup cleanup preserves the
 last meaningful failure instead of replacing it with a generic disconnected
-message.
+message. Each BLE connection attempt has a 15-second deadline; an incomplete
+client is explicitly disconnected before the integration waits for another
+live advertisement and retries through a freshly resolved route. The setup
+window permits at least two complete advertisement-and-connection attempts and
+retains a bounded history of recent connection failures.
 
 For frame-by-frame diagnostics, add this to `configuration.yaml` and restart
 Home Assistant:

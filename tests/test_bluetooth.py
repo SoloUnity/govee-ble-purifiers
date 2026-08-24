@@ -98,6 +98,55 @@ async def test_connect_error_records_disconnect_before_connector_returns(
     assert isinstance(diagnostics["last_disconnect_elapsed_seconds"], float)
 
 
+@pytest.mark.asyncio
+async def test_connection_deadline_cleans_partial_client_and_records_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stuck BlueZ attempt is released before a fresh-route retry."""
+
+    class FakeClient:
+        def __init__(self, *_: object, **__: object) -> None:
+            self.is_connected = False
+            self.disconnect_calls = 0
+            clients.append(self)
+
+        async def disconnect(self) -> None:
+            self.disconnect_calls += 1
+
+    clients: list[FakeClient] = []
+
+    async def hang_connection(
+        client_class: object, device: object, *_: object, **__: object
+    ) -> None:
+        client_class(device)  # type: ignore[operator]
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(bluetooth_module, "BleakClientWithServiceCache", FakeClient)
+    monkeypatch.setattr(bluetooth_module, "establish_connection", hang_connection)
+    monkeypatch.setattr(bluetooth_module, "CONNECTION_ATTEMPT_TIMEOUT", 0.01)
+    transport = GattTransport(name="Bedroom purifier")
+    device = SimpleNamespace(
+        address="AA:BB:CC:DD:EE:FF",
+        name="ihoment_H7129_TEST",
+    )
+
+    for attempt in range(1, 3):
+        with pytest.raises(BluetoothUnavailableError) as raised:
+            await transport.async_connect(device)  # type: ignore[arg-type]
+        assert f"attempt={attempt}" in str(raised.value)
+        assert "connection attempt deadline exceeded" in str(raised.value)
+
+    assert len(clients) == 2
+    assert [client.disconnect_calls for client in clients] == [1, 1]
+    diagnostics = transport.diagnostic_snapshot()
+    assert diagnostics["connecting_client_present"] is False
+    failures = diagnostics["recent_connection_failures"]
+    assert isinstance(failures, list)
+    assert len(failures) == 2
+    assert "attempt=1" in failures[0]
+    assert "attempt=2" in failures[1]
+
+
 def test_route_diagnostics_reports_advertisement_age(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
