@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, override
@@ -15,7 +16,10 @@ from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import format_mac
 
-from .bluetooth import BluetoothUnavailableError
+from .bluetooth import (
+    RECENT_CACHED_ADVERTISEMENT_MAX_AGE,
+    BluetoothUnavailableError,
+)
 from .const import CONF_MODEL, DOMAIN, INTEGRATION_NAME
 from .coordinator import GoveeDataUpdateCoordinator
 from .models import Model
@@ -52,12 +56,32 @@ def _model_from_name(name: str | None) -> str | None:
 
 def _discover_purifiers(
     service_infos: Iterable[BluetoothServiceInfoBleak],
+    *,
+    seen_after: float | None = None,
 ) -> tuple[DiscoveredPurifier, ...]:
     """Return supported discoveries ordered from strongest to weakest signal."""
     discovered = []
     for service_info in service_infos:
         model = _model_from_name(service_info.name)
         if model is None or not service_info.connectable:
+            continue
+        advertisement_time = getattr(service_info, "time", None)
+        if seen_after is not None and (
+            not isinstance(advertisement_time, int | float)
+            or advertisement_time < seen_after
+        ):
+            advertisement_age = (
+                round(max(0.0, time.monotonic() - advertisement_time), 3)
+                if isinstance(advertisement_time, int | float)
+                else None
+            )
+            _LOGGER.debug(
+                "Excluding stale purifier from manual setup: name=%s "
+                "address=%s advertisement_age_seconds=%s",
+                service_info.name,
+                service_info.address,
+                advertisement_age,
+            )
             continue
         discovered.append(
             DiscoveredPurifier(
@@ -85,23 +109,31 @@ def _discovery_options(
     }
 
 
-async def _async_request_active_discovery_scan(hass: HomeAssistant) -> None:
-    """Refresh AUTO-mode scanner data without requiring a newer HA release."""
+async def _async_request_active_discovery_scan(hass: HomeAssistant) -> float | None:
+    """Refresh AUTO scanners and return the successful sweep's start time."""
     request_active_scan = getattr(bluetooth, "async_request_active_scan", None)
     if request_active_scan is None:
         _LOGGER.debug(
-            "One-shot active Bluetooth scanning is unavailable; using cached "
-            "discoveries"
+            "One-shot active Bluetooth scanning is unavailable; using only "
+            "recent cached discoveries"
         )
-        return
+        return None
+    started_at = time.monotonic()
     try:
         await request_active_scan(hass)
     except Exception as err:  # noqa: BLE001
         _LOGGER.debug(
-            "One-shot active Bluetooth scan failed; using cached discoveries: %s",
+            "One-shot active Bluetooth scan failed; using only recent cached "
+            "discoveries: %s",
             err,
             exc_info=True,
         )
+        return None
+    _LOGGER.debug(
+        "One-shot active Bluetooth scan completed in %.3f seconds",
+        time.monotonic() - started_at,
+    )
+    return started_at
 
 
 async def _async_validate_purifier(
@@ -133,6 +165,7 @@ class GoveeBleAirPurifierConfigFlow(ConfigFlow, domain=DOMAIN):
         """Initialize the flow."""
         self._discovery_info: BluetoothServiceInfoBleak | None = None
         self._discovered_model: str | None = None
+        self._manual_discoveries: tuple[DiscoveredPurifier, ...] | None = None
 
     @override
     async def async_step_bluetooth(
@@ -200,24 +233,34 @@ class GoveeBleAirPurifierConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Choose a currently discovered purifier without entering an address."""
         if user_input is None:
-            await _async_request_active_discovery_scan(self.hass)
+            scan_started_at = await _async_request_active_discovery_scan(self.hass)
+            seen_after = scan_started_at or (
+                time.monotonic() - RECENT_CACHED_ADVERTISEMENT_MAX_AGE
+            )
+            configured_ids = {
+                entry.unique_id
+                for entry in self._async_current_entries()
+                if entry.unique_id is not None
+            }
+            self._manual_discoveries = tuple(
+                device
+                for device in _discover_purifiers(
+                    bluetooth.async_discovered_service_info(
+                        self.hass,
+                        connectable=True,
+                    ),
+                    seen_after=seen_after,
+                )
+                if _unique_id_from_address(device.address) not in configured_ids
+            )
+            _LOGGER.debug(
+                "Manual purifier discovery snapshot contains %d fresh, "
+                "unconfigured device(s)",
+                len(self._manual_discoveries),
+            )
 
         errors: dict[str, str] = {}
-        configured_ids = {
-            entry.unique_id
-            for entry in self._async_current_entries()
-            if entry.unique_id is not None
-        }
-        discoveries = tuple(
-            device
-            for device in _discover_purifiers(
-                bluetooth.async_discovered_service_info(
-                    self.hass,
-                    connectable=True,
-                )
-            )
-            if _unique_id_from_address(device.address) not in configured_ids
-        )
+        discoveries = self._manual_discoveries or ()
 
         if not discoveries:
             return self.async_abort(reason="no_devices_found")

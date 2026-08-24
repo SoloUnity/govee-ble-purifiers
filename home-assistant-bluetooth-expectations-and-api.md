@@ -633,9 +633,11 @@ The Govee purifier integration applies the general model as follows:
 - Home Assistant's shared advertisement history is not cleared by a connection
   cycle.
 - Opening this integration's manual **Add device** flow requests one shared
-  active sweep before reading discoveries. The request affects `AUTO` scanners
-  on supported Home Assistant versions and falls back to cached discoveries if
-  unavailable or unsuccessful.
+  active sweep before reading discoveries. After a successful sweep, only
+  purifiers observed during that window are offered and that list remains
+  stable through selection. The request affects `AUTO` scanners on supported
+  Home Assistant versions; if unavailable or unsuccessful, only cache entries
+  no more than five seconds old are offered.
 - A new connectable `BLEDevice` and new Bleak client are used per cycle.
 - A GATT connection attempt has a 25-second deadline. This allows the
   connector's shorter internal attempt to finish before the integration's

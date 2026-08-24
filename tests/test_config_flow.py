@@ -1,5 +1,6 @@
 """Tests for the Govee BLE Air Purifier config flow."""
 
+import time
 from collections.abc import Generator
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -51,12 +52,14 @@ def _service_info(
     rssi: int,
     *,
     connectable: bool = True,
+    advertisement_time: float | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         name=name,
         address=address,
         rssi=rssi,
         connectable=connectable,
+        time=time.monotonic() if advertisement_time is None else advertisement_time,
     )
 
 
@@ -73,6 +76,7 @@ async def test_user_flow_selects_discovered_purifier_without_address_entry(
 
     async def active_scan(_: HomeAssistant) -> None:
         call_order.append("active_scan")
+        discovery.time = time.monotonic()
 
     def discoveries(*_: object, **__: object) -> tuple[SimpleNamespace, ...]:
         call_order.append("discovery_cache")
@@ -130,7 +134,40 @@ async def test_user_flow_selects_discovered_purifier_without_address_entry(
         name=discovery.name,
     )
     request_active_scan.assert_awaited_once_with(hass)
-    assert call_order[:2] == ["active_scan", "discovery_cache"]
+    assert call_order == ["active_scan", "discovery_cache"]
+
+
+async def test_user_flow_excludes_device_not_seen_during_active_scan(
+    hass: HomeAssistant,
+) -> None:
+    """A completed sweep cannot offer an old Home Assistant cache entry."""
+    stale_discovery = _service_info(
+        "GVH7124STALE",
+        "AA:BB:CC:DD:EE:FF",
+        -87,
+        advertisement_time=time.monotonic() - 194,
+    )
+
+    with (
+        patch.object(
+            config_flow_module.bluetooth,
+            "async_request_active_scan",
+            new_callable=AsyncMock,
+            create=True,
+        ) as request_active_scan,
+        patch(
+            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "async_discovered_service_info",
+            return_value=(stale_discovery,),
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "no_devices_found"
+    request_active_scan.assert_awaited_once_with(hass)
 
 
 async def test_user_flow_falls_back_to_cache_when_active_scan_fails(
@@ -158,6 +195,38 @@ async def test_user_flow_falls_back_to_cache_when_active_scan_fails(
 
     assert result["type"] is FlowResultType.FORM
     request_active_scan.assert_awaited_once_with(hass)
+
+
+async def test_user_flow_failed_scan_rejects_stale_cache(
+    hass: HomeAssistant,
+) -> None:
+    """The compatibility fallback cannot offer an unreachable stale device."""
+    stale_discovery = _service_info(
+        "GVH7124STALE",
+        "AA:BB:CC:DD:EE:FF",
+        -87,
+        advertisement_time=time.monotonic() - 194,
+    )
+
+    with (
+        patch.object(
+            config_flow_module.bluetooth,
+            "async_request_active_scan",
+            new=AsyncMock(side_effect=RuntimeError("scanner unavailable")),
+            create=True,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "async_discovered_service_info",
+            return_value=(stale_discovery,),
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "no_devices_found"
 
 
 async def test_user_flow_aborts_when_no_supported_device_is_visible(

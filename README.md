@@ -38,10 +38,12 @@ The integration matches the observed advertised-name families `GVH7124*` and
 `ihoment_H7129_*`; the model is inferred from that name. Manual setup never asks
 for a Bluetooth address. Opening **Add device** requests Home Assistant's shared
 one-shot active scan on supported versions, then lists unconfigured discoveries
-by advertised name. The strongest current signal is labeled **Near** and the
-remaining devices are labeled **Far**. If active scanning is unavailable or the
-sweep fails, setup safely falls back to Home Assistant's discovery cache. The
-address is retained internally only as the stable device identity.
+observed during that completed scan. The strongest current signal is labeled
+**Near** and the remaining devices are labeled **Far**. The list is held stable
+while the user makes a selection. If active scanning is unavailable or the
+sweep fails, setup accepts only cache entries recent enough for an initial
+connection. The address is retained internally only as the stable device
+identity.
 
 ## Data updates
 
