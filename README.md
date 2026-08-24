@@ -53,9 +53,12 @@ refresh sweeps, and unsolicited device notifications.
 
 If Bluetooth drops or the purifier is unplugged, the integration marks state
 unavailable, discards any H7129 session material, and reconnects with capped
-exponential backoff. A command interrupted by a disconnect is verified after a
-new connection when the protocol exposes authoritative state; old commands are
-not replayed indefinitely.
+exponential backoff. Each connection cycle ignores replayed discovery cache,
+waits for a live advertisement, resolves Home Assistant's current best local or
+proxy route, and creates one fresh Bluetooth client. A failed route is discarded
+before the next cycle. A command interrupted by a disconnect is verified after
+a new connection when the protocol exposes authoritative state; old commands
+are not replayed indefinitely.
 
 ## Known limitations
 
@@ -76,6 +79,8 @@ available. Connection failures additionally report elapsed time, disconnects
 that occurred before GATT discovery returned, and both the selected and current
 Bluetooth routes. Route details include the adapter or proxy source, RSSI, and
 advertisement age so a stale route can be distinguished from a weak fresh one.
+On supported Home Assistant versions, failures also include the platform's
+connection reachability and proxy-slot diagnosis.
 
 For frame-by-frame diagnostics, add this to `configuration.yaml` and restart
 Home Assistant:

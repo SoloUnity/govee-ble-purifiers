@@ -52,6 +52,7 @@ INITIALIZATION_ATTEMPTS = 2
 COMMAND_DEADLINE = 30.0
 COMMAND_SEND_ATTEMPTS = 3
 STARTUP_TIMEOUT = 35.0
+FRESH_ADVERTISEMENT_TIMEOUT = 10.0
 BETWEEN_REQUEST_DELAY = 0.001
 BACKOFF_MIN = 1.0
 BACKOFF_MAX = 60.0
@@ -291,22 +292,32 @@ class ReliablePurifierClient:
         self._refresh_pending = False
         self._refresh_running = False
         self._invalidate_connection_scoped_state()
+        cached_route = self._environment.route_diagnostics()
+        cached_reachability = self._environment.reachability_diagnostics()
         _LOGGER.debug(
             "Starting purifier connection cycle=%d session_generation=%d "
-            "model=%s security=%s route=%s",
+            "model=%s security=%s route=%s reachability=%s",
             self._connection_cycles,
             session_generation,
             self._profile.model.value,
             self._profile.security.value,
-            self._environment.route_diagnostics(),
+            cached_route,
+            cached_reachability,
         )
 
         self.status = ClientStatus.WAITING_FOR_ADVERTISEMENT
-        device = self._environment.get_connectable_device()
+        device = await self._environment.async_wait_for_fresh_device(
+            FRESH_ADVERTISEMENT_TIMEOUT
+        )
         if device is None:
-            device = await self._environment.async_wait_for_device(BACKOFF_MIN)
-        if device is None:
-            raise BluetoothUnavailableError("No connectable advertisement is present")
+            raise BluetoothUnavailableError(
+                "No live connectable advertisement was received; "
+                f"cached_route={cached_route}; "
+                f"cached_reachability={cached_reachability}; "
+                f"current_route={self._environment.route_diagnostics()}; "
+                f"current_reachability="
+                f"{self._environment.reachability_diagnostics()}"
+            )
 
         self.status = ClientStatus.CONNECTING
         selected_route = self._environment.route_diagnostics()
@@ -327,7 +338,8 @@ class ReliablePurifierClient:
         except (BluetoothUnavailableError, GattTransportError) as err:
             route_summary = (
                 f"selected_route={selected_route}; "
-                f"current_route={self._environment.route_diagnostics()}"
+                f"current_route={self._environment.route_diagnostics()}; "
+                f"reachability={self._environment.reachability_diagnostics()}"
             )
             if isinstance(err, BluetoothUnavailableError):
                 raise BluetoothUnavailableError(f"{err}; {route_summary}") from err

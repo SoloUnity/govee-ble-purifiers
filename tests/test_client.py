@@ -37,6 +37,15 @@ class FakeEnvironment:
     def route_diagnostics(self) -> dict[str, object]:
         return {"present": True, "source": "test", "rssi": -50}
 
+    def reachability_diagnostics(self) -> str:
+        return "test route is reachable"
+
+    async def async_wait_for_fresh_device(self, _: float) -> SimpleNamespace:
+        return SimpleNamespace(
+            name="ihoment_H7129_TEST",
+            address=self.address,
+        )
+
 
 class FakeTransport:
     generation = 7
@@ -108,12 +117,7 @@ def test_old_generation_callbacks_are_ignored() -> None:
 async def test_connection_error_surfaces_selected_and_current_routes() -> None:
     """Normal HA errors contain the route evidence needed for diagnosis."""
     client = make_client()
-    environment = client._environment
     transport = client._transport
-    environment.get_connectable_device = lambda: SimpleNamespace(  # type: ignore[attr-defined,method-assign]
-        name="ihoment_H7129_TEST",
-        address=environment.address,
-    )
     transport.set_disconnect_callback = lambda _: None  # type: ignore[attr-defined,method-assign]
 
     async def fail_connect(_: object) -> None:
@@ -128,6 +132,7 @@ async def test_connection_error_surfaces_selected_and_current_routes() -> None:
     assert "connector timed out" in message
     assert "selected_route={'present': True, 'source': 'test', 'rssi': -50}" in message
     assert "current_route={'present': True, 'source': 'test', 'rssi': -50}" in message
+    assert "reachability=test route is reachable" in message
 
 
 @pytest.mark.asyncio

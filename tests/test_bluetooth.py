@@ -32,8 +32,10 @@ async def test_connect_error_preserves_underlying_bleak_detail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Normal Home Assistant errors explain the underlying connector failure."""
+    connector_kwargs: dict[str, object] = {}
 
-    async def fail_connection(*_: object, **__: object) -> None:
+    async def fail_connection(*_: object, **kwargs: object) -> None:
+        connector_kwargs.update(kwargs)
         raise RuntimeError("adapter route unavailable")
 
     monkeypatch.setattr(
@@ -59,6 +61,7 @@ async def test_connect_error_preserves_underlying_bleak_detail(
     assert "stage=establish_connection" in str(
         transport.diagnostic_snapshot()["last_error"]
     )
+    assert connector_kwargs["max_attempts"] == 1
 
 
 @pytest.mark.asyncio
@@ -123,3 +126,124 @@ def test_route_diagnostics_reports_advertisement_age(
     assert route["rssi"] == -71
     assert 1.9 <= route["advertisement_age_seconds"] <= 2.1
     assert route["callback_age_seconds"] is None
+
+
+@pytest.mark.asyncio
+async def test_callback_registration_disables_cached_replay_when_supported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replayed cache entry cannot masquerade as a live advertisement."""
+    registration: dict[str, object] = {}
+
+    def register(*args: object, **kwargs: object) -> object:
+        registration["args"] = args
+        registration["kwargs"] = kwargs
+        return lambda: None
+
+    monkeypatch.setattr(
+        bluetooth_module.bluetooth,
+        "BluetoothCallbackReplay",
+        SimpleNamespace(DISABLED="disabled"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        bluetooth_module.bluetooth,
+        "async_register_callback",
+        register,
+    )
+    environment = HomeAssistantBluetoothEnvironment(
+        SimpleNamespace(),  # type: ignore[arg-type]
+        "AA:BB:CC:DD:EE:FF",
+    )
+
+    await environment.async_start()
+
+    assert registration["kwargs"] == {"replay": "disabled"}
+
+
+@pytest.mark.asyncio
+async def test_wait_for_fresh_device_rejects_cache_and_uses_live_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Connection starts only after a post-cutoff advertisement is available."""
+    device = SimpleNamespace(address="AA:BB:CC:DD:EE:FF", name="H7129")
+    stale_info = SimpleNamespace(
+        device=device,
+        name="ihoment_H7129_TEST",
+        source="test-adapter",
+        rssi=-80,
+        tx_power=None,
+        connectable=True,
+        time=time.monotonic() - 30,
+    )
+    current_info = stale_info
+    clears: list[str] = []
+    monkeypatch.setattr(
+        bluetooth_module.bluetooth,
+        "async_last_service_info",
+        lambda *_args, **_kwargs: current_info,
+    )
+    monkeypatch.setattr(
+        bluetooth_module.bluetooth,
+        "async_ble_device_from_address",
+        lambda *_args, **_kwargs: device,
+    )
+    monkeypatch.setattr(
+        bluetooth_module.bluetooth,
+        "async_clear_advertisement_history",
+        lambda _hass, address: clears.append(address),
+        raising=False,
+    )
+    environment = HomeAssistantBluetoothEnvironment(
+        SimpleNamespace(),  # type: ignore[arg-type]
+        device.address,
+    )
+
+    wait_task = asyncio.create_task(environment.async_wait_for_fresh_device(1.0))
+    await asyncio.sleep(0)
+    assert not wait_task.done()
+
+    current_info = SimpleNamespace(
+        **{
+            **stale_info.__dict__,
+            "rssi": -73,
+            "time": time.monotonic(),
+        }
+    )
+    environment._advertisement_received(current_info)
+
+    assert await wait_task is device
+    assert clears == [device.address]
+    route = environment.route_diagnostics()
+    assert route["rssi"] == -73
+    assert route["fresh_advertisements"] == 1
+
+
+def test_reachability_diagnostics_uses_connection_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure logs request Home Assistant's connection-specific diagnosis."""
+    calls: list[tuple[object, str, object]] = []
+    connection_intent = object()
+    monkeypatch.setattr(
+        bluetooth_module.bluetooth,
+        "BluetoothReachabilityIntent",
+        SimpleNamespace(CONNECTION=connection_intent),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        bluetooth_module.bluetooth,
+        "async_address_reachability_diagnostics",
+        lambda hass, address, intent: (
+            calls.append((hass, address, intent)) or "one connectable route"
+        ),
+        raising=False,
+    )
+    hass = SimpleNamespace()
+    environment = HomeAssistantBluetoothEnvironment(
+        hass,  # type: ignore[arg-type]
+        "AA:BB:CC:DD:EE:FF",
+    )
+
+    assert environment.reachability_diagnostics() == "one connectable route"
+    assert calls == [(hass, environment.address, connection_intent)]
