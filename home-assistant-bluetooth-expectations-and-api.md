@@ -289,25 +289,37 @@ Each newly opened user flow applies the APIs above as follows:
    exposes that API.
 3. If the request fails, is unavailable, or returns early, continue observing
    the shared scanner until the integration's full ten-second deadline elapses.
-4. Retain the last valid `GVH7124*` or `ihoment_H7129_*` name for each address.
-   A later nameless or address-only packet cannot erase an identity learned in
-   the same scan window.
-5. At the deadline, merge connectable shared-cache entries only when their
+4. Seed a session identity map from valid `GVH7124*` or `ihoment_H7129_*` names
+   already retained in Home Assistant's service-info cache or connectable
+   `BLEDevice` objects. This historical information identifies an address but
+   does not satisfy the current scan's reachability requirement.
+5. Record all fresh connectable address sightings during the window, including
+   nameless and address-only packets. Retain valid supported names learned by
+   this and earlier setup flows for the lifetime of the Home Assistant process;
+   a nameless packet cannot erase them.
+6. At the deadline, merge connectable shared-cache entries only when their
    advertisement timestamp was refreshed during this window. This recovers
    current static advertisements that Home Assistant deduplicated before
    callback delivery without admitting old cache entries.
-6. Remove configured addresses and unsupported devices, sort the remaining
-   devices by RSSI, and freeze the choices for the rest of this flow.
-7. After selection, use `async_process_advertisements()` to request and wait up
+7. Join current sightings to known identities by normalized address. Remove
+   configured addresses and unresolved or unsupported devices, sort the
+   remaining devices by RSSI, and freeze the choices for the rest of this flow.
+   If nameless devices were freshly seen but none could be identified, report
+   that condition separately from receiving no fresh Bluetooth traffic.
+8. After selection, use `async_process_advertisements()` to request and wait up
    to ten seconds for new connectable evidence from that exact address. Reject
    cached replay with a timestamp predicate and concurrently accept a shared
    cache timestamp refreshed after this wait began, because Home Assistant can
    update history before suppressing an identical callback. A nameless fresh
    packet is valid reachability evidence because the model identity was retained
    from the list scan; a conflicting supported model name is rejected.
-8. Begin protocol initialization immediately after the fresh packet rather than
+9. Begin protocol initialization immediately after the fresh packet rather than
    waiting out the selected-device timeout. Keep the setup form open with a
    `not_discovered` error when no fresh packet arrives.
+
+The setup flow does not infer models from Bluetooth addresses and does not open
+GATT connections to unidentified devices to read the GAP Device Name
+characteristic. Identity recovery remains passive and address-correlated.
 
 This setup-only wait does not change normal operation or the protocol's
 three-second `aa 01` state-query cadence.
@@ -732,10 +744,17 @@ The Govee purifier integration applies the general model as follows:
 - Every new user flow registers a temporary shared-scanner listener, requests a
   ten-second active window, and owns the full ten-second observation deadline
   even if the Home Assistant request fails, is unavailable, or returns early.
-- Setup retains the last valid supported name per address and merges only cache
-  entries whose timestamps were refreshed during that window. Older cached
-  devices, unsupported names, non-connectable routes, and configured addresses
+- Setup records fresh addresses independently from purifier identity. It can
+  recover a valid supported name for the same address from Home Assistant's
+  service-info cache, a connectable `BLEDevice`, or an earlier setup flow in the
+  current Home Assistant session. Only cache entries refreshed during the new
+  window establish reachability; older identity data alone cannot list a
+  device. Unresolved, unsupported, non-connectable, and configured addresses
   are excluded. Choices remain stable through selection.
+- Fresh nameless traffic without a known supported identity produces a specific
+  setup result instead of the generic no-devices result. Models are never
+  inferred from addresses, and setup does not connect to unidentified devices
+  to read their GATT names.
 - Selection requires new connectable evidence from that address within ten
   seconds. Cached replay cannot satisfy the timestamp predicate; either the
   address-specific callback or a shared-cache timestamp refreshed during the

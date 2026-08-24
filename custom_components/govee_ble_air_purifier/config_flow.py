@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, override
+from typing import Any, cast, override
 
 import voluptuous as vol
 from homeassistant.components import bluetooth
@@ -28,6 +28,24 @@ _LOGGER = logging.getLogger(__name__)
 MANUAL_DISCOVERY_SCAN_DURATION = 10.0
 SELECTED_DEVICE_ADVERTISEMENT_TIMEOUT = 10
 SELECTED_ADVERTISEMENT_CHECK_INTERVAL = 0.25
+_SETUP_IDENTITY_CACHE = f"{DOMAIN}_setup_identity_cache"
+
+
+@dataclass(frozen=True, slots=True)
+class PurifierIdentity:
+    """A supported purifier identity learned independently of reachability."""
+
+    name: str
+    model: str
+
+
+@dataclass(frozen=True, slots=True)
+class FreshBluetoothSighting:
+    """Address-level evidence observed during the current setup scan."""
+
+    address: str
+    rssi: int
+    name_missing: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +56,14 @@ class DiscoveredPurifier:
     name: str
     model: str
     rssi: int
+
+
+@dataclass(frozen=True, slots=True)
+class PurifierDiscoveryResult:
+    """Resolved purifiers and unresolved nameless Bluetooth observations."""
+
+    purifiers: tuple[DiscoveredPurifier, ...]
+    unnamed_devices_seen: bool
 
 
 def _unique_id_from_address(address: str) -> str:
@@ -57,19 +83,114 @@ def _model_from_name(name: str | None) -> str | None:
     return None
 
 
-def _record_discovery(
-    discoveries: dict[str, DiscoveredPurifier],
+def _identity_cache(hass: HomeAssistant) -> dict[str, PurifierIdentity]:
+    """Return identities retained for the lifetime of Home Assistant."""
+    return cast(
+        dict[str, PurifierIdentity],
+        hass.data.setdefault(_SETUP_IDENTITY_CACHE, {}),
+    )
+
+
+def _remember_identity(
+    identities: dict[str, PurifierIdentity],
+    *,
+    address: str,
+    name: str | None,
+) -> PurifierIdentity | None:
+    """Retain a supported advertised identity without implying freshness."""
+    model = _model_from_name(name)
+    if model is None or name is None:
+        return identities.get(_unique_id_from_address(address))
+    identity = PurifierIdentity(name=name, model=model)
+    identities[_unique_id_from_address(address)] = identity
+    return identity
+
+
+def _remember_ble_device_identity(
+    hass: HomeAssistant,
+    identities: dict[str, PurifierIdentity],
+    *,
+    address: str,
+) -> None:
+    """Best-effort recovery of a valid name retained on Home Assistant's device."""
+    try:
+        device = bluetooth.async_ble_device_from_address(
+            hass,
+            address,
+            connectable=True,
+        )
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.debug(
+            "Unable to inspect Home Assistant's BLE device name for %s: %s",
+            address,
+            err,
+            exc_info=True,
+        )
+        return
+    if device is not None:
+        _remember_identity(
+            identities,
+            address=address,
+            name=getattr(device, "name", None),
+        )
+
+
+def _name_is_missing(name: str | None, address: str) -> bool:
+    """Return whether an observation lacks a useful advertised name."""
+    return not name or name.casefold() == address.casefold()
+
+
+def _record_fresh_sighting(
+    sightings: dict[str, FreshBluetoothSighting],
+    identities: dict[str, PurifierIdentity],
     service_info: BluetoothServiceInfoBleak,
 ) -> None:
-    """Remember the latest valid name and signal for one purifier address."""
-    model = _model_from_name(service_info.name)
-    if model is None or not service_info.connectable:
+    """Record fresh reachability separately from any known identity."""
+    if not service_info.connectable:
         return
-    discoveries[service_info.address] = DiscoveredPurifier(
+    _remember_identity(
+        identities,
         address=service_info.address,
         name=service_info.name,
-        model=model,
-        rssi=service_info.rssi,
+    )
+    key = _unique_id_from_address(service_info.address)
+    previous = sightings.get(key)
+    sightings[key] = FreshBluetoothSighting(
+        address=service_info.address,
+        rssi=max(
+            service_info.rssi,
+            previous.rssi if previous is not None else service_info.rssi,
+        ),
+        name_missing=(
+            _name_is_missing(service_info.name, service_info.address)
+            or (previous.name_missing if previous is not None else False)
+        ),
+    )
+
+
+def _resolve_discoveries(
+    sightings: Iterable[FreshBluetoothSighting],
+    identities: dict[str, PurifierIdentity],
+) -> PurifierDiscoveryResult:
+    """Combine current reachability with independently learned identities."""
+    discoveries: list[DiscoveredPurifier] = []
+    unnamed_devices_seen = False
+    for sighting in sightings:
+        identity = identities.get(_unique_id_from_address(sighting.address))
+        if identity is None:
+            unnamed_devices_seen |= sighting.name_missing
+            continue
+        discoveries.append(
+            DiscoveredPurifier(
+                address=sighting.address,
+                name=identity.name,
+                model=identity.model,
+                rssi=sighting.rssi,
+            )
+        )
+    return PurifierDiscoveryResult(
+        purifiers=_sorted_discoveries(discoveries),
+        unnamed_devices_seen=unnamed_devices_seen,
     )
 
 
@@ -123,14 +244,35 @@ def _scanner_diagnostics(hass: HomeAssistant) -> list[dict[str, Any]] | None:
 
 async def _async_discover_purifiers(
     hass: HomeAssistant,
-) -> tuple[DiscoveredPurifier, ...]:
+) -> PurifierDiscoveryResult:
     """Collect supported purifiers during one complete setup scan window."""
     request_active_scan = getattr(bluetooth, "async_request_active_scan", None)
     started_at = time.monotonic()
     api_available = request_active_scan is not None
     scan_error: Exception | None = None
-    discoveries: dict[str, DiscoveredPurifier] = {}
+    identities = _identity_cache(hass)
+    sightings: dict[str, FreshBluetoothSighting] = {}
     accept_callbacks = False
+
+    # Identity is deliberately seeded before the freshness cutoff. A cached
+    # name may identify a later nameless packet, but it cannot make an address
+    # reachable because only sightings recorded below enter the result.
+    cached_before_scan = tuple(
+        bluetooth.async_discovered_service_info(hass, connectable=True)
+    )
+    for service_info in cached_before_scan:
+        if not service_info.connectable:
+            continue
+        _remember_identity(
+            identities,
+            address=service_info.address,
+            name=service_info.name,
+        )
+        _remember_ble_device_identity(
+            hass,
+            identities,
+            address=service_info.address,
+        )
 
     def _advertisement_received(
         service_info: BluetoothServiceInfoBleak,
@@ -141,16 +283,20 @@ async def _async_discover_purifiers(
         # registration completes are evidence from this scan window.
         if not accept_callbacks:
             return
-        previous = discoveries.get(service_info.address)
-        _record_discovery(discoveries, service_info)
-        current = discoveries.get(service_info.address)
+        key = _unique_id_from_address(service_info.address)
+        previous = sightings.get(key)
+        _record_fresh_sighting(sightings, identities, service_info)
+        current = sightings.get(key)
+        identity = identities.get(key)
         if current is not None and current != previous:
             _LOGGER.debug(
-                "Observed supported purifier during manual scan: name=%s "
-                "address=%s model=%s source=%s rssi=%s",
-                current.name,
+                "Observed connectable Bluetooth address during manual scan: "
+                "address=%s observed_name=%s known_name=%s model=%s "
+                "source=%s rssi=%s",
                 current.address,
-                current.model,
+                service_info.name,
+                identity.name if identity is not None else None,
+                identity.model if identity is not None else None,
                 getattr(service_info, "source", None),
                 current.rssi,
             )
@@ -208,28 +354,39 @@ async def _async_discover_purifiers(
         # Current Home Assistant updates its shared history even when repeated
         # packet content is deduplicated before callbacks. Merge that history
         # after the window while retaining any valid name seen by our callback.
-        for service_info in bluetooth.async_discovered_service_info(
-            hass,
-            connectable=True,
-        ):
+        cached_after_scan = tuple(
+            bluetooth.async_discovered_service_info(hass, connectable=True)
+        )
+        for service_info in cached_after_scan:
             advertisement_time = getattr(service_info, "time", None)
             if not isinstance(advertisement_time, int | float):
                 continue
             if advertisement_time < started_at:
                 continue
-            _record_discovery(discoveries, service_info)
+            _record_fresh_sighting(sightings, identities, service_info)
+
+        # A newly seen nameless service-info record can still have a valid name
+        # retained on its BLEDevice object by Home Assistant.
+        for sighting in sightings.values():
+            _remember_ble_device_identity(
+                hass,
+                identities,
+                address=sighting.address,
+            )
     finally:
         cancel_callback()
 
-    result = _sorted_discoveries(discoveries.values())
+    result = _resolve_discoveries(sightings.values(), identities)
     _LOGGER.debug(
         "Manual purifier discovery window completed in %.3f seconds: "
         "active_scan_api_available=%s active_scan_error=%s scanners=%s "
-        "candidates=%s",
+        "fresh_addresses=%d unnamed_unresolved=%s candidates=%s",
         time.monotonic() - started_at,
         api_available,
         repr(scan_error) if scan_error is not None else None,
         _scanner_diagnostics(hass),
+        len(sightings),
+        result.unnamed_devices_seen,
         [
             {
                 "name": discovery.name,
@@ -237,7 +394,7 @@ async def _async_discover_purifiers(
                 "model": discovery.model,
                 "rssi": discovery.rssi,
             }
-            for discovery in result
+            for discovery in result.purifiers
         ],
     )
     return result
@@ -404,6 +561,7 @@ class GoveeBleAirPurifierConfigFlow(ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         """Initialize the flow."""
         self._manual_discoveries: tuple[DiscoveredPurifier, ...] | None = None
+        self._unnamed_devices_seen = False
 
     @override
     async def async_step_user(
@@ -416,11 +574,13 @@ class GoveeBleAirPurifierConfigFlow(ConfigFlow, domain=DOMAIN):
                 for entry in self._async_current_entries()
                 if entry.unique_id is not None
             }
+            scan_result = await _async_discover_purifiers(self.hass)
             self._manual_discoveries = tuple(
                 device
-                for device in await _async_discover_purifiers(self.hass)
+                for device in scan_result.purifiers
                 if _unique_id_from_address(device.address) not in configured_ids
             )
+            self._unnamed_devices_seen = scan_result.unnamed_devices_seen
             _LOGGER.debug(
                 "Manual purifier discovery snapshot contains %d fresh, "
                 "unconfigured device(s)",
@@ -431,6 +591,8 @@ class GoveeBleAirPurifierConfigFlow(ConfigFlow, domain=DOMAIN):
         discoveries = self._manual_discoveries or ()
 
         if not discoveries:
+            if self._unnamed_devices_seen:
+                return self.async_abort(reason="devices_seen_without_supported_name")
             return self.async_abort(reason="no_devices_found")
 
         if user_input is not None:

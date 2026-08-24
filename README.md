@@ -81,21 +81,29 @@ from a previous setup flow.
    Assistant returns early because no `AUTO` scanner can open an active window.
    If the API is unavailable or the request fails, it still observes the shared
    scanner for all ten seconds.
-3. It remembers the last valid supported name seen for each address. A later
-   nameless or address-only packet cannot erase a valid identity learned during
-   that window.
-4. At the end of the window it also merges Home Assistant cache entries whose
+3. Before the freshness window, it remembers any valid supported name already
+   retained in Home Assistant's service-info cache or `BLEDevice`, together
+   with supported names learned by earlier setup flows during the same Home
+   Assistant session. These names establish identity only; they do not
+   establish current reachability.
+4. During the window it records fresh connectable addresses even when a packet
+   is nameless or uses the Bluetooth address as its name. A valid supported name
+   seen during the window is also retained and cannot be erased by a later
+   nameless packet.
+5. At the end of the window it also merges Home Assistant cache entries whose
    timestamps were refreshed during that same window. Older cached discoveries
    are excluded.
-5. Already configured addresses and unsupported or non-connectable devices are
-   removed. Remaining choices are sorted by RSSI: the strongest is labelled
-   **Near**, and all others are labelled **Far**.
-6. The choices are frozen while the user selects a purifier.
-7. After selection, the integration waits up to ten seconds for a fresh,
+6. It combines current address-level sightings with known identities for the
+   same normalized address. Already configured addresses and unresolved,
+   unsupported, or non-connectable devices are removed. Remaining choices are
+   sorted by RSSI: the strongest is labelled **Near**, and all others are
+   labelled **Far**.
+7. The choices are frozen while the user selects a purifier.
+8. After selection, the integration waits up to ten seconds for a fresh,
    connectable advertisement from that exact address. It connects immediately
    when one arrives rather than waiting out the timeout. A fresh nameless packet
    is acceptable because the valid name and model were retained from the scan.
-8. Setup validates the purifier by connecting and completing initialization
+9. Setup validates the purifier by connecting and completing initialization
    before saving the config entry.
 
 If no eligible purifier appears, start a new **Add device** flow after moving the
@@ -196,6 +204,16 @@ trace-supported wire findings.
 - Start a new **Add device** flow. Each flow runs a new ten-second scan.
 - Confirm the advertised name begins with `GVH7124` or `ihoment_H7129_`.
 
+### Bluetooth devices were seen without a supported purifier name
+
+The scan received fresh connectable advertisements, but Home Assistant did not
+have a valid H7124 or H7129 name for those addresses. Move the purifier or
+Bluetooth proxy closer and start a new **Add device** flow. A later scan can use
+a valid name retained by Home Assistant or learned during an earlier setup flow,
+but it still requires the purifier's address to be freshly observed. The
+integration does not infer a purifier model from its Bluetooth address and does
+not connect to unidentified devices to read their names.
+
 ### Device was listed but is no longer visible
 
 The purifier advertised during the list scan but did not produce another fresh
@@ -295,7 +313,8 @@ env PYTHONPATH=. .venv/bin/ruff check .
 env PYTHONPATH=. .venv/bin/pytest -q
 ```
 
-The tests cover setup scanning and cache freshness, model/name retention,
+The tests cover setup scanning and cache freshness, separate address-level
+reachability and model/name identity, Home Assistant and session name retention,
 connection timeouts and cleanup, stale callback generations, H7129 session
 negotiation, request/response matching, notification decoding, command recovery,
 entities, diagnostics-related lifecycle behavior, and trace extraction.
@@ -324,4 +343,4 @@ decoded ATT operation, and raw bytes.
 - [Home Assistant integration and HACS reference](home-assistant-bluetooth-integration-reference.md)
 - [License](LICENSE)
 
-Release documentation reflects integration version 0.3.14.
+Release documentation reflects integration version 0.3.15.
