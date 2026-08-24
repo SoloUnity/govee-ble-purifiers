@@ -84,9 +84,12 @@ connection reachability and proxy-slot diagnosis. Setup cleanup preserves the
 last meaningful failure instead of replacing it with a generic disconnected
 message. Each BLE connection attempt has a 15-second deadline; an incomplete
 client is explicitly disconnected and local BlueZ connections for its address
-are closed and verified before the integration waits for another live
-advertisement and retries through a freshly resolved route. A surviving stale
-connection blocks the next attempt instead of consuming another adapter slot.
+are closed and verified before the integration resolves another route. An
+initial connection may use a cached connectable advertisement no more than five
+seconds old; every retry requires advertisement evidence newer than the route
+that just failed. The integration does not clear Home Assistant's shared
+advertisement history. A surviving stale connection blocks the next attempt
+instead of consuming another adapter slot.
 The setup window permits at least two complete advertisement-and-connection
 attempts and retains a bounded history of recent connection and cleanup
 failures.

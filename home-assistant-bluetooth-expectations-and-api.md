@@ -215,7 +215,7 @@ This does not clear integration discovery-match history.
 
 ### 6.4 Freshness is a policy, not callback timing
 
-When a connection must begin only after a live advertisement:
+When a protocol specifically requires a live wake-up advertisement:
 
 1. Record a monotonic cutoff.
 2. Disable registration replay.
@@ -224,8 +224,11 @@ When a connection must begin only after a live advertisement:
 5. Resolve a new connectable `BLEDevice` after that event.
 6. Apply a bounded wait and report the cached and current routes on timeout.
 
-If the protocol does not require a live wake-up packet, using the current best
-cached route may be sufficient and faster.
+If the protocol does not require a live wake-up packet, prefer a bounded
+freshness policy over clearing shared history. A recent cached route can be
+used for the first attempt; remember its advertisement timestamp and require a
+newer timestamp or live callback before retrying. This tolerates callback
+deduplication without repeatedly selecting the same failed route.
 
 ### 6.5 Scan modes
 
@@ -625,7 +628,10 @@ The Govee purifier integration applies the general model as follows:
 
 - Home Assistant owns scanning and selects local-adapter or proxy routes.
 - Callback replay is disabled for connection wake-up waits.
-- Advertisement history is cleared before waiting for a live packet.
+- The first connection accepts a cached connectable advertisement no more than
+  five seconds old; a retry requires evidence newer than its previous route.
+- Home Assistant's shared advertisement history is not cleared by a connection
+  cycle.
 - A new connectable `BLEDevice` and new Bleak client are used per cycle.
 - A GATT connection attempt has a 15-second deadline.
 - A partially connecting client is explicitly disconnected on timeout.

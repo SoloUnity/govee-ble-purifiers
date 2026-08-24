@@ -323,7 +323,7 @@ class ReliablePurifierClient:
         )
         if device is None:
             raise BluetoothUnavailableError(
-                "No live connectable advertisement was received; "
+                "No recent or newly observed connectable advertisement was received; "
                 f"cached_route={cached_route}; "
                 f"cached_reachability={cached_reachability}; "
                 f"current_route={self._environment.route_diagnostics()}; "

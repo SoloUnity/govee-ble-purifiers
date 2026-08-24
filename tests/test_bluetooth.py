@@ -3,7 +3,7 @@
 import asyncio
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -377,10 +377,58 @@ async def test_callback_registration_disables_cached_replay_when_supported(
 
 
 @pytest.mark.asyncio
-async def test_wait_for_fresh_device_rejects_cache_and_uses_live_route(
+async def test_wait_for_fresh_device_accepts_recent_cached_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Connection starts only after a post-cutoff advertisement is available."""
+    """A subsecond Home Assistant route is usable without another callback."""
+    device = SimpleNamespace(address="AA:BB:CC:DD:EE:FF", name="H7129")
+    recent_info = SimpleNamespace(
+        device=device,
+        name="ihoment_H7129_TEST",
+        source="test-adapter",
+        rssi=-75,
+        tx_power=None,
+        connectable=True,
+        time=time.monotonic() - 0.376,
+    )
+    clear_history = Mock()
+    monkeypatch.setattr(
+        bluetooth_module.bluetooth,
+        "async_last_service_info",
+        lambda *_args, **_kwargs: recent_info,
+    )
+    monkeypatch.setattr(
+        bluetooth_module.bluetooth,
+        "async_ble_device_from_address",
+        lambda *_args, **_kwargs: device,
+    )
+    monkeypatch.setattr(
+        bluetooth_module.bluetooth,
+        "async_clear_advertisement_history",
+        clear_history,
+        raising=False,
+    )
+    environment = HomeAssistantBluetoothEnvironment(
+        SimpleNamespace(),  # type: ignore[arg-type]
+        device.address,
+    )
+
+    assert await environment.async_wait_for_fresh_device(1.0) is device
+
+    clear_history.assert_not_called()
+    route = environment.route_diagnostics()
+    assert route["last_route_selection"] == "recent_cache"
+    assert route["selected_advertisement_age_seconds"] == pytest.approx(
+        0.376, abs=0.05
+    )
+    assert route["fresh_advertisements"] == 0
+
+
+@pytest.mark.asyncio
+async def test_wait_for_fresh_device_rejects_stale_cache_and_uses_live_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An old cached route remains unusable until a live packet arrives."""
     device = SimpleNamespace(address="AA:BB:CC:DD:EE:FF", name="H7129")
     stale_info = SimpleNamespace(
         device=device,
@@ -392,7 +440,6 @@ async def test_wait_for_fresh_device_rejects_cache_and_uses_live_route(
         time=time.monotonic() - 30,
     )
     current_info = stale_info
-    clears: list[str] = []
     monkeypatch.setattr(
         bluetooth_module.bluetooth,
         "async_last_service_info",
@@ -402,12 +449,6 @@ async def test_wait_for_fresh_device_rejects_cache_and_uses_live_route(
         bluetooth_module.bluetooth,
         "async_ble_device_from_address",
         lambda *_args, **_kwargs: device,
-    )
-    monkeypatch.setattr(
-        bluetooth_module.bluetooth,
-        "async_clear_advertisement_history",
-        lambda _hass, address: clears.append(address),
-        raising=False,
     )
     environment = HomeAssistantBluetoothEnvironment(
         SimpleNamespace(),  # type: ignore[arg-type]
@@ -428,10 +469,60 @@ async def test_wait_for_fresh_device_rejects_cache_and_uses_live_route(
     environment._advertisement_received(current_info)
 
     assert await wait_task is device
-    assert clears == [device.address]
     route = environment.route_diagnostics()
     assert route["rssi"] == -73
     assert route["fresh_advertisements"] == 1
+    assert route["last_route_selection"] == "live_callback"
+
+
+@pytest.mark.asyncio
+async def test_retry_requires_advertisement_newer_than_selected_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry cannot immediately reuse the exact cached packet that just failed."""
+    device = SimpleNamespace(address="AA:BB:CC:DD:EE:FF", name="H7129")
+    first_time = time.monotonic() - 0.2
+    current_info = SimpleNamespace(
+        device=device,
+        name="ihoment_H7129_TEST",
+        source="test-adapter",
+        rssi=-75,
+        tx_power=None,
+        connectable=True,
+        time=first_time,
+    )
+    monkeypatch.setattr(
+        bluetooth_module.bluetooth,
+        "async_last_service_info",
+        lambda *_args, **_kwargs: current_info,
+    )
+    monkeypatch.setattr(
+        bluetooth_module.bluetooth,
+        "async_ble_device_from_address",
+        lambda *_args, **_kwargs: device,
+    )
+    environment = HomeAssistantBluetoothEnvironment(
+        SimpleNamespace(),  # type: ignore[arg-type]
+        device.address,
+    )
+
+    assert await environment.async_wait_for_fresh_device(1.0) is device
+
+    retry_task = asyncio.create_task(environment.async_wait_for_fresh_device(1.0))
+    await asyncio.sleep(0)
+    assert not retry_task.done()
+
+    current_info = SimpleNamespace(
+        **{
+            **current_info.__dict__,
+            "rssi": -73,
+            "time": time.monotonic(),
+        }
+    )
+    assert await retry_task is device
+    route = environment.route_diagnostics()
+    assert route["last_route_selection"] == "newer_cache"
+    assert route["fresh_advertisements"] == 0
 
 
 def test_reachability_diagnostics_uses_connection_intent(

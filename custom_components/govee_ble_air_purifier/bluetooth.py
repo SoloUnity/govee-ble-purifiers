@@ -35,6 +35,7 @@ STALE_CONNECTION_CLEANUP_TIMEOUT = 5.0
 STALE_CONNECTION_CHECK_INTERVAL = 0.25
 RECENT_CONNECTION_FAILURE_LIMIT = 4
 ADVERTISEMENT_CHECK_INTERVAL = 0.25
+RECENT_CACHED_ADVERTISEMENT_MAX_AGE = 5.0
 
 NotificationCallback = Callable[[bytes], None]
 DisconnectCallback = Callable[[int], None]
@@ -98,6 +99,8 @@ class HomeAssistantBluetoothEnvironment:
         self._live_service_info: Any = None
         self._fresh_after: float | None = None
         self._fresh_advertisements = 0
+        self._last_selected_advertisement_time: float | None = None
+        self._last_route_selection: str | None = None
 
     async def async_start(self) -> None:
         """Listen passively for a fresh route to the configured address."""
@@ -149,29 +152,6 @@ class HomeAssistantBluetoothEnvironment:
             self._fresh_advertisements += 1
             self._advertisement_event.set()
 
-    def clear_advertisement_history(self) -> None:
-        """Make Home Assistant dispatch the next identical advertisement."""
-        clear_history = getattr(bluetooth, "async_clear_advertisement_history", None)
-        if clear_history is None:
-            _LOGGER.debug(
-                "Home Assistant does not expose advertisement-history clearing "
-                "for %s; using timestamp polling fallback",
-                self.address,
-            )
-            return
-        try:
-            clear_history(self._hass, self.address)
-        except Exception as err:
-            _LOGGER.debug(
-                "Unable to clear Bluetooth advertisement history for %s: %s; "
-                "using timestamp polling fallback",
-                self.address,
-                exception_detail(err),
-                exc_info=True,
-            )
-            return
-        _LOGGER.debug("Cleared Bluetooth advertisement history for %s", self.address)
-
     def get_connectable_device(self) -> BLEDevice | None:
         """Return the best currently reachable connectable route."""
         device = bluetooth.async_ble_device_from_address(
@@ -215,6 +195,10 @@ class HomeAssistantBluetoothEnvironment:
                     self._callback_advertisement_age()
                 ),
                 "fresh_advertisements": self._fresh_advertisements,
+                "last_route_selection": self._last_route_selection,
+                "selected_advertisement_age_seconds": (
+                    self._selected_advertisement_age()
+                ),
                 "error": exception_detail(err),
             }
         if service_info is None:
@@ -230,6 +214,10 @@ class HomeAssistantBluetoothEnvironment:
                     self._callback_advertisement_age()
                 ),
                 "fresh_advertisements": self._fresh_advertisements,
+                "last_route_selection": self._last_route_selection,
+                "selected_advertisement_age_seconds": (
+                    self._selected_advertisement_age()
+                ),
             }
         advertisement_time = getattr(service_info, "time", None)
         advertisement_age = (
@@ -249,7 +237,20 @@ class HomeAssistantBluetoothEnvironment:
             "callback_age_seconds": self._callback_age(),
             "callback_advertisement_age_seconds": (self._callback_advertisement_age()),
             "fresh_advertisements": self._fresh_advertisements,
+            "last_route_selection": self._last_route_selection,
+            "selected_advertisement_age_seconds": (
+                self._selected_advertisement_age()
+            ),
         }
+
+    def _selected_advertisement_age(self) -> float | None:
+        """Return the age of the advertisement used for the previous route."""
+        if self._last_selected_advertisement_time is None:
+            return None
+        return round(
+            max(0.0, time.monotonic() - self._last_selected_advertisement_time),
+            3,
+        )
 
     def _callback_age(self) -> float | None:
         """Return seconds since this integration directly saw an advertisement."""
@@ -266,8 +267,11 @@ class HomeAssistantBluetoothEnvironment:
             3,
         )
 
-    def _fresh_service_info_since(self, cutoff: float) -> Any:
-        """Return current route information only when it is newer than cutoff."""
+    def _usable_service_info(self, started_at: float) -> tuple[Any, str] | None:
+        """Return a recent first route or evidence newer than the previous route."""
+        if self._live_service_info is not None:
+            return self._live_service_info, "live_callback"
+
         service_info = bluetooth.async_last_service_info(
             self._hass,
             self.address,
@@ -276,15 +280,29 @@ class HomeAssistantBluetoothEnvironment:
         advertisement_time = (
             getattr(service_info, "time", None) if service_info is not None else None
         )
-        if (
-            service_info is not None
-            and isinstance(advertisement_time, int | float)
-            and advertisement_time >= cutoff
-        ):
-            return service_info
-        if self._last_callback_time is not None and self._last_callback_time >= cutoff:
-            return self._live_service_info
+        if service_info is None or not isinstance(advertisement_time, int | float):
+            return None
+        if advertisement_time < started_at - RECENT_CACHED_ADVERTISEMENT_MAX_AGE:
+            return None
+
+        previous_time = self._last_selected_advertisement_time
+        if previous_time is None:
+            return service_info, "recent_cache"
+        if advertisement_time > previous_time:
+            return service_info, "newer_cache"
         return None
+
+    def _record_selected_route(self, service_info: Any, source: str) -> None:
+        """Remember the route evidence so a retry cannot reuse the same packet."""
+        advertisement_time = getattr(service_info, "time", None)
+        if isinstance(advertisement_time, int | float):
+            previous_time = self._last_selected_advertisement_time
+            self._last_selected_advertisement_time = (
+                advertisement_time
+                if previous_time is None
+                else max(previous_time, advertisement_time)
+            )
+        self._last_route_selection = source
 
     def reachability_diagnostics(self) -> str | None:
         """Return Home Assistant's human-readable connection route diagnosis."""
@@ -310,33 +328,39 @@ class HomeAssistantBluetoothEnvironment:
         )
 
     async def async_wait_for_fresh_device(self, timeout: float) -> BLEDevice | None:
-        """Wait for a live advertisement, then resolve HA's current best route."""
+        """Resolve a recent route, or wait for evidence newer than the last route."""
         started_at = time.monotonic()
         deadline = started_at + timeout
         self._fresh_after = started_at
         self._live_service_info = None
         self._advertisement_event.clear()
-        self.clear_advertisement_history()
         _LOGGER.debug(
-            "Waiting for a live connectable advertisement for %s: timeout=%.1fs",
+            "Waiting for a recent or new connectable advertisement for %s: "
+            "timeout=%.1fs recent_cache_limit=%.1fs previous_age=%s",
             self.address,
             timeout,
+            RECENT_CACHED_ADVERTISEMENT_MAX_AGE,
+            self._selected_advertisement_age(),
         )
 
         try:
             while (remaining := deadline - time.monotonic()) > 0:
-                service_info = self._fresh_service_info_since(started_at)
-                if service_info is not None:
+                route_candidate = self._usable_service_info(started_at)
+                if route_candidate is not None:
+                    service_info, selection_source = route_candidate
                     advertisement_time = getattr(service_info, "time", None)
                     device = self.get_connectable_device()
                     if device is None:
                         device = getattr(service_info, "device", None)
                     if device is not None:
+                        self._record_selected_route(service_info, selection_source)
                         _LOGGER.debug(
-                            "Live Bluetooth route selected for %s after %.3fs: "
-                            "source=%s rssi=%s advertisement_age=%s",
+                            "Bluetooth route selected for %s after %.3fs: "
+                            "selection=%s source=%s rssi=%s "
+                            "advertisement_age=%s",
                             self.address,
                             time.monotonic() - started_at,
+                            selection_source,
                             getattr(service_info, "source", None),
                             getattr(service_info, "rssi", None),
                             (
@@ -352,7 +376,7 @@ class HomeAssistantBluetoothEnvironment:
 
                 self._advertisement_event.clear()
                 # Close the check/clear race before blocking again.
-                if self._fresh_service_info_since(started_at) is not None:
+                if self._usable_service_info(started_at) is not None:
                     continue
 
                 try:
@@ -367,8 +391,8 @@ class HomeAssistantBluetoothEnvironment:
 
         if time.monotonic() >= deadline:
             _LOGGER.debug(
-                "No live connectable advertisement for %s within %.1f seconds; "
-                "route=%s reachability=%s",
+                "No recent or new connectable advertisement for %s within %.1f "
+                "seconds; route=%s reachability=%s",
                 self.address,
                 timeout,
                 self.route_diagnostics(),
