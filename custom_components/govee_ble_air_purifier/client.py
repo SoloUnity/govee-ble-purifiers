@@ -52,6 +52,8 @@ TRANSACTION_TIMEOUT = 3.0
 INITIALIZATION_ATTEMPTS = 3
 ESSENTIAL_INITIALIZATION_REQUEST = "device_state"
 INITIALIZATION_RETRY_DELAY = 3.0
+PERIODIC_POLL_ATTEMPTS = 3
+REFRESH_ATTEMPTS = 3
 COMMAND_DEADLINE = 30.0
 COMMAND_SEND_ATTEMPTS = 3
 STARTUP_TIMEOUT = 300.0
@@ -137,6 +139,8 @@ class ReliablePurifierClient:
         self._session_generation = 0
         self._refresh_pending = False
         self._refresh_running = False
+        self._incomplete_refresh_requests: tuple[str, ...] = ()
+        self._refresh_failure_summaries: dict[str, str] = {}
         self._next_poll_due = 0.0
         self._ready_since: float | None = None
         self._connection_cycles = 0
@@ -171,6 +175,8 @@ class ReliablePurifierClient:
             "initialization_failure_summaries": dict(
                 self._initialization_failure_summaries
             ),
+            "incomplete_refresh_requests": self._incomplete_refresh_requests,
+            "refresh_failure_summaries": dict(self._refresh_failure_summaries),
             "route": self._environment.route_diagnostics(),
             "transport": self._transport.diagnostic_snapshot(),
         }
@@ -323,6 +329,8 @@ class ReliablePurifierClient:
         self._drain_frame_queue()
         self._refresh_pending = False
         self._refresh_running = False
+        self._incomplete_refresh_requests = ()
+        self._refresh_failure_summaries = {}
         self._incomplete_initialization_requests = ()
         self._initialization_failure_summaries = {}
         self._invalidate_connection_scoped_state()
@@ -519,18 +527,14 @@ class ReliablePurifierClient:
             if self._refresh_pending:
                 # An idle ee-aa capture began its refresh at about +1 ms.
                 await asyncio.sleep(BETWEEN_REQUEST_DELAY)
-                await self._async_run_sweep(
-                    self._protocol.refresh_requests(),
-                    attempts=1,
-                    is_refresh=True,
-                )
+                await self._async_run_refresh(self._protocol.refresh_requests())
                 continue
 
             loop = asyncio.get_running_loop()
             if loop.time() >= self._next_poll_due:
                 await self._async_execute_descriptor(
                     self._protocol.device_state_poll(),
-                    attempts=1,
+                    attempts=PERIODIC_POLL_ATTEMPTS,
                     is_periodic_poll=True,
                 )
                 continue
@@ -576,30 +580,56 @@ class ReliablePurifierClient:
             if not operation.future.done():
                 operation.future.set_result(None)
 
-    async def _async_run_sweep(
-        self,
-        descriptors: tuple[RequestDescriptor, ...],
-        *,
-        attempts: int,
-        is_refresh: bool = False,
+    async def _async_run_refresh(
+        self, descriptors: tuple[RequestDescriptor, ...]
     ) -> None:
-        if is_refresh:
-            self._refresh_running = True
-            self._refresh_pending = False
+        """Retry a refresh while preserving secondary best-effort telemetry."""
+        failures: dict[str, str] = {}
+        self._refresh_running = True
+        self._refresh_pending = False
+        self._update_refresh_failures(failures)
         try:
             for index, descriptor in enumerate(descriptors):
                 _LOGGER.debug(
-                    "Sweep request %d/%d: name=%s",
+                    "Refresh request %d/%d: name=%s attempts=%d",
                     index + 1,
                     len(descriptors),
                     descriptor.name,
+                    REFRESH_ATTEMPTS,
                 )
-                await self._async_execute_descriptor(descriptor, attempts=attempts)
+                try:
+                    await self._async_execute_descriptor(
+                        descriptor,
+                        attempts=REFRESH_ATTEMPTS,
+                    )
+                except TransactionTimeoutError as err:
+                    failures[descriptor.name] = str(err)
+                    self._update_refresh_failures(failures)
+                    if descriptor.name == ESSENTIAL_INITIALIZATION_REQUEST:
+                        _LOGGER.debug(
+                            "Essential refresh request exhausted its retries; "
+                            "reconnecting request=%s attempts=%d",
+                            descriptor.name,
+                            REFRESH_ATTEMPTS,
+                            exc_info=True,
+                        )
+                        raise
+                    _LOGGER.debug(
+                        "Secondary refresh request exhausted its retries; "
+                        "preserving connection request=%s attempts=%d",
+                        descriptor.name,
+                        REFRESH_ATTEMPTS,
+                        exc_info=True,
+                    )
                 if index + 1 < len(descriptors):
                     await asyncio.sleep(BETWEEN_REQUEST_DELAY)
         finally:
-            if is_refresh:
-                self._refresh_running = False
+            self._refresh_running = False
+
+    def _update_refresh_failures(self, failures: dict[str, str]) -> None:
+        """Publish response exhaustion from the most recent refresh sweep."""
+        self._incomplete_refresh_requests = tuple(failures)
+        self._refresh_failure_summaries = dict(failures)
 
     async def _async_execute_descriptor(
         self,
@@ -652,6 +682,7 @@ class ReliablePurifierClient:
                         if result is MatchResult.IGNORED:
                             ignored_frames.append(frame)
                         if result is MatchResult.COMPLETE:
+                            self._last_timeout_summary = None
                             _LOGGER.debug(
                                 "Transaction complete: request=%s attempt=%d/%d "
                                 "latency=%.3fs received=%d matched=%d",

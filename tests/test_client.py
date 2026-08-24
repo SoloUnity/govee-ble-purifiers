@@ -458,6 +458,118 @@ async def test_initialization_transport_failure_remains_fatal() -> None:
 
 
 @pytest.mark.asyncio
+async def test_periodic_poll_uses_three_attempts_on_existing_connection() -> None:
+    """One READY session retries aa-01 before escalating to reconnection."""
+    client = make_client()
+    client._next_poll_due = asyncio.get_running_loop().time()
+    calls: list[tuple[str, int, bool]] = []
+
+    async def execute(
+        descriptor: RequestDescriptor,
+        *,
+        attempts: int,
+        is_periodic_poll: bool = False,
+    ) -> tuple[bytes, ...]:
+        calls.append((descriptor.name, attempts, is_periodic_poll))
+        client._stopping.set()
+        return ()
+
+    client._async_execute_descriptor = execute  # type: ignore[method-assign]
+
+    await client._async_ready_loop()
+
+    assert calls == [("device_state", 3, True)]
+
+
+@pytest.mark.asyncio
+async def test_periodic_poll_exhaustion_leaves_ready_loop_for_reconnect() -> None:
+    """Three silent aa-01 attempts remain a fatal health failure."""
+    client = make_client()
+    client._next_poll_due = asyncio.get_running_loop().time()
+
+    async def execute(
+        descriptor: RequestDescriptor,
+        *,
+        attempts: int,
+        is_periodic_poll: bool = False,
+    ) -> tuple[bytes, ...]:
+        assert descriptor.name == "device_state"
+        assert attempts == 3
+        assert is_periodic_poll
+        raise client_module.TransactionTimeoutError("three aa 01 attempts failed")
+
+    client._async_execute_descriptor = execute  # type: ignore[method-assign]
+
+    with pytest.raises(
+        client_module.TransactionTimeoutError,
+        match="three aa 01 attempts failed",
+    ):
+        await client._async_ready_loop()
+
+
+@pytest.mark.asyncio
+async def test_refresh_exhausts_secondary_request_and_preserves_connection() -> None:
+    """An ee-aa refresh records secondary silence and completes the sweep."""
+    client = make_client()
+    descriptors = client._protocol.refresh_requests()
+    calls: list[tuple[str, int]] = []
+
+    async def execute(
+        descriptor: RequestDescriptor, *, attempts: int, **_: object
+    ) -> tuple[bytes, ...]:
+        calls.append((descriptor.name, attempts))
+        if descriptor.name == "capability_b5":
+            raise client_module.TransactionTimeoutError("refresh stayed silent")
+        return ()
+
+    client._async_execute_descriptor = execute  # type: ignore[method-assign]
+
+    await client._async_run_refresh(descriptors)
+
+    assert [name for name, _ in calls] == [
+        descriptor.name for descriptor in descriptors
+    ]
+    assert all(attempts == 3 for _, attempts in calls)
+    assert not client._refresh_running
+    diagnostics = client.diagnostic_snapshot()
+    assert diagnostics["incomplete_refresh_requests"] == ("capability_b5",)
+    assert diagnostics["refresh_failure_summaries"] == {
+        "capability_b5": "refresh stayed silent"
+    }
+    assert client._transport.disconnects == 0  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_refresh_essential_exhaustion_requires_reconnect() -> None:
+    """A refresh cannot remain healthy after three missing aa-01 responses."""
+    client = make_client()
+    descriptors = client._protocol.refresh_requests()
+    calls: list[str] = []
+
+    async def execute(
+        descriptor: RequestDescriptor, *, attempts: int, **_: object
+    ) -> tuple[bytes, ...]:
+        assert attempts == 3
+        calls.append(descriptor.name)
+        if descriptor.name == "device_state":
+            raise client_module.TransactionTimeoutError("essential refresh failed")
+        return ()
+
+    client._async_execute_descriptor = execute  # type: ignore[method-assign]
+
+    with pytest.raises(
+        client_module.TransactionTimeoutError,
+        match="essential refresh failed",
+    ):
+        await client._async_run_refresh(descriptors)
+
+    assert calls == ["capability_b5", "device_state"]
+    assert not client._refresh_running
+    diagnostics = client.diagnostic_snapshot()
+    assert diagnostics["incomplete_refresh_requests"] == ("device_state",)
+
+
+@pytest.mark.asyncio
 async def test_steady_scheduler_polls_only_aa01(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

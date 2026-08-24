@@ -805,7 +805,13 @@ The Govee purifier integration applies the general model as follows:
   silent, the connected session remains in initialization and retries it after a
   short delay. A transport, notification-channel, or protected-session failure
   still triggers complete reconnect and H7129 renegotiation.
-- Only the protocol-defined `aa 01` state query is periodically polled.
+- Only the protocol-defined `aa 01` state query is periodically polled. A READY
+  connection gets up to three same-session attempts; exhausting them marks the
+  session unhealthy and enters reconnect recovery.
+- The documented H7129 `ee aa` refresh gives every request three attempts.
+  Exhausted secondary refresh requests are retained in diagnostics while the
+  sweep and connection continue. An exhausted essential `aa 01` refresh request
+  triggers reconnection.
 - Physical-control notifications update cached state without waiting for a poll.
 - Diagnostics retain recent connection failures and Home Assistant reachability
   information.

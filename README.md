@@ -144,7 +144,9 @@ logged.
 During normal operation, the only periodic request is the documented `aa 01`
 device-state query on a fixed three-second write-to-write cadence. H7124
 preserves the captured 1.936-second delay between startup and its first idle
-poll; H7129 begins with the normal three-second delay.
+poll; H7129 begins with the normal three-second delay. A missed periodic response
+is retried up to three times on the existing connection. Exhausting all three
+attempts treats the connection as unhealthy and enters normal reconnect recovery.
 
 The integration does not continuously poll PM2.5, filter life, fan mode, or
 night-light state. Those values come from startup initialization, a documented
@@ -192,6 +194,11 @@ sweep continues without discarding the connection. If the essential `aa 01`
 device-state request remains silent, the client stays connected and retries it
 after a short delay. Only an actual disconnect, GATT/channel failure, invalid
 H7129 session, or corrupt protected traffic forces a new connection and session.
+
+The documented H7129 `ee aa` refresh uses the same three attempts per request.
+An exhausted secondary refresh response is recorded and the remaining refresh
+continues on the current session. Because `aa 01` is the connection's essential
+health signal, three missing `aa 01` refresh responses trigger reconnection.
 
 Commands are serialized and have a 30-second end-to-end deadline. Up to three
 bounded sends are permitted across recovery. Newer pending controls of the same
@@ -271,6 +278,7 @@ details can include:
 
 - the client state and connection generation;
 - startup requests still incomplete after three response attempts;
+- refresh requests still incomplete after three response attempts;
 - the selected and current adapter/proxy route;
 - RSSI and advertisement age;
 - Home Assistant reachability and connection-slot diagnostics;
@@ -374,4 +382,4 @@ decoded ATT operation, and raw bytes.
 - [Home Assistant integration and HACS reference](home-assistant-bluetooth-integration-reference.md)
 - [License](LICENSE)
 
-Release documentation reflects integration version 0.3.18.
+Release documentation reflects integration version 0.3.19.
