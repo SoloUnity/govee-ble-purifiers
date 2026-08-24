@@ -51,6 +51,7 @@ H7124_INITIAL_POLL_DELAY = 1.936
 TRANSACTION_TIMEOUT = 3.0
 INITIALIZATION_ATTEMPTS = 3
 ESSENTIAL_INITIALIZATION_REQUEST = "device_state"
+ESSENTIAL_INITIALIZATION_MAX_BATCHES = 3
 INITIALIZATION_RETRY_DELAY = 3.0
 PERIODIC_POLL_ATTEMPTS = 3
 REFRESH_ATTEMPTS = 3
@@ -150,6 +151,8 @@ class ReliablePurifierClient:
         self._last_timeout_summary: str | None = None
         self._incomplete_initialization_requests: tuple[str, ...] = ()
         self._initialization_failure_summaries: dict[str, str] = {}
+        self._essential_initialization_batches = 0
+        self._essential_initialization_attempts = 0
         self._has_ever_been_ready = False
         self._reported_available: bool | None = None
 
@@ -174,6 +177,15 @@ class ReliablePurifierClient:
             ),
             "initialization_failure_summaries": dict(
                 self._initialization_failure_summaries
+            ),
+            "essential_initialization_batches": (
+                self._essential_initialization_batches
+            ),
+            "essential_initialization_attempts": (
+                self._essential_initialization_attempts
+            ),
+            "essential_initialization_batch_limit": (
+                ESSENTIAL_INITIALIZATION_MAX_BATCHES
             ),
             "incomplete_refresh_requests": self._incomplete_refresh_requests,
             "refresh_failure_summaries": dict(self._refresh_failure_summaries),
@@ -333,6 +345,8 @@ class ReliablePurifierClient:
         self._refresh_failure_summaries = {}
         self._incomplete_initialization_requests = ()
         self._initialization_failure_summaries = {}
+        self._essential_initialization_batches = 0
+        self._essential_initialization_attempts = 0
         self._invalidate_connection_scoped_state()
         cached_route = self._environment.route_diagnostics()
         cached_reachability = self._environment.reachability_diagnostics()
@@ -454,6 +468,7 @@ class ReliablePurifierClient:
         for index, descriptor in enumerate(descriptors):
             if descriptor.name == ESSENTIAL_INITIALIZATION_REQUEST:
                 essential = descriptor
+                self._essential_initialization_batches += 1
             try:
                 await self._async_execute_descriptor(
                     descriptor,
@@ -479,13 +494,28 @@ class ReliablePurifierClient:
             )
 
         while essential.name in failures:
+            if (
+                self._essential_initialization_batches
+                >= ESSENTIAL_INITIALIZATION_MAX_BATCHES
+            ):
+                summary = failures[essential.name]
+                raise TransactionTimeoutError(
+                    "Essential initialization remained silent after "
+                    f"{self._essential_initialization_batches} batch(es) and "
+                    f"{self._essential_initialization_attempts} attempt(s); "
+                    "recycling the connected session; "
+                    f"last_failure={summary}"
+                )
             _LOGGER.debug(
                 "Essential initialization request remains incomplete; preserving "
-                "the connected session and retrying request=%s in %.1fs",
+                "the connected session and retrying request=%s batch=%d/%d in %.1fs",
                 essential.name,
+                self._essential_initialization_batches + 1,
+                ESSENTIAL_INITIALIZATION_MAX_BATCHES,
                 INITIALIZATION_RETRY_DELAY,
             )
             await self._async_wait_for_ready_work(INITIALIZATION_RETRY_DELAY)
+            self._essential_initialization_batches += 1
             try:
                 await self._async_execute_descriptor(
                     essential,
@@ -647,6 +677,11 @@ class ReliablePurifierClient:
         self._active_request = descriptor.name
         try:
             for attempt in range(attempts):
+                if (
+                    self.status is ClientStatus.INITIALIZING
+                    and descriptor.name == ESSENTIAL_INITIALIZATION_REQUEST
+                ):
+                    self._essential_initialization_attempts += 1
                 matcher = self._protocol.new_response_matcher(descriptor)
                 observed_frames: list[bytes] = []
                 ignored_frames: list[bytes] = []

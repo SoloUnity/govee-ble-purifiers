@@ -101,8 +101,11 @@ class SilentChannel:
 
     ready = True
 
-    async def async_send(self, _: bytes) -> None:
-        return
+    def __init__(self) -> None:
+        self.writes: list[bytes] = []
+
+    async def async_send(self, frame: bytes) -> None:
+        self.writes.append(frame)
 
     def invalidate(self) -> None:
         self.ready = False
@@ -431,6 +434,37 @@ async def test_initialization_retries_essential_state_on_same_session() -> None:
     assert device_state_calls == 2
     wait_for_work.assert_awaited_once_with(client_module.INITIALIZATION_RETRY_DELAY)
     assert client.diagnostic_snapshot()["incomplete_initialization_requests"] == ()
+    assert client._transport.disconnects == 0  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_initialization_recycles_after_three_silent_essential_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zombie connected session gets nine aa-01 attempts, not an infinite loop."""
+    monkeypatch.setattr(client_module, "TRANSACTION_TIMEOUT", 0.001)
+    client = make_client()
+    client.status = client_module.ClientStatus.INITIALIZING
+    channel = SilentChannel()
+    client._channel = channel  # type: ignore[assignment]
+    wait_for_work = AsyncMock()
+    client._async_wait_for_ready_work = wait_for_work  # type: ignore[method-assign]
+    essential = (client._protocol.device_state_poll(),)
+
+    with pytest.raises(
+        client_module.TransactionTimeoutError,
+        match=r"3 batch\(es\) and 9 attempt\(s\)",
+    ):
+        await client._async_run_initialization(essential)
+
+    assert wait_for_work.await_count == 2
+    wait_for_work.assert_awaited_with(client_module.INITIALIZATION_RETRY_DELAY)
+    assert len(channel.writes) == 9  # type: ignore[attr-defined]
+    diagnostics = client.diagnostic_snapshot()
+    assert diagnostics["essential_initialization_batches"] == 3
+    assert diagnostics["essential_initialization_attempts"] == 9
+    assert diagnostics["essential_initialization_batch_limit"] == 3
+    assert diagnostics["incomplete_initialization_requests"] == ("device_state",)
     assert client._transport.disconnects == 0  # type: ignore[attr-defined]
 
 

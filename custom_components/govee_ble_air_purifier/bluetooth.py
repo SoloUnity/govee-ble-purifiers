@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from typing import Any
 
@@ -31,6 +31,10 @@ CONNECT_ATTEMPTS = 3
 CONNECTION_ATTEMPT_TIMEOUT = 45.0
 CONNECTION_ABORT_TIMEOUT = 5.0
 CONNECTION_DIAGNOSTIC_TIMEOUT = 1.0
+NOTIFICATION_SUBSCRIBE_TIMEOUT = 15.0
+GATT_WRITE_TIMEOUT = 10.0
+GATT_DISCONNECT_TIMEOUT = 5.0
+GATT_OPERATION_CANCEL_TIMEOUT = 1.0
 STALE_CONNECTION_CLEANUP_TIMEOUT = 5.0
 STALE_CONNECTION_CHECK_INTERVAL = 0.25
 RECENT_CONNECTION_FAILURE_LIMIT = 4
@@ -469,6 +473,14 @@ class GattTransport:
         self._last_address_cleanup_error: str | None = None
         self._last_address_cleanup_elapsed: float | None = None
         self._last_address_cleanup_remaining: int | None = None
+        self._gatt_operation_tasks: set[asyncio.Task[Any]] = set()
+        self._active_gatt_operation: str | None = None
+        self._last_gatt_operation: str | None = None
+        self._last_gatt_operation_deadline: float | None = None
+        self._last_gatt_operation_elapsed: float | None = None
+        self._last_gatt_operation_timed_out = False
+        self._last_gatt_operation_error: str | None = None
+        self._gatt_operation_timeouts = 0
 
     @property
     def generation(self) -> int:
@@ -510,7 +522,74 @@ class GattTransport:
             "last_address_cleanup_remaining_connections": (
                 self._last_address_cleanup_remaining
             ),
+            "active_gatt_operation": self._active_gatt_operation,
+            "last_gatt_operation": self._last_gatt_operation,
+            "last_gatt_operation_deadline_seconds": (
+                self._last_gatt_operation_deadline
+            ),
+            "last_gatt_operation_elapsed_seconds": self._last_gatt_operation_elapsed,
+            "last_gatt_operation_timed_out": self._last_gatt_operation_timed_out,
+            "last_gatt_operation_error": self._last_gatt_operation_error,
+            "gatt_operation_timeouts": self._gatt_operation_timeouts,
+            "pending_gatt_operation_tasks": len(self._gatt_operation_tasks),
         }
+
+    def _observe_gatt_operation_task(self, task: asyncio.Task[Any]) -> None:
+        """Retain and observe a backend task until cancellation really finishes."""
+        self._gatt_operation_tasks.discard(task)
+        if task.cancelled():
+            return
+        with suppress(Exception):
+            task.exception()
+
+    async def _async_gatt_operation(
+        self,
+        operation: str,
+        timeout: float,
+        action: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        """Run one backend GATT call with bounded, observed cancellation."""
+        started = time.monotonic()
+        self._active_gatt_operation = operation
+        self._last_gatt_operation = operation
+        self._last_gatt_operation_deadline = timeout
+        self._last_gatt_operation_timed_out = False
+        self._last_gatt_operation_error = None
+        task = asyncio.create_task(action(), name=f"govee-gatt-{operation}")
+        self._gatt_operation_tasks.add(task)
+        task.add_done_callback(self._observe_gatt_operation_task)
+        try:
+            done, _ = await asyncio.wait((task,), timeout=timeout)
+            if not done:
+                self._gatt_operation_timeouts += 1
+                self._last_gatt_operation_timed_out = True
+                task.cancel()
+                await asyncio.wait((task,), timeout=GATT_OPERATION_CANCEL_TIMEOUT)
+                elapsed = max(0.0, time.monotonic() - started)
+                detail = (
+                    f"operation={operation}; stage={self._connection_stage}; "
+                    f"elapsed={elapsed:.3f}s; deadline={timeout:.1f}s; "
+                    f"generation={self._generation}"
+                )
+                self._last_gatt_operation_error = detail
+                self._last_error = f"gatt_operation_timeout; {detail}"
+                raise GattTransportError(f"GATT operation timed out; {detail}")
+            return task.result()
+        except asyncio.CancelledError:
+            if not task.done():
+                task.cancel()
+                await asyncio.wait((task,), timeout=GATT_OPERATION_CANCEL_TIMEOUT)
+            raise
+        except Exception as err:
+            if self._last_gatt_operation_error is None:
+                self._last_gatt_operation_error = exception_detail(err)
+            raise
+        finally:
+            self._last_gatt_operation_elapsed = round(
+                max(0.0, time.monotonic() - started), 3
+            )
+            if self._active_gatt_operation == operation:
+                self._active_gatt_operation = None
 
     def _set_stage(self, stage: str) -> None:
         """Record the current GATT stage and its monotonic start time."""
@@ -958,9 +1037,15 @@ class GattTransport:
             NOTIFY_CHARACTERISTIC_UUID,
         )
         try:
-            await client.start_notify(
-                self._notify_characteristic, notification_received
+            await self._async_gatt_operation(
+                "start_notify",
+                NOTIFICATION_SUBSCRIBE_TIMEOUT,
+                lambda: client.start_notify(
+                    self._notify_characteristic, notification_received
+                ),
             )
+        except GattTransportError:
+            raise
         except Exception as err:
             self._last_error = self._failure_summary(err)
             raise GattTransportError(
@@ -985,10 +1070,17 @@ class GattTransport:
         async with self._write_lock:
             client = self._require_client()
             generation = self._generation
+            self._set_stage("write_command")
             try:
-                await client.write_gatt_char(
-                    self._command_characteristic, data, response=False
+                await self._async_gatt_operation(
+                    "write_gatt_char",
+                    GATT_WRITE_TIMEOUT,
+                    lambda: client.write_gatt_char(
+                        self._command_characteristic, data, response=False
+                    ),
                 )
+            except GattTransportError:
+                raise
             except Exception as err:
                 self._last_error = exception_detail(err)
                 raise GattTransportError(
@@ -1004,6 +1096,7 @@ class GattTransport:
             )
             if generation != self._generation or not client.is_connected:
                 raise GattTransportError("Connection dropped during command write")
+            self._set_stage("notifications_active")
 
     async def async_disconnect(self) -> None:
         """Close the active client and invalidate all of its callbacks."""
@@ -1024,15 +1117,30 @@ class GattTransport:
         )
         # Clearing the client before awaiting makes the Bleak disconnect callback
         # a deliberate/stale disconnect rather than an unexpected one.
-        with suppress(Exception):
+        try:
             if client.is_connected:
-                await client.disconnect()
-        _LOGGER.debug(
-            "Disconnect complete for %s: generation=%d",
-            self.name,
-            self._generation,
-        )
-        self._set_stage("disconnected")
+                await self._async_gatt_operation(
+                    "disconnect",
+                    GATT_DISCONNECT_TIMEOUT,
+                    client.disconnect,
+                )
+        except Exception as err:
+            self._last_error = exception_detail(err)
+            _LOGGER.debug(
+                "Disconnect cleanup did not complete normally for %s: "
+                "generation=%d error=%s",
+                self.name,
+                self._generation,
+                self._last_error,
+                exc_info=True,
+            )
+        finally:
+            _LOGGER.debug(
+                "Disconnect complete for %s: generation=%d",
+                self.name,
+                self._generation,
+            )
+            self._set_stage("disconnected")
 
     def _require_client(self) -> BleakClientWithServiceCache:
         client = self._client

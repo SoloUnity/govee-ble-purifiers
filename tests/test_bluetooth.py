@@ -11,6 +11,7 @@ from custom_components.govee_ble_air_purifier import bluetooth as bluetooth_modu
 from custom_components.govee_ble_air_purifier.bluetooth import (
     BluetoothUnavailableError,
     GattTransport,
+    GattTransportError,
     HomeAssistantBluetoothEnvironment,
     exception_chain_detail,
 )
@@ -42,6 +43,107 @@ def test_exception_chain_detail_preserves_nested_causes() -> None:
         "ConnectionError: connector failed <- "
         "RuntimeError: adapter route unavailable"
     )
+
+
+@pytest.mark.asyncio
+async def test_notification_subscription_timeout_is_bounded_and_observed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stalled BlueZ start-notify call cannot block connection recovery."""
+    cancelled = asyncio.Event()
+
+    class HangingClient:
+        is_connected = True
+
+        async def start_notify(self, *_: object) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+    monkeypatch.setattr(bluetooth_module, "NOTIFICATION_SUBSCRIBE_TIMEOUT", 0.01)
+    transport = GattTransport(name="Bedroom purifier")
+    transport._client = HangingClient()  # type: ignore[assignment]
+    transport._notify_characteristic = object()
+
+    with pytest.raises(GattTransportError, match="operation=start_notify"):
+        await transport.async_subscribe(lambda _: None)
+
+    await asyncio.wait_for(cancelled.wait(), 0.1)
+    diagnostics = transport.diagnostic_snapshot()
+    assert diagnostics["active_gatt_operation"] is None
+    assert diagnostics["last_gatt_operation"] == "start_notify"
+    assert diagnostics["last_gatt_operation_deadline_seconds"] == 0.01
+    assert diagnostics["last_gatt_operation_timed_out"] is True
+    assert diagnostics["gatt_operation_timeouts"] == 1
+    assert diagnostics["pending_gatt_operation_tasks"] == 0
+
+
+@pytest.mark.asyncio
+async def test_write_timeout_is_bounded_and_observed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stalled write is converted into the normal transport recovery error."""
+    cancelled = asyncio.Event()
+
+    class HangingClient:
+        is_connected = True
+
+        async def write_gatt_char(self, *_: object, **__: object) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+    monkeypatch.setattr(bluetooth_module, "GATT_WRITE_TIMEOUT", 0.01)
+    transport = GattTransport(name="Bedroom purifier")
+    transport._client = HangingClient()  # type: ignore[assignment]
+    transport._command_characteristic = object()
+
+    with pytest.raises(GattTransportError, match="operation=write_gatt_char"):
+        await transport.async_write(bytes(20))
+
+    await asyncio.wait_for(cancelled.wait(), 0.1)
+    diagnostics = transport.diagnostic_snapshot()
+    assert diagnostics["connection_stage"] == "write_command"
+    assert diagnostics["last_gatt_operation"] == "write_gatt_char"
+    assert diagnostics["last_gatt_operation_timed_out"] is True
+    assert diagnostics["pending_gatt_operation_tasks"] == 0
+    assert diagnostics["wire_tx_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_disconnect_timeout_cannot_block_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stalled backend disconnect is bounded, observed, and suppressed."""
+    cancelled = asyncio.Event()
+
+    class HangingClient:
+        is_connected = True
+
+        async def disconnect(self) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+    monkeypatch.setattr(bluetooth_module, "GATT_DISCONNECT_TIMEOUT", 0.01)
+    transport = GattTransport(name="Bedroom purifier")
+    transport._client = HangingClient()  # type: ignore[assignment]
+
+    await asyncio.wait_for(transport.async_disconnect(), 0.1)
+
+    await asyncio.wait_for(cancelled.wait(), 0.1)
+    diagnostics = transport.diagnostic_snapshot()
+    assert diagnostics["is_connected"] is False
+    assert diagnostics["connection_stage"] == "disconnected"
+    assert diagnostics["last_gatt_operation"] == "disconnect"
+    assert diagnostics["last_gatt_operation_timed_out"] is True
+    assert diagnostics["pending_gatt_operation_tasks"] == 0
 
 
 @pytest.mark.asyncio

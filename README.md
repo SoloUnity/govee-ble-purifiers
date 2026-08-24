@@ -129,7 +129,9 @@ The integration maintains one serialized connection owner per purifier:
 7. Run the complete captured startup initialization sweep in order, allowing up
    to three attempts for every request.
 8. Require the essential `aa 01` device-state response, but record an exhausted
-   secondary request as best-effort and continue the rest of the sweep.
+   secondary request as best-effort and continue the rest of the sweep. A silent
+   essential request receives at most three three-attempt batches on one
+   connection before that session is recycled.
 9. Mark entities available after the full sweep has been attempted and essential
    state is known. Values missed during secondary initialization remain unknown.
 10. Process commands, unsolicited notifications, refresh requests, and the one
@@ -181,6 +183,13 @@ setup cycles remain debug-only while that recovery window is active; only the
 final failure is returned to the setup flow. Home Assistant can then retry a
 temporarily unavailable config entry.
 
+Backend GATT calls are bounded independently so a connected-but-stalled BlueZ,
+adapter, or proxy operation cannot freeze the owner task. Notification
+subscription has a 15-second deadline, command writes have a 10-second deadline,
+and best-effort disconnect cleanup has a five-second deadline. Timed-out backend
+tasks are cancelled, retained until cancellation completes, and observed so they
+cannot produce orphaned-task warnings.
+
 After a purifier has connected successfully at least once, a dropped link marks
 its entities unavailable without generating a coordinator error for every
 expected recovery cycle. Cached values are not presented as currently available.
@@ -191,9 +200,12 @@ Once GATT and the plaintext or encrypted application channel are healthy, every
 startup request receives three response attempts. An exhausted capability,
 metadata, air-quality, or night-light request is retained in diagnostics and the
 sweep continues without discarding the connection. If the essential `aa 01`
-device-state request remains silent, the client stays connected and retries it
-after a short delay. Only an actual disconnect, GATT/channel failure, invalid
-H7129 session, or corrupt protected traffic forces a new connection and session.
+device-state request remains silent, the client retries it in up to three
+three-attempt batches separated by short delays. If all nine attempts remain
+silent, the connected session is recycled. An actual disconnect, GATT/channel
+failure, or invalid H7129 session also forces a new connection and session.
+Isolated protected frames that fail validation are discarded; continued absence
+of the required response is handled by the same bounded request policy.
 
 The documented H7129 `ee aa` refresh uses the same three attempts per request.
 An exhausted secondary refresh response is recorded and the remaining refresh
@@ -283,7 +295,10 @@ details can include:
 - RSSI and advertisement age;
 - Home Assistant reachability and connection-slot diagnostics;
 - GATT stage and elapsed connection time;
+- the active/last GATT operation, its deadline, elapsed time, timeout count, and
+  any cancellation task still being observed;
 - partial-client and stale-connection cleanup results;
+- essential initialization batch and wire-attempt counts;
 - request name, retry count, received and matched frames; and
 - a bounded sample of ignored application frames.
 
@@ -382,4 +397,4 @@ decoded ATT operation, and raw bytes.
 - [Home Assistant integration and HACS reference](home-assistant-bluetooth-integration-reference.md)
 - [License](LICENSE)
 
-Release documentation reflects integration version 0.3.19.
+Release documentation reflects integration version 0.3.20.

@@ -438,6 +438,19 @@ This prevents:
 - concurrent encrypted-session negotiation; and
 - exhausting adapter or proxy connection slots.
 
+### 8.5 Bound every backend GATT operation
+
+A connection deadline does not bound later calls such as notification
+subscription, characteristic writes, or disconnect cleanup. Give each backend
+operation its own explicit deadline. On timeout, cancel the backend task, retain
+it until cancellation actually finishes, and observe its result. This prevents a
+stalled adapter or proxy call from freezing the connection owner and avoids
+destroyed-but-pending task warnings during shutdown.
+
+Disconnect is cleanup rather than a reason to block recovery indefinitely. Use a
+short, best-effort deadline, clear ownership before awaiting the backend, and
+continue the state machine even when the backend does not acknowledge cleanup.
+
 ## 9. Recommended connection state machine
 
 ```text
@@ -773,6 +786,9 @@ The Govee purifier integration applies the general model as follows:
   45-second shared deadline. This lets weak links retry immediately without a
   complete address cleanup, advertisement wait, and outer backoff between every
   low-level failure.
+- Notification subscription has a 15-second deadline, application writes have a
+  10-second deadline, and disconnect cleanup has a five-second deadline. A
+  timed-out backend task is cancelled and observed until it finishes.
 - A partially connecting client is explicitly disconnected on timeout.
 - Local BlueZ connections for the purifier address are closed and verified
   before a new outer cycle, after the connector cycle ultimately fails, during
@@ -802,9 +818,13 @@ The Govee purifier integration applies the general model as follows:
   and do not discard an otherwise healthy application channel. The complete
   sweep is still attempted.
 - The `aa 01` device-state request is essential. If its three-attempt batch stays
-  silent, the connected session remains in initialization and retries it after a
-  short delay. A transport, notification-channel, or protected-session failure
-  still triggers complete reconnect and H7129 renegotiation.
+  silent, the connected session remains in initialization and starts another
+  batch after a short delay. At most three batches (nine wire attempts) run on
+  one connection before the session is recycled. A transport,
+  notification-channel, or protected-session failure still triggers complete
+  reconnect and H7129 renegotiation. An isolated protected frame that fails
+  validation is discarded; missing required responses are resolved by the same
+  bounded request policy.
 - Only the protocol-defined `aa 01` state query is periodically polled. A READY
   connection gets up to three same-session attempts; exhausting them marks the
   session unhealthy and enters reconnect recovery.
@@ -813,8 +833,9 @@ The Govee purifier integration applies the general model as follows:
   sweep and connection continue. An exhausted essential `aa 01` refresh request
   triggers reconnection.
 - Physical-control notifications update cached state without waiting for a poll.
-- Diagnostics retain recent connection failures and Home Assistant reachability
-  information.
+- Diagnostics retain recent connection failures, Home Assistant reachability,
+  essential initialization batch/attempt counts, and GATT operation deadline,
+  timeout, cancellation, and elapsed-time information.
 
 These values are project policy based on the purifier traces and reliability
 goals. They are not universal Home Assistant constants.
