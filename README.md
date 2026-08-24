@@ -160,13 +160,24 @@ the Govee app is treated as a transient disconnect:
 - the active or partially connecting client is disconnected;
 - stale local address-level connections are closed and verified when possible;
 - Home Assistant's best route is resolved again for the next cycle; and
-- recovery uses exponential backoff from 1 to 60 seconds with jitter.
+- recovery uses exponential backoff from 1 to 60 seconds with jitter. Its base
+  delay is capped at eight seconds while Home Assistant still has an
+  advertisement no more than ten seconds old, producing an approximately
+  6.4-to-9.6-second jittered wait at the ceiling.
 
 The first runtime connection attempt can accept a cached connectable
 advertisement no more than five seconds old. After a failed route, retry requires
 newer advertisement evidence. Each advertisement wait is bounded to ten seconds,
-each GATT connection attempt to 25 seconds, and initial setup to 90 seconds.
-Home Assistant can then retry a temporarily unavailable config entry.
+each GATT connection attempt to 25 seconds, and initial setup to five minutes.
+Individual setup cycles remain debug-only while that recovery window is active;
+only the final failure is returned to the setup flow. Home Assistant can then
+retry a temporarily unavailable config entry.
+
+After a purifier has connected successfully at least once, a dropped link marks
+its entities unavailable without generating a coordinator error for every
+expected recovery cycle. Cached values are not presented as currently available.
+Recovery continues indefinitely, and a successful initialization restores the
+entities and publishes the newly authoritative state.
 
 Commands are serialized and have a 30-second end-to-end deadline. Up to three
 bounded sends are permitted across recovery. Newer pending controls of the same
@@ -227,6 +238,11 @@ does not prove service discovery will complete. Check the logged route, RSSI,
 advertisement age, proxy slots, connection stage, and stale-connection cleanup
 result. A purifier at roughly -75 dBm or weaker may advertise successfully while
 GATT remains unreliable.
+
+Initial setup retries for up to five minutes. Intermediate connection failures
+are retained in debug diagnostics instead of appearing as coordinator errors.
+If setup ultimately reports `cannot_connect`, every bounded attempt in that
+five-minute window failed or the purifier stopped advertising.
 
 ### Physical changes are not reflected
 
@@ -343,4 +359,4 @@ decoded ATT operation, and raw bytes.
 - [Home Assistant integration and HACS reference](home-assistant-bluetooth-integration-reference.md)
 - [License](LICENSE)
 
-Release documentation reflects integration version 0.3.15.
+Release documentation reflects integration version 0.3.16.

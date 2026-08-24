@@ -345,6 +345,27 @@ def test_route_diagnostics_reports_advertisement_age(
     assert route["callback_age_seconds"] is None
 
 
+def test_recent_advertisement_uses_timestamp_not_presence_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backoff remains short only while connectable evidence is actually recent."""
+    service_info = SimpleNamespace(time=time.monotonic() - 2.0)
+    monkeypatch.setattr(
+        bluetooth_module.bluetooth,
+        "async_last_service_info",
+        lambda *_args, **_kwargs: service_info,
+    )
+    environment = HomeAssistantBluetoothEnvironment(
+        SimpleNamespace(),  # type: ignore[arg-type]
+        "AA:BB:CC:DD:EE:FF",
+    )
+
+    assert environment.has_recent_advertisement(5.0)
+
+    service_info.time = time.monotonic() - 6.0
+    assert not environment.has_recent_advertisement(5.0)
+
+
 @pytest.mark.asyncio
 async def test_callback_registration_disables_cached_replay_when_supported(
     monkeypatch: pytest.MonkeyPatch,

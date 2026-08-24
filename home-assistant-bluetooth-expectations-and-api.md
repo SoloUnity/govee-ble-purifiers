@@ -466,7 +466,10 @@ essential because backend callbacks can arrive after cancellation or cleanup.
 Backoff should be bounded and normally include jitter. Reset exponential
 backoff only after a connection has remained healthy for a meaningful period;
 otherwise a connection that succeeds for milliseconds can cause rapid retry
-loops.
+loops. When a connectable device is still producing recent advertisements, an
+integration may cap the effective backoff below its disconnected-device maximum
+while still requiring fresh route evidence before the next attempt. This keeps
+a weak but present device responsive without busy-looping on a stale route.
 
 ## 10. Handling poor signals and stuck connections
 
@@ -772,9 +775,17 @@ The Govee purifier integration applies the general model as follows:
   no automatic discovery flow; the user can open a new **Add device** scan.
 - A surviving address-level connection blocks a new attempt so retries cannot
   consume additional adapter slots.
-- The setup window is 90 seconds, permitting at least two full
-  advertisement-and-connection attempts under the configured bounds.
-- Recovery uses capped exponential backoff with jitter.
+- The setup window is five minutes. Intermediate connection-cycle failures are
+  diagnostic debug events; only expiration of the complete setup window is
+  returned to the config flow or config-entry setup.
+- Recovery uses capped exponential backoff with jitter. Its normal ceiling is
+  60 seconds, but the base delay is capped at eight seconds while Home Assistant
+  retains a connectable advertisement no more than ten seconds old. The
+  resulting ceiling after jitter is approximately 6.4 to 9.6 seconds.
+- Before the first successful initialization, transient failures do not publish
+  coordinator update errors. After a device has been ready, link loss makes its
+  entities unavailable without logging an error for each retry cycle. Recovery
+  remains indefinite and successful reinitialization restores availability.
 - GATT, plaintext/encrypted channel, and purifier protocol are separate layers.
 - Notification subscription precedes H7129 negotiation and all application
   requests.

@@ -43,6 +43,11 @@ class GoveePurifierEntity(CoordinatorEntity[GoveeDataUpdateCoordinator]):
             name=entry.title,
         )
 
+    @property
+    def available(self) -> bool:
+        """Return unavailable during expected Bluetooth recovery without errors."""
+        return super().available and self.coordinator.client_available
+
     async def _async_run_operation(self, operation: Awaitable[None]) -> None:
         """Run a control operation and translate connection failures."""
         try:

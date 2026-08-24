@@ -23,6 +23,7 @@ def _entry_and_coordinator(
     coordinator = MagicMock()
     coordinator.data = state
     coordinator.last_update_success = True
+    coordinator.client_available = True
     coordinator.async_set_power = AsyncMock()
     coordinator.async_set_fan_mode = AsyncMock()
     coordinator.async_set_light_power = AsyncMock()
@@ -94,3 +95,14 @@ def test_sensors_read_cached_state_only() -> None:
 
     assert sensors["pm25"].native_value == 7
     assert sensors["filter_life"].native_value == 73
+
+
+def test_entities_become_unavailable_during_quiet_bluetooth_recovery() -> None:
+    """Expected link recovery does not require a coordinator update error."""
+    entry, coordinator = _entry_and_coordinator(PurifierState(power=True))
+    fan = GoveePurifierFan(entry)
+
+    assert fan.available
+
+    coordinator.client_available = False
+    assert not fan.available

@@ -35,6 +35,9 @@ from custom_components.govee_ble_air_purifier.protocol import GoveePurifierProto
 class FakeEnvironment:
     address = "AA:BB:CC:DD:EE:FF"
 
+    def __init__(self) -> None:
+        self.recent_advertisement = False
+
     async def async_start(self) -> None:
         return
 
@@ -43,6 +46,9 @@ class FakeEnvironment:
 
     def reachability_diagnostics(self) -> str:
         return "test route is reachable"
+
+    def has_recent_advertisement(self, _: float) -> bool:
+        return self.recent_advertisement
 
     async def async_wait_for_fresh_device(self, _: float) -> SimpleNamespace:
         return SimpleNamespace(
@@ -123,8 +129,8 @@ def test_old_generation_callbacks_are_ignored() -> None:
     assert not client._disconnected.is_set()
 
 
-def test_startup_budget_allows_two_complete_connection_cycles() -> None:
-    """Setup can wait for two advertisements and two bounded connections."""
+def test_startup_budget_is_five_minutes() -> None:
+    """Weak-signal setup gets a bounded five-minute recovery window."""
     maximum_first_backoff = client_module.BACKOFF_MIN * 1.2
     two_cycle_budget = (
         2 * (client_module.FRESH_ADVERTISEMENT_TIMEOUT + CONNECTION_ATTEMPT_TIMEOUT)
@@ -132,6 +138,7 @@ def test_startup_budget_allows_two_complete_connection_cycles() -> None:
     )
 
     assert client_module.STARTUP_TIMEOUT >= two_cycle_budget
+    assert client_module.STARTUP_TIMEOUT == 300.0
 
 
 @pytest.mark.asyncio
@@ -153,7 +160,7 @@ async def test_shutdown_does_not_overwrite_detailed_availability_error() -> None
 
 
 @pytest.mark.asyncio
-async def test_startup_timeout_surfaces_diagnostic_summary(
+async def test_startup_timeout_surfaces_one_final_diagnostic_without_callback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A bounded startup failure remains useful after cleanup completes."""
@@ -177,9 +184,7 @@ async def test_startup_timeout_surfaces_diagnostic_summary(
     assert "cause=TimeoutError" in message
     assert "route={'present': True, 'source': 'test', 'rssi': -50}" in message
     assert "reachability=test route is reachable" in message
-    assert len(updates) == 1
-    assert updates[0][0] is False
-    assert updates[0][1] is raised.value
+    assert updates == []
 
 
 @pytest.mark.asyncio
@@ -262,6 +267,7 @@ async def test_cancelling_idle_wait_cleans_up_child_tasks() -> None:
 async def test_connection_loop_retries_after_link_failure() -> None:
     """A failed connection cycle becomes unavailable, backs off, and retries."""
     client = make_client()
+    client._has_ever_been_ready = True
     availability: list[bool] = []
     client._availability_callback = lambda available, _: availability.append(available)
     cycles = 0
@@ -282,6 +288,56 @@ async def test_connection_loop_retries_after_link_failure() -> None:
     assert availability == [False]
     client._async_backoff.assert_awaited_once_with(client_module.BACKOFF_MIN)
     assert client._transport.disconnects == 2  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_initial_connection_failures_remain_quiet_while_retrying() -> None:
+    """Setup retries do not publish intermediate unavailable errors."""
+    client = make_client()
+    availability: list[bool] = []
+    client._availability_callback = lambda available, _: availability.append(available)
+    cycles = 0
+
+    async def run_cycle() -> None:
+        nonlocal cycles
+        cycles += 1
+        if cycles == 1:
+            raise GattTransportError("weak signal")
+        client._stopping.set()
+
+    client._connect_initialize_and_run = run_cycle  # type: ignore[method-assign]
+    client._async_backoff = AsyncMock()  # type: ignore[method-assign]
+
+    await client._run()
+
+    assert cycles == 2
+    assert availability == []
+
+
+def test_recent_advertisements_cap_recovery_backoff() -> None:
+    """A visible weak purifier is retried without reaching minute-long delays."""
+    client = make_client()
+    environment = client._environment
+    environment.recent_advertisement = True  # type: ignore[attr-defined]
+
+    assert client._recovery_backoff_delay(60.0) == 8.0
+
+    environment.recent_advertisement = False  # type: ignore[attr-defined]
+    assert client._recovery_backoff_delay(60.0) == 60.0
+
+
+def test_duplicate_unavailable_updates_are_suppressed() -> None:
+    """One weak-link outage produces one availability transition."""
+    client = make_client()
+    updates: list[bool] = []
+    client._availability_callback = lambda available, _: updates.append(available)
+
+    client._set_available(True, None)
+    client._set_available(False, GattTransportError("first failure"))
+    client._set_available(False, GattTransportError("retry failure"))
+    client._set_available(True, None)
+
+    assert updates == [True, False, True]
 
 
 def test_reconnect_invalidates_fan_and_never_assumes_cached_rgb() -> None:

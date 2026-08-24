@@ -4,7 +4,7 @@
     "step": {
       "user": {
         "title": "Add a Govee BLE air purifier",
-        "description": "Choose a purifier currently visible to a connectable Home Assistant Bluetooth adapter or proxy. Near is the device with the strongest current signal. Close the Govee app first because the purifier accepts only one Bluetooth connection.",
+        "description": "Choose a purifier currently visible to a connectable Home Assistant Bluetooth adapter or proxy. Near is the device with the strongest current signal. Close the Govee app first because the purifier accepts only one Bluetooth connection. Weak-signal setup can continue retrying for up to five minutes.",
         "data": {
           "address": "Purifier"
         },

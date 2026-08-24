@@ -52,11 +52,12 @@ TRANSACTION_TIMEOUT = 3.0
 INITIALIZATION_ATTEMPTS = 2
 COMMAND_DEADLINE = 30.0
 COMMAND_SEND_ATTEMPTS = 3
-STARTUP_TIMEOUT = 90.0
+STARTUP_TIMEOUT = 300.0
 FRESH_ADVERTISEMENT_TIMEOUT = 10.0
 BETWEEN_REQUEST_DELAY = 0.001
 BACKOFF_MIN = 1.0
 BACKOFF_MAX = 60.0
+RECENT_ADVERTISEMENT_BACKOFF_MAX = 8.0
 BACKOFF_RESET_AFTER = 30.0
 
 StateCallback = Callable[[PurifierState], None]
@@ -141,6 +142,8 @@ class ReliablePurifierClient:
         self._active_request: str | None = None
         self._last_error: str | None = None
         self._last_timeout_summary: str | None = None
+        self._has_ever_been_ready = False
+        self._reported_available: bool | None = None
 
     @property
     def is_ready(self) -> bool:
@@ -151,6 +154,7 @@ class ReliablePurifierClient:
         return {
             "status": self.status.value,
             "is_ready": self.is_ready,
+            "has_ever_been_ready": self._has_ever_been_ready,
             "session_generation": self._session_generation,
             "connection_cycles": self._connection_cycles,
             "plaintext_rx_count": self._plaintext_rx_count,
@@ -191,7 +195,6 @@ class ReliablePurifierClient:
                 f"transport={self._transport.diagnostic_snapshot()}"
             )
             await self.async_shutdown()
-            self._set_available(False, startup_error)
             raise startup_error from err
 
     async def async_shutdown(self) -> None:
@@ -277,7 +280,14 @@ class ReliablePurifierClient:
                 )
                 if stable_for >= BACKOFF_RESET_AFTER:
                     backoff = BACKOFF_MIN
-                self._set_available(False, err)
+                if self._has_ever_been_ready:
+                    self._set_available(False, err)
+                else:
+                    _LOGGER.debug(
+                        "Initial purifier setup is still recovering after "
+                        "cycle=%d; suppressing transient availability error",
+                        self._connection_cycles,
+                    )
             finally:
                 self._ready_since = None
                 channel = self._channel
@@ -292,7 +302,7 @@ class ReliablePurifierClient:
             if self._stopping.is_set():
                 break
             self.status = ClientStatus.BACKOFF
-            await self._async_backoff(backoff)
+            await self._async_backoff(self._recovery_backoff_delay(backoff))
             backoff = min(BACKOFF_MAX, backoff * 2)
 
     async def _connect_initialize_and_run(self) -> None:
@@ -392,6 +402,7 @@ class ReliablePurifierClient:
         )
 
         self.status = ClientStatus.READY
+        self._has_ever_been_ready = True
         loop = asyncio.get_running_loop()
         self._ready_since = loop.time()
         initial_poll_delay = (
@@ -776,6 +787,14 @@ class ReliablePurifierClient:
         self._disconnected.set()
 
     def _set_available(self, available: bool, error: Exception | None) -> None:
+        if self._reported_available is available:
+            _LOGGER.debug(
+                "Purifier availability unchanged: available=%s status=%s",
+                available,
+                self.status.value,
+            )
+            return
+        self._reported_available = available
         _LOGGER.debug(
             "Purifier availability update: available=%s status=%s error=%s",
             available,
@@ -783,6 +802,26 @@ class ReliablePurifierClient:
             f"{type(error).__name__}: {error}" if error is not None else None,
         )
         self._availability_callback(available, error)
+
+    def _recovery_backoff_delay(self, requested: float) -> float:
+        """Cap recovery delay while Home Assistant still sees advertisements."""
+        recent = self._environment.has_recent_advertisement(
+            FRESH_ADVERTISEMENT_TIMEOUT
+        )
+        delay = (
+            min(requested, RECENT_ADVERTISEMENT_BACKOFF_MAX)
+            if recent
+            else requested
+        )
+        _LOGGER.debug(
+            "Bluetooth recovery backoff policy: requested=%.1fs effective=%.1fs "
+            "recent_advertisement=%s recent_limit=%.1fs",
+            requested,
+            delay,
+            recent,
+            FRESH_ADVERTISEMENT_TIMEOUT,
+        )
+        return delay
 
     def _coalesce_pending(self, replacement: _Operation) -> None:
         key = type(replacement.command)

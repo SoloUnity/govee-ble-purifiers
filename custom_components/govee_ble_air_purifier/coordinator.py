@@ -51,6 +51,7 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
         )
         self.data = PurifierState()
         self._shutdown = False
+        self._client_available = False
 
         environment = HomeAssistantBluetoothEnvironment(hass, address)
         transport = GattTransport(name=self.name)
@@ -67,6 +68,11 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
     async def async_start(self) -> None:
         """Connect and complete the official startup initialization sweep."""
         await self.client.async_start()
+
+    @property
+    def client_available(self) -> bool:
+        """Return whether the purifier completed initialization and is connected."""
+        return self._client_available
 
     async def async_shutdown(self) -> None:
         """Cancel recovery and close any active BLE connection."""
@@ -119,9 +125,22 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
             self.async_set_updated_data(state)
 
     def _availability_updated(self, available: bool, error: Exception | None) -> None:
+        self._client_available = available
         if available:
             self.async_set_updated_data(self.client.state)
             return
-        self.async_set_update_error(
-            UpdateFailed(str(error) if error else "Purifier is disconnected")
-        )
+        if error is not None and not isinstance(error, ConnectionError | TimeoutError):
+            _LOGGER.error(
+                "Unexpected purifier recovery failure: name=%s error=%s",
+                self.name,
+                error,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+        else:
+            _LOGGER.debug(
+                "Purifier is unavailable while Bluetooth recovery continues: "
+                "name=%s error=%s",
+                self.name,
+                str(error) if error is not None else None,
+            )
+        self.async_update_listeners()

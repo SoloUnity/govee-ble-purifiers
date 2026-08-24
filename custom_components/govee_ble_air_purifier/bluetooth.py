@@ -331,6 +331,32 @@ class HomeAssistantBluetoothEnvironment:
             self._hass, self.address, connectable=True
         )
 
+    def has_recent_advertisement(self, max_age: float) -> bool:
+        """Return whether HA has recent connectable evidence for this address."""
+        try:
+            service_info = bluetooth.async_last_service_info(
+                self._hass,
+                self.address,
+                connectable=True,
+            )
+        except Exception as err:
+            _LOGGER.debug(
+                "Unable to inspect advertisement recency for %s: %s",
+                self.address,
+                exception_detail(err),
+                exc_info=True,
+            )
+            return False
+        advertisement_time = (
+            getattr(service_info, "time", None)
+            if service_info is not None
+            else None
+        )
+        return (
+            isinstance(advertisement_time, int | float)
+            and max(0.0, time.monotonic() - advertisement_time) <= max_age
+        )
+
     async def async_wait_for_fresh_device(self, timeout: float) -> BLEDevice | None:
         """Resolve a recent route, or wait for evidence newer than the last route."""
         started_at = time.monotonic()
