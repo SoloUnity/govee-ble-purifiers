@@ -157,7 +157,7 @@ The H7124 sweep established these request-to-response boundaries:
 
 | Request | Response completion |
 | --- | --- |
-| `33 b2` | One matching response. Captures returned a zero payload; a physical H7124 also returned `01` in byte 2 with bytes 3-18 zero. |
+| `33 b2` | One matching response. Captures returned `00` in byte 2; physical H7124 and H7129 devices also returned `01` in byte 2. In both forms, bytes 3-18 were zero. |
 | `33 b5` | One matching response with a zero payload |
 | `aa 01` | One device-state response |
 | `aa 05 00`, `aa 05 01`, `aa 05 03` | One matching `aa 05` response for each subcommand |
@@ -171,14 +171,17 @@ The H7124 sweep established these request-to-response boundaries:
 | `ab 01 04` | Nine fragments: `ab 00`, `ab 01` through `ab 07`, then `ab ff` |
 | H7129 `ab 02 02 00 01` | One `ab 00` response containing the `02 02 00 01` selector |
 
-The additional physical H7124 `33 b2` response was:
+The additional physical H7124 and H7129 `33 b2` response was:
 
 ```text
 33 b2 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 80
 ```
 
-The final `80` is the valid XOR checksum for that frame. The meaning of the
-`01` value has not been established.
+The final `80` is the valid XOR checksum for that frame. The H7129 observation
+occurred during encrypted startup initialization and was returned once for
+each of two `33 b2` request attempts. This establishes that both models can
+use the same response shape; the meaning of the `01` value has not been
+established.
 
 Observed H7124 `aa 05` responses begin as follows; remaining payload bytes are
 zero through byte 18, followed by the checksum:
