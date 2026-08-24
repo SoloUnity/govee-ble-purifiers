@@ -153,7 +153,8 @@ initialization notification and answered after 69 ms.
 
 ### Response completion
 
-The H7124 sweep established these request-to-response boundaries:
+The captured sweeps and physical-device observations established these
+request-to-response boundaries:
 
 | Request | Response completion |
 | --- | --- |
@@ -162,7 +163,9 @@ The H7124 sweep established these request-to-response boundaries:
 | `aa 01` | One device-state response |
 | `aa 05 00`, `aa 05 01`, `aa 05 03` | One matching `aa 05` response for each subcommand |
 | `aa 1b 01`, `aa 1b 05` | One matching night-light state response for each selector |
-| `aa 1e 01 02`, `aa 10`, `aa 08`, `aa 26`, `aa 17`, `aa 07 20`, `aa 1f` | One exact echo for each request |
+| H7124 `aa 1e 01 02` | One exact echo |
+| H7129 `aa 1e 01 02` | One `aa 1e 03 01` response with bytes 4-18 zero |
+| `aa 10`, `aa 08`, `aa 26`, `aa 17`, `aa 07 20`, `aa 1f` | One exact echo for each request |
 | `aa 16` | One structured `aa 16` response |
 | `aa 19` | One air-quality/status response |
 | `aa 07 10`, `aa 07 11`, `aa 07 06` | One matching `aa 07` device-data response for each subcommand |
@@ -182,6 +185,17 @@ occurred during encrypted startup initialization and was returned once for
 each of two `33 b2` request attempts. This establishes that both models can
 use the same response shape; the meaning of the `01` value has not been
 established.
+
+An H7129 physical device returned this decrypted response once after each of
+two encrypted `aa 1e 01 02` startup request attempts:
+
+```text
+aa 1e 03 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 b6
+```
+
+The final `b6` is the valid XOR checksum. This establishes the H7129 response
+boundary and shows that, unlike the captured H7124 response, it is not an exact
+echo. The meanings of the `03 01` response values have not been established.
 
 Observed H7124 `aa 05` responses begin as follows; remaining payload bytes are
 zero through byte 18, followed by the checksum:

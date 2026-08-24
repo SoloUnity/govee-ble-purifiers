@@ -253,6 +253,18 @@ _BASE_INITIALIZATION_REQUESTS: tuple[RequestDescriptor, ...] = (
     ),
 )
 
+_H7129_CAPABILITY_1E_REQUEST = _request(
+    "capability_1e_01_02",
+    b"\xaa\x1e\x01\x02",
+    _exact(build_frame(b"\xaa\x1e\x03\x01")),
+)
+
+_H7129_BASE_INITIALIZATION_REQUESTS = (
+    _BASE_INITIALIZATION_REQUESTS[:8]
+    + (_H7129_CAPABILITY_1E_REQUEST,)
+    + _BASE_INITIALIZATION_REQUESTS[9:]
+)
+
 _H7129_METADATA_REQUEST = _request(
     "metadata_02_02_00_01",
     b"\xab\x02\x02\x00\x01",
@@ -262,6 +274,7 @@ _H7129_METADATA_REQUEST = _request(
 # The documented active-session ee-aa refresh omits the initial 33-b2 and the
 # aa-07/aa-1f/ab metadata tail, and begins with 33-b5.
 _REFRESH_REQUESTS = _BASE_INITIALIZATION_REQUESTS[1:15]
+_H7129_REFRESH_REQUESTS = _H7129_BASE_INITIALIZATION_REQUESTS[1:15]
 
 DEVICE_STATE_POLL = _BASE_INITIALIZATION_REQUESTS[2]
 
@@ -276,12 +289,14 @@ class GoveePurifierProtocol:
         """Return the official app's documented 23/24 request sweep."""
 
         if self.profile.model.value == "H7129":
-            return _BASE_INITIALIZATION_REQUESTS + (_H7129_METADATA_REQUEST,)
+            return _H7129_BASE_INITIALIZATION_REQUESTS + (_H7129_METADATA_REQUEST,)
         return _BASE_INITIALIZATION_REQUESTS
 
     def refresh_requests(self) -> tuple[RequestDescriptor, ...]:
         """Return the documented short sweep triggered by active-session ``ee aa``."""
 
+        if self.profile.model.value == "H7129":
+            return _H7129_REFRESH_REQUESTS
         return _REFRESH_REQUESTS
 
     def device_state_poll(self) -> RequestDescriptor:

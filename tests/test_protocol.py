@@ -139,7 +139,9 @@ def test_initialization_and_refresh_order() -> None:
 
     refresh = h7129.refresh_requests()
     assert len(refresh) == 14
-    assert refresh == h7124_requests[1:15]
+    assert tuple(request.frame for request in refresh) == tuple(
+        request.frame for request in h7124_requests[1:15]
+    )
     assert h7129.device_state_poll().frame == build_frame(b"\xaa\x01")
 
 
@@ -189,13 +191,54 @@ def test_unrelated_notification_does_not_complete_transaction() -> None:
 
 
 def test_exact_echo_response_boundary() -> None:
-    """Exact-echo capability requests reject a differing payload."""
+    """H7124's exact-echo capability request rejects a differing payload."""
 
     requests = _protocol().initialization_requests()
     exact_echo = _protocol().new_response_matcher(requests[8])
 
     assert exact_echo.feed(build_frame(b"\xaa\x1e\x01\x03")) is MatchResult.IGNORED
     assert exact_echo.feed(requests[8].frame) is MatchResult.COMPLETE
+
+
+def test_h7129_capability_1e_accepts_observed_response() -> None:
+    """H7129 completes aa-1e only on its observed non-echo response."""
+
+    protocol = _protocol(Model.H7129)
+    descriptor = protocol.initialization_requests()[8]
+    observed_response = bytes.fromhex(
+        "aa 1e 03 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 b6"
+    )
+
+    assert descriptor.frame == build_frame(b"\xaa\x1e\x01\x02")
+    assert (
+        protocol.new_response_matcher(descriptor).feed(observed_response)
+        is MatchResult.COMPLETE
+    )
+    assert (
+        protocol.new_response_matcher(descriptor).feed(descriptor.frame)
+        is MatchResult.IGNORED
+    )
+    assert (
+        protocol.new_response_matcher(descriptor).feed(
+            build_frame(b"\xaa\x1e\x03\x01\x01")
+        )
+        is MatchResult.IGNORED
+    )
+
+
+def test_h7129_refresh_uses_observed_capability_1e_response() -> None:
+    """The active-session refresh reuses H7129's model-specific matcher."""
+
+    protocol = _protocol(Model.H7129)
+    descriptor = protocol.refresh_requests()[7]
+
+    assert descriptor.name == "capability_1e_01_02"
+    assert (
+        protocol.new_response_matcher(descriptor).feed(
+            build_frame(b"\xaa\x1e\x03\x01")
+        )
+        is MatchResult.COMPLETE
+    )
 
 
 @pytest.mark.parametrize("model", [Model.H7124, Model.H7129])
