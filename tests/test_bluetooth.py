@@ -125,6 +125,7 @@ async def test_connection_deadline_cleans_partial_client_and_records_attempts(
     class FakeClient:
         def __init__(self, *_: object, **__: object) -> None:
             self.is_connected = False
+            self.services = SimpleNamespace(services={})
             self.disconnect_calls = 0
             clients.append(self)
 
@@ -169,11 +170,89 @@ async def test_connection_deadline_cleans_partial_client_and_records_attempts(
     assert address_cleanups == [device.address] * 4
     diagnostics = transport.diagnostic_snapshot()
     assert diagnostics["connecting_client_present"] is False
+    timeout_diagnostics = diagnostics["last_connection_timeout_diagnostics"]
+    assert timeout_diagnostics == {
+        "partial_client_present": True,
+        "partial_client_connected": False,
+        "partial_client_connected_error": None,
+        "service_count": 0,
+        "service_error": None,
+        "bluez_connection_count": 0,
+        "bluez_connection_error": None,
+        "device_path": None,
+        "adapter": None,
+        "cleanup": {
+            "success": True,
+            "remaining_connections": 0,
+            "elapsed_seconds": pytest.approx(0, abs=0.01),
+            "error": None,
+        },
+    }
     failures = diagnostics["recent_connection_failures"]
     assert isinstance(failures, list)
     assert len(failures) == 2
     assert "attempt=1" in failures[0]
     assert "attempt=2" in failures[1]
+
+
+@pytest.mark.asyncio
+async def test_connection_deadline_inspects_live_partial_client_before_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timeout evidence distinguishes a connected client from stalled discovery."""
+    class ConnectedClient:
+        def __init__(self, *_: object, **__: object) -> None:
+            self.is_connected = True
+            self.services = SimpleNamespace(services={"service": object()})
+            clients.append(self)
+
+        async def disconnect(self) -> None:
+            self.is_connected = False
+
+    clients: list[ConnectedClient] = []
+
+    async def hang_connection(
+        client_class: object, device: object, *_: object, **__: object
+    ) -> None:
+        client_class(device)  # type: ignore[operator]
+        await asyncio.Event().wait()
+
+    async def connected_while_client_is_live(device: object) -> list[object]:
+        return [device] if clients and clients[0].is_connected else []
+
+    monkeypatch.setattr(
+        bluetooth_module, "BleakClientWithServiceCache", ConnectedClient
+    )
+    monkeypatch.setattr(bluetooth_module, "establish_connection", hang_connection)
+    monkeypatch.setattr(
+        bluetooth_module, "get_connected_devices", connected_while_client_is_live
+    )
+    monkeypatch.setattr(bluetooth_module, "CONNECTION_ATTEMPT_TIMEOUT", 0.01)
+    transport = GattTransport(name="Bedroom purifier")
+    device = SimpleNamespace(
+        address="AA:BB:CC:DD:EE:FF",
+        name="ihoment_H7129_TEST",
+        details={"path": "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF"},
+    )
+
+    with pytest.raises(BluetoothUnavailableError) as raised:
+        await transport.async_connect(device)  # type: ignore[arg-type]
+
+    diagnostics = transport.diagnostic_snapshot()[
+        "last_connection_timeout_diagnostics"
+    ]
+    assert isinstance(diagnostics, dict)
+    assert diagnostics["partial_client_present"] is True
+    assert diagnostics["partial_client_connected"] is True
+    assert diagnostics["service_count"] == 1
+    assert diagnostics["bluez_connection_count"] == 1
+    assert diagnostics["device_path"] == (
+        "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF"
+    )
+    assert diagnostics["adapter"] == "hci0"
+    assert diagnostics["cleanup"]["success"] is True
+    assert diagnostics["cleanup"]["remaining_connections"] == 0
+    assert "timeout_diagnostics=" in str(raised.value)
 
 
 @pytest.mark.asyncio

@@ -30,6 +30,7 @@ COMMAND_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b11"
 CONNECT_ATTEMPTS = 1
 CONNECTION_ATTEMPT_TIMEOUT = 15.0
 CONNECTION_ABORT_TIMEOUT = 5.0
+CONNECTION_DIAGNOSTIC_TIMEOUT = 1.0
 STALE_CONNECTION_CLEANUP_TIMEOUT = 5.0
 STALE_CONNECTION_CHECK_INTERVAL = 0.25
 RECENT_CONNECTION_FAILURE_LIMIT = 4
@@ -403,6 +404,7 @@ class GattTransport:
         self._pre_return_disconnects = 0
         self._last_disconnect_stage: str | None = None
         self._last_disconnect_elapsed: float | None = None
+        self._last_connection_timeout_diagnostics: dict[str, Any] | None = None
         self._recent_connection_failures: deque[str] = deque(
             maxlen=RECENT_CONNECTION_FAILURE_LIMIT
         )
@@ -438,6 +440,9 @@ class GattTransport:
             "pre_return_disconnects": self._pre_return_disconnects,
             "last_disconnect_stage": self._last_disconnect_stage,
             "last_disconnect_elapsed_seconds": self._last_disconnect_elapsed,
+            "last_connection_timeout_diagnostics": (
+                self._last_connection_timeout_diagnostics
+            ),
             "connecting_client_present": self._connecting_client is not None,
             "recent_connection_failures": list(self._recent_connection_failures),
             "address_cleanup_attempts": self._address_cleanup_attempts,
@@ -480,6 +485,65 @@ class GattTransport:
         """Keep bounded evidence from attempts preceding the final failure."""
         self._last_error = detail
         self._recent_connection_failures.append(detail)
+
+    @staticmethod
+    def _device_backend_route(device: BLEDevice) -> dict[str, str | None]:
+        """Return only the non-secret BlueZ route fields needed for diagnosis."""
+        details = getattr(device, "details", None)
+        path: str | None = None
+        adapter: str | None = None
+        if isinstance(details, dict):
+            raw_path = details.get("path")
+            path = raw_path if isinstance(raw_path, str) else None
+            raw_adapter = details.get("adapter")
+            props = details.get("props")
+            if raw_adapter is None and isinstance(props, dict):
+                raw_adapter = props.get("Adapter")
+            if isinstance(raw_adapter, str):
+                adapter = raw_adapter.rsplit("/", 1)[-1]
+        if adapter is None and path is not None:
+            adapter = next(
+                (part for part in path.split("/") if part.startswith("hci")),
+                None,
+            )
+        return {"device_path": path, "adapter": adapter}
+
+    async def _async_connection_timeout_diagnostics(
+        self, device: BLEDevice
+    ) -> dict[str, Any]:
+        """Inspect a still-running connector before cancellation changes its state."""
+        client = self._connecting_client
+        diagnostics: dict[str, Any] = {
+            "partial_client_present": client is not None,
+            "partial_client_connected": None,
+            "partial_client_connected_error": None,
+            "service_count": None,
+            "service_error": None,
+            "bluez_connection_count": None,
+            "bluez_connection_error": None,
+            **self._device_backend_route(device),
+        }
+        if client is not None:
+            try:
+                diagnostics["partial_client_connected"] = bool(client.is_connected)
+            except Exception as err:  # noqa: BLE001
+                diagnostics["partial_client_connected_error"] = exception_detail(err)
+            try:
+                services = client.services
+                diagnostics["service_count"] = len(
+                    getattr(services, "services", {})
+                )
+            except Exception as err:  # noqa: BLE001
+                diagnostics["service_error"] = exception_detail(err)
+
+        try:
+            async with asyncio.timeout(CONNECTION_DIAGNOSTIC_TIMEOUT):
+                connected_devices = await get_connected_devices(device)
+            diagnostics["bluez_connection_count"] = len(connected_devices)
+        except Exception as err:  # noqa: BLE001
+            diagnostics["bluez_connection_error"] = exception_detail(err)
+
+        return diagnostics
 
     async def _async_abort_connecting_client(self) -> None:
         """Release a partially established client before another route is tried."""
@@ -609,6 +673,7 @@ class GattTransport:
         self._pre_return_disconnects = 0
         self._last_disconnect_stage = None
         self._last_disconnect_elapsed = None
+        self._last_connection_timeout_diagnostics = None
         self._set_stage("establish_connection")
         self._connection_attempts += 1
         _LOGGER.debug(
@@ -630,9 +695,9 @@ class GattTransport:
             self._connecting_address = device.address
             return client
 
-        try:
-            async with asyncio.timeout(CONNECTION_ATTEMPT_TIMEOUT):
-                client = await establish_connection(
+        async def establish_with_diagnostics() -> BleakClientWithServiceCache:
+            connection_task = asyncio.create_task(
+                establish_connection(
                     create_tracked_client,  # type: ignore[arg-type]
                     device,
                     self.name,
@@ -640,7 +705,27 @@ class GattTransport:
                         self._disconnected_from_bleak(connected_client, generation)
                     ),
                     max_attempts=CONNECT_ATTEMPTS,
+                ),
+                name=f"govee-connect-{device.address}",
+            )
+            try:
+                done, _ = await asyncio.wait(
+                    (connection_task,), timeout=CONNECTION_ATTEMPT_TIMEOUT
                 )
+                if not done:
+                    self._last_connection_timeout_diagnostics = (
+                        await self._async_connection_timeout_diagnostics(device)
+                    )
+                    raise TimeoutError("connection attempt deadline exceeded")
+                return connection_task.result()
+            finally:
+                if not connection_task.done():
+                    connection_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await connection_task
+
+        try:
+            client = await establish_with_diagnostics()
         except TimeoutError as err:
             detail = (
                 f"attempt={self._connection_attempts}; "
@@ -653,6 +738,15 @@ class GattTransport:
             cleanup_ok = await self.async_cleanup_stale_connection(
                 reason="connection_timeout"
             )
+            timeout_diagnostics = self._last_connection_timeout_diagnostics or {}
+            timeout_diagnostics["cleanup"] = {
+                "success": cleanup_ok,
+                "remaining_connections": self._last_address_cleanup_remaining,
+                "elapsed_seconds": self._last_address_cleanup_elapsed,
+                "error": self._last_address_cleanup_error,
+            }
+            self._last_connection_timeout_diagnostics = timeout_diagnostics
+            detail = f"{detail}; timeout_diagnostics={timeout_diagnostics}"
             if not cleanup_ok:
                 detail = (
                     f"{detail}; address_cleanup_error="
