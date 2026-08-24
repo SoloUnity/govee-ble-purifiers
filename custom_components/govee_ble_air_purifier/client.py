@@ -49,7 +49,9 @@ _LOGGER = logging.getLogger(__name__)
 POLL_INTERVAL = 3.0
 H7124_INITIAL_POLL_DELAY = 1.936
 TRANSACTION_TIMEOUT = 3.0
-INITIALIZATION_ATTEMPTS = 2
+INITIALIZATION_ATTEMPTS = 3
+ESSENTIAL_INITIALIZATION_REQUEST = "device_state"
+INITIALIZATION_RETRY_DELAY = 3.0
 COMMAND_DEADLINE = 30.0
 COMMAND_SEND_ATTEMPTS = 3
 STARTUP_TIMEOUT = 300.0
@@ -142,6 +144,8 @@ class ReliablePurifierClient:
         self._active_request: str | None = None
         self._last_error: str | None = None
         self._last_timeout_summary: str | None = None
+        self._incomplete_initialization_requests: tuple[str, ...] = ()
+        self._initialization_failure_summaries: dict[str, str] = {}
         self._has_ever_been_ready = False
         self._reported_available: bool | None = None
 
@@ -161,12 +165,18 @@ class ReliablePurifierClient:
             "active_request": self._active_request,
             "last_error": self._last_error,
             "last_timeout_summary": self._last_timeout_summary,
+            "incomplete_initialization_requests": (
+                self._incomplete_initialization_requests
+            ),
+            "initialization_failure_summaries": dict(
+                self._initialization_failure_summaries
+            ),
             "route": self._environment.route_diagnostics(),
             "transport": self._transport.diagnostic_snapshot(),
         }
 
     async def async_start(self) -> None:
-        """Start recovery and wait for the first complete initialization."""
+        """Start recovery and wait for the first usable initialization."""
         if self._runner is not None:
             return
 
@@ -313,6 +323,8 @@ class ReliablePurifierClient:
         self._drain_frame_queue()
         self._refresh_pending = False
         self._refresh_running = False
+        self._incomplete_initialization_requests = ()
+        self._initialization_failure_summaries = {}
         self._invalidate_connection_scoped_state()
         cached_route = self._environment.route_diagnostics()
         cached_reachability = self._environment.reachability_diagnostics()
@@ -396,10 +408,7 @@ class ReliablePurifierClient:
             len(initialization_requests),
             INITIALIZATION_ATTEMPTS,
         )
-        await self._async_run_sweep(
-            initialization_requests,
-            attempts=INITIALIZATION_ATTEMPTS,
-        )
+        await self._async_run_initialization(initialization_requests)
 
         self.status = ClientStatus.READY
         self._has_ever_been_ready = True
@@ -415,16 +424,84 @@ class ReliablePurifierClient:
         self._last_timeout_summary = None
         _LOGGER.debug(
             "Purifier ready: cycle=%d session_generation=%d initial_poll_delay=%.3fs "
-            "state=%s",
+            "incomplete_startup_requests=%s state=%s",
             self._connection_cycles,
             session_generation,
             initial_poll_delay,
+            self._incomplete_initialization_requests,
             self.state,
         )
         self._set_available(True, None)
         if self._first_ready is not None and not self._first_ready.done():
             self._first_ready.set_result(None)
         await self._async_ready_loop()
+
+    async def _async_run_initialization(
+        self, descriptors: tuple[RequestDescriptor, ...]
+    ) -> None:
+        """Attempt the full startup sweep while preserving a healthy channel."""
+        failures: dict[str, str] = {}
+        essential: RequestDescriptor | None = None
+
+        for index, descriptor in enumerate(descriptors):
+            if descriptor.name == ESSENTIAL_INITIALIZATION_REQUEST:
+                essential = descriptor
+            try:
+                await self._async_execute_descriptor(
+                    descriptor,
+                    attempts=INITIALIZATION_ATTEMPTS,
+                )
+            except TransactionTimeoutError as err:
+                failures[descriptor.name] = str(err)
+                self._update_initialization_failures(failures)
+                _LOGGER.debug(
+                    "Initialization request exhausted its retries: request=%s "
+                    "attempts=%d essential=%s; continuing startup sweep",
+                    descriptor.name,
+                    INITIALIZATION_ATTEMPTS,
+                    descriptor.name == ESSENTIAL_INITIALIZATION_REQUEST,
+                    exc_info=True,
+                )
+            if index + 1 < len(descriptors):
+                await asyncio.sleep(BETWEEN_REQUEST_DELAY)
+
+        if essential is None:
+            raise PurifierClientError(
+                "Initialization sequence has no essential device-state request"
+            )
+
+        while essential.name in failures:
+            _LOGGER.debug(
+                "Essential initialization request remains incomplete; preserving "
+                "the connected session and retrying request=%s in %.1fs",
+                essential.name,
+                INITIALIZATION_RETRY_DELAY,
+            )
+            await self._async_wait_for_ready_work(INITIALIZATION_RETRY_DELAY)
+            try:
+                await self._async_execute_descriptor(
+                    essential,
+                    attempts=INITIALIZATION_ATTEMPTS,
+                )
+            except TransactionTimeoutError as err:
+                failures[essential.name] = str(err)
+                self._update_initialization_failures(failures)
+                continue
+            failures.pop(essential.name)
+            self._update_initialization_failures(failures)
+
+        if failures:
+            _LOGGER.debug(
+                "Purifier initialization is usable with exhausted secondary "
+                "requests: requests=%s attempts_per_request=%d",
+                tuple(failures),
+                INITIALIZATION_ATTEMPTS,
+            )
+
+    def _update_initialization_failures(self, failures: dict[str, str]) -> None:
+        """Publish secret-free evidence for startup requests that stayed silent."""
+        self._incomplete_initialization_requests = tuple(failures)
+        self._initialization_failure_summaries = dict(failures)
 
     async def _async_ready_loop(self) -> None:
         while not self._stopping.is_set():

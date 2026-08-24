@@ -126,9 +126,13 @@ The integration maintains one serialized connection owner per purifier:
 4. Create a fresh Bleak client and discover GATT services.
 5. Subscribe to notifications before sending protocol traffic.
 6. Use a plaintext H7124 channel or negotiate a fresh H7129 encrypted session.
-7. Run the captured startup initialization sweep in order.
-8. Mark entities available only after the entire sweep succeeds.
-9. Process commands, unsolicited notifications, refresh requests, and the one
+7. Run the complete captured startup initialization sweep in order, allowing up
+   to three attempts for every request.
+8. Require the essential `aa 01` device-state response, but record an exhausted
+   secondary request as best-effort and continue the rest of the sweep.
+9. Mark entities available after the full sweep has been attempted and essential
+   state is known. Values missed during secondary initialization remain unknown.
+10. Process commands, unsolicited notifications, refresh requests, and the one
    documented periodic state query.
 
 H7129 session keys exist only for one BLE connection. They are discarded on
@@ -180,6 +184,14 @@ its entities unavailable without generating a coordinator error for every
 expected recovery cycle. Cached values are not presented as currently available.
 Recovery continues indefinitely, and a successful initialization restores the
 entities and publishes the newly authoritative state.
+
+Once GATT and the plaintext or encrypted application channel are healthy, every
+startup request receives three response attempts. An exhausted capability,
+metadata, air-quality, or night-light request is retained in diagnostics and the
+sweep continues without discarding the connection. If the essential `aa 01`
+device-state request remains silent, the client stays connected and retries it
+after a short delay. Only an actual disconnect, GATT/channel failure, invalid
+H7129 session, or corrupt protected traffic forces a new connection and session.
 
 Commands are serialized and have a 30-second end-to-end deadline. Up to three
 bounded sends are permitted across recovery. Newer pending controls of the same
@@ -258,6 +270,7 @@ Connection and protocol failures appear in Home Assistant's normal log. Error
 details can include:
 
 - the client state and connection generation;
+- startup requests still incomplete after three response attempts;
 - the selected and current adapter/proxy route;
 - RSSI and advertisement age;
 - Home Assistant reachability and connection-slot diagnostics;
@@ -361,4 +374,4 @@ decoded ATT operation, and raw bytes.
 - [Home Assistant integration and HACS reference](home-assistant-bluetooth-integration-reference.md)
 - [License](LICENSE)
 
-Release documentation reflects integration version 0.3.17.
+Release documentation reflects integration version 0.3.18.

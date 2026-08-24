@@ -29,7 +29,10 @@ from custom_components.govee_ble_air_purifier.models import (
     SetNightLightColor,
     SetPower,
 )
-from custom_components.govee_ble_air_purifier.protocol import GoveePurifierProtocol
+from custom_components.govee_ble_air_purifier.protocol import (
+    GoveePurifierProtocol,
+    RequestDescriptor,
+)
 
 
 class FakeEnvironment:
@@ -363,6 +366,95 @@ def test_brightness_echo_does_not_clear_cached_light_power() -> None:
 
     assert client.state.light_power is True
     assert client.state.light_brightness == 50
+
+
+@pytest.mark.asyncio
+async def test_initialization_exhausts_secondary_request_then_completes_sweep() -> None:
+    """One silent secondary request cannot discard the remaining startup work."""
+    client = make_client()
+    descriptors = client._protocol.initialization_requests()
+    calls: list[tuple[str, int]] = []
+
+    async def execute(
+        descriptor: RequestDescriptor, *, attempts: int, **_: object
+    ) -> tuple[bytes, ...]:
+        calls.append((descriptor.name, attempts))
+        if descriptor.name == "capability_b2":
+            raise client_module.TransactionTimeoutError("secondary stayed silent")
+        return ()
+
+    client._async_execute_descriptor = execute  # type: ignore[method-assign]
+
+    await client._async_run_initialization(descriptors)
+
+    assert [name for name, _ in calls] == [
+        descriptor.name for descriptor in descriptors
+    ]
+    assert all(attempts == 3 for _, attempts in calls)
+    diagnostics = client.diagnostic_snapshot()
+    assert diagnostics["incomplete_initialization_requests"] == ("capability_b2",)
+    assert diagnostics["initialization_failure_summaries"] == {
+        "capability_b2": "secondary stayed silent"
+    }
+
+
+@pytest.mark.asyncio
+async def test_initialization_retries_essential_state_on_same_session() -> None:
+    """A silent aa-01 batch is retried without abandoning the connected channel."""
+    client = make_client()
+    descriptors = client._protocol.initialization_requests()
+    calls: list[str] = []
+    device_state_calls = 0
+
+    async def execute(
+        descriptor: RequestDescriptor, *, attempts: int, **_: object
+    ) -> tuple[bytes, ...]:
+        nonlocal device_state_calls
+        assert attempts == 3
+        calls.append(descriptor.name)
+        if descriptor.name == "device_state":
+            device_state_calls += 1
+            if device_state_calls == 1:
+                raise client_module.TransactionTimeoutError("aa 01 stayed silent")
+        return ()
+
+    wait_for_work = AsyncMock()
+    client._async_execute_descriptor = execute  # type: ignore[method-assign]
+    client._async_wait_for_ready_work = wait_for_work  # type: ignore[method-assign]
+
+    await client._async_run_initialization(descriptors)
+
+    assert calls[: len(descriptors)] == [
+        descriptor.name for descriptor in descriptors
+    ]
+    assert calls[-1] == "device_state"
+    assert device_state_calls == 2
+    wait_for_work.assert_awaited_once_with(client_module.INITIALIZATION_RETRY_DELAY)
+    assert client.diagnostic_snapshot()["incomplete_initialization_requests"] == ()
+    assert client._transport.disconnects == 0  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_initialization_transport_failure_remains_fatal() -> None:
+    """Only response exhaustion is best-effort; a broken GATT link still recovers."""
+    client = make_client()
+    descriptors = client._protocol.initialization_requests()
+    calls: list[str] = []
+
+    async def execute(
+        descriptor: RequestDescriptor, *, attempts: int, **_: object
+    ) -> tuple[bytes, ...]:
+        assert attempts == 3
+        calls.append(descriptor.name)
+        raise GattTransportError("link dropped")
+
+    client._async_execute_descriptor = execute  # type: ignore[method-assign]
+
+    with pytest.raises(GattTransportError, match="link dropped"):
+        await client._async_run_initialization(descriptors)
+
+    assert calls == [descriptors[0].name]
+    assert client.diagnostic_snapshot()["incomplete_initialization_requests"] == ()
 
 
 @pytest.mark.asyncio

@@ -797,6 +797,14 @@ The Govee purifier integration applies the general model as follows:
   requests.
 - H7129 session material is discarded on disconnect or negotiation failure.
 - Initialization is repeated after every reconnect.
+- Every startup request is attempted up to three times in documented order.
+  Exhausted secondary capability, metadata, and telemetry requests are recorded
+  and do not discard an otherwise healthy application channel. The complete
+  sweep is still attempted.
+- The `aa 01` device-state request is essential. If its three-attempt batch stays
+  silent, the connected session remains in initialization and retries it after a
+  short delay. A transport, notification-channel, or protected-session failure
+  still triggers complete reconnect and H7129 renegotiation.
 - Only the protocol-defined `aa 01` state query is periodically polled.
 - Physical-control notifications update cached state without waiting for a poll.
 - Diagnostics retain recent connection failures and Home Assistant reachability

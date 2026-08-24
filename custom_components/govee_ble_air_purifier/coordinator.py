@@ -66,12 +66,12 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
         )
 
     async def async_start(self) -> None:
-        """Connect and complete the official startup initialization sweep."""
+        """Connect, attempt the startup sweep, and require essential state."""
         await self.client.async_start()
 
     @property
     def client_available(self) -> bool:
-        """Return whether the purifier completed initialization and is connected."""
+        """Return whether essential initialization completed and is connected."""
         return self._client_available
 
     async def async_shutdown(self) -> None:
@@ -118,9 +118,9 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
             ) from err
 
     def _state_updated(self, state: PurifierState) -> None:
-        # During (re)initialization, collect state privately until the entire
-        # official sweep succeeds. This prevents partial state from marking a
-        # recovering coordinator available.
+        # During (re)initialization, collect state privately until the full
+        # startup sequence has been attempted and essential state is known.
+        # Exhausted secondary requests do not prevent later publication.
         if self.client.is_ready:
             self.async_set_updated_data(state)
 
