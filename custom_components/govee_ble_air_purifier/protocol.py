@@ -259,10 +259,16 @@ _H7129_CAPABILITY_1E_REQUEST = _request(
     _exact(build_frame(b"\xaa\x1e\x03\x01")),
 )
 
+_H7129_CAPABILITY_10_REQUEST = _request(
+    "capability_10",
+    b"\xaa\x10",
+    _exact(build_frame(b"\xaa\x10\x00\xff\xff\xff")),
+)
+
 _H7129_BASE_INITIALIZATION_REQUESTS = (
     _BASE_INITIALIZATION_REQUESTS[:8]
-    + (_H7129_CAPABILITY_1E_REQUEST,)
-    + _BASE_INITIALIZATION_REQUESTS[9:]
+    + (_H7129_CAPABILITY_1E_REQUEST, _H7129_CAPABILITY_10_REQUEST)
+    + _BASE_INITIALIZATION_REQUESTS[10:]
 )
 
 _H7129_METADATA_REQUEST = _request(

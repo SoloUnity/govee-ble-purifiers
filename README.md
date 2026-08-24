@@ -45,8 +45,8 @@ labels the strongest current signal **Near**, and labels the remaining devices
 On each connection, the integration subscribes to notifications and reproduces
 the protocol's response-paced startup initialization. H7129 session negotiation
 happens before that sweep. Startup matching preserves H7124's exact
-`aa 1e 01 02` echo while recognizing H7129's observed `aa 1e 03 01` response.
-During normal operation, only the documented
+`aa 1e 01 02` and `aa 10` echoes while recognizing H7129's observed
+model-specific responses. During normal operation, only the documented
 `aa 01` device-state query is polled, on the official fixed three-second cadence.
 For H7124, the first idle poll preserves the captured 1.936-second post-startup
 gap; subsequent requests use the fixed write-to-write cadence.

@@ -165,7 +165,9 @@ request-to-response boundaries:
 | `aa 1b 01`, `aa 1b 05` | One matching night-light state response for each selector |
 | H7124 `aa 1e 01 02` | One exact echo |
 | H7129 `aa 1e 01 02` | One `aa 1e 03 01` response with bytes 4-18 zero |
-| `aa 10`, `aa 08`, `aa 26`, `aa 17`, `aa 07 20`, `aa 1f` | One exact echo for each request |
+| H7124 `aa 10` | One exact echo |
+| H7129 `aa 10` | One `aa 10 00 ff ff ff` response with bytes 6-18 zero |
+| `aa 08`, `aa 26`, `aa 17`, `aa 07 20`, `aa 1f` | One exact echo for each request |
 | `aa 16` | One structured `aa 16` response |
 | `aa 19` | One air-quality/status response |
 | `aa 07 10`, `aa 07 11`, `aa 07 06` | One matching `aa 07` device-data response for each subcommand |
@@ -196,6 +198,18 @@ aa 1e 03 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 b6
 The final `b6` is the valid XOR checksum. This establishes the H7129 response
 boundary and shows that, unlike the captured H7124 response, it is not an exact
 echo. The meanings of the `03 01` response values have not been established.
+
+The same H7129 device subsequently returned this decrypted response once after
+each of two encrypted `aa 10` startup request attempts:
+
+```text
+aa 10 00 ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 45
+```
+
+The final `45` is the valid XOR checksum. This establishes another
+model-specific response boundary: H7129 returns capability data where the
+captured H7124 transaction used an exact echo. The meanings of the
+`00 ff ff ff` response values have not been established.
 
 Observed H7124 `aa 05` responses begin as follows; remaining payload bytes are
 zero through byte 18, followed by the checksum:

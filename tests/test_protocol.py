@@ -241,6 +241,47 @@ def test_h7129_refresh_uses_observed_capability_1e_response() -> None:
     )
 
 
+def test_h7129_capability_10_accepts_observed_response() -> None:
+    """H7129 completes aa-10 only on its observed capability response."""
+
+    protocol = _protocol(Model.H7129)
+    descriptor = protocol.initialization_requests()[9]
+    observed_response = bytes.fromhex(
+        "aa 10 00 ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 45"
+    )
+
+    assert descriptor.frame == build_frame(b"\xaa\x10")
+    assert (
+        protocol.new_response_matcher(descriptor).feed(observed_response)
+        is MatchResult.COMPLETE
+    )
+    assert (
+        protocol.new_response_matcher(descriptor).feed(descriptor.frame)
+        is MatchResult.IGNORED
+    )
+    assert (
+        protocol.new_response_matcher(descriptor).feed(
+            build_frame(b"\xaa\x10\x00\xff\xff\xff\x01")
+        )
+        is MatchResult.IGNORED
+    )
+
+
+def test_h7129_refresh_uses_observed_capability_10_response() -> None:
+    """The active-session refresh reuses H7129's aa-10 matcher."""
+
+    protocol = _protocol(Model.H7129)
+    descriptor = protocol.refresh_requests()[8]
+
+    assert descriptor.name == "capability_10"
+    assert (
+        protocol.new_response_matcher(descriptor).feed(
+            build_frame(b"\xaa\x10\x00\xff\xff\xff")
+        )
+        is MatchResult.COMPLETE
+    )
+
+
 @pytest.mark.parametrize("model", [Model.H7124, Model.H7129])
 @pytest.mark.parametrize("value", [0x00, 0x01])
 def test_capability_b2_accepts_observed_values(model: Model, value: int) -> None:
