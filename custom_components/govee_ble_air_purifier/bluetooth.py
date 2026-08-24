@@ -28,7 +28,7 @@ NOTIFY_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b10"
 COMMAND_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b11"
 
 CONNECT_ATTEMPTS = 1
-CONNECTION_ATTEMPT_TIMEOUT = 15.0
+CONNECTION_ATTEMPT_TIMEOUT = 25.0
 CONNECTION_ABORT_TIMEOUT = 5.0
 CONNECTION_DIAGNOSTIC_TIMEOUT = 1.0
 STALE_CONNECTION_CLEANUP_TIMEOUT = 5.0
@@ -66,6 +66,10 @@ def exception_chain_detail(error: BaseException) -> str:
 
 class BluetoothUnavailableError(ConnectionError):
     """Raised when there is no usable Bluetooth route to the purifier."""
+
+
+class _ConnectionAttemptDeadlineExceeded(TimeoutError):
+    """Raised when the integration's outer connection deadline expires."""
 
 
 class GattTransportError(ConnectionError):
@@ -740,7 +744,9 @@ class GattTransport:
                     self._last_connection_timeout_diagnostics = (
                         await self._async_connection_timeout_diagnostics(device)
                     )
-                    raise TimeoutError("connection attempt deadline exceeded")
+                    raise _ConnectionAttemptDeadlineExceeded(
+                        "connection attempt deadline exceeded"
+                    )
                 return connection_task.result()
             finally:
                 if not connection_task.done():
@@ -750,7 +756,7 @@ class GattTransport:
 
         try:
             client = await establish_with_diagnostics()
-        except TimeoutError as err:
+        except _ConnectionAttemptDeadlineExceeded as err:
             detail = (
                 f"attempt={self._connection_attempts}; "
                 f"stage={self._connection_stage}; elapsed={self._elapsed():.3f}s; "

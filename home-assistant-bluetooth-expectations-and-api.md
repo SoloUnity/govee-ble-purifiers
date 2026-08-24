@@ -633,13 +633,15 @@ The Govee purifier integration applies the general model as follows:
 - Home Assistant's shared advertisement history is not cleared by a connection
   cycle.
 - A new connectable `BLEDevice` and new Bleak client are used per cycle.
-- A GATT connection attempt has a 15-second deadline.
+- A GATT connection attempt has a 25-second deadline. This allows the
+  connector's shorter internal attempt to finish before the integration's
+  outer safety deadline.
 - A partially connecting client is explicitly disconnected on timeout.
 - Local BlueZ connections for the purifier address are closed and verified
   before a new attempt, after a failed attempt, during shutdown, and on removal.
 - A surviving address-level connection blocks a new attempt so retries cannot
   consume additional adapter slots.
-- The setup window is 60 seconds, permitting at least two full
+- The setup window is 90 seconds, permitting at least two full
   advertisement-and-connection attempts under the configured bounds.
 - Recovery uses capped exponential backoff with jitter.
 - GATT, plaintext/encrypted channel, and purifier protocol are separate layers.

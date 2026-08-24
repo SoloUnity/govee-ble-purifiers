@@ -109,6 +109,8 @@ async def test_connect_error_records_disconnect_before_connector_returns(
         await transport.async_connect(device)  # type: ignore[arg-type]
 
     assert "pre_return_disconnects=1" in str(raised.value)
+    assert "connection attempt deadline exceeded" not in str(raised.value)
+    assert "cause=TimeoutError: TimeoutError()" in str(raised.value)
     diagnostics = transport.diagnostic_snapshot()
     assert diagnostics["pre_return_disconnects"] == 1
     assert diagnostics["last_disconnect_stage"] == "establish_connection"
