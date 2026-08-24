@@ -106,7 +106,7 @@ The Bluetooth integration detects nearby devices, and discoveries appear under S
 
 The developer documentation specifies the following behavior for integrations consuming Bluetooth:
 
-- An integration that needs a Bluetooth adapter lists `bluetooth_adapters` in `manifest.json` dependencies. This causes supported remote adapters to be connected before the integration attempts to use them.
+- An integration that needs a Bluetooth adapter lists `bluetooth_adapters` in `manifest.json` dependencies. A manual-only integration that directly calls the shared Bluetooth APIs without manifest discovery matchers also lists `bluetooth`, ensuring that the manager is loaded before its user flow scans. These dependencies cause supported remote adapters to be connected before the integration attempts to use them.
 - `bluetooth.async_get_scanner(hass)` returns Home Assistant's shared `BleakScanner` wrapper. It avoids creating an additional scanner and remains valid when adapter settings change.
 - `connectable=True` is the default for Bluetooth matching and APIs. It limits results to scanners capable of making outgoing connections.
 - `connectable=False` receives data from both connectable and non-connectable scanners. It is the documented setting for devices that only require advertisements.
@@ -222,7 +222,7 @@ For a config entry representing multiple devices, Home Assistant's dynamic-devic
 
 For a config entry representing one discovered Bluetooth device, each new unmatched device can start its own Bluetooth discovery flow and, after confirmation, create its own config entry.
 
-When a Bluetooth config entry or managed device is removed, `bluetooth.async_rediscover_address(hass, address)` clears its match history and immediately replays cached discovery so it can be set up again without a Home Assistant restart. `async_clear_address_from_match_history` only clears history for a future advertisement; it does not immediately replay discovery.
+When an integration uses manifest-driven automatic discovery, removal can call `bluetooth.async_rediscover_address(hass, address)` to clear match history and immediately replay cached discovery so the device can be offered again without a Home Assistant restart. A manual-only integration should omit this call and let the next explicit user flow perform its own scan. `async_clear_address_from_match_history` only clears history for a future advertisement; it does not immediately replay discovery.
 
 Sources: [config flow](https://developers.home-assistant.io/docs/core/integration/config_flow/), [config-flow quality rule](https://developers.home-assistant.io/docs/core/integration-quality-scale/rules/config-flow/), [dynamic devices](https://developers.home-assistant.io/docs/core/integration-quality-scale/rules/dynamic-devices/), [Bluetooth APIs](https://developers.home-assistant.io/docs/core/bluetooth/api/).
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from homeassistant.components import bluetooth as ha_bluetooth
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import Event, HomeAssistant
@@ -87,7 +86,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: GoveeConfigEntry) -> bo
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Allow a removed purifier to be discovered again."""
+    """Release any surviving address-level connection after entry removal."""
     address = entry.data[CONF_ADDRESS]
     await _async_cleanup_address(address, reason="entry_removed")
-    ha_bluetooth.async_rediscover_address(hass, address)

@@ -1,8 +1,10 @@
 """Tests for the Govee BLE Air Purifier config flow."""
 
 import asyncio
+import json
 import time
 from collections.abc import Generator
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,7 +18,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.govee_ble_air_purifier import config_flow as config_flow_module
 from custom_components.govee_ble_air_purifier.config_flow import (
-    _discover_purifiers,
+    DiscoveredPurifier,
     _discovery_options,
     _model_from_name,
 )
@@ -46,6 +48,17 @@ def _prepare_bluetooth_test_environment(
             "SELECTED_DEVICE_ADVERTISEMENT_TIMEOUT",
             1,
         ),
+        patch.object(
+            config_flow_module,
+            "SELECTED_ADVERTISEMENT_CHECK_INTERVAL",
+            0.0,
+        ),
+        patch.object(
+            config_flow_module.bluetooth,
+            "async_register_callback",
+            return_value=MagicMock(),
+            create=True,
+        ),
     ):
         yield
 
@@ -54,7 +67,7 @@ pytestmark = pytest.mark.usefixtures("enable_custom_integrations")
 
 
 def _service_info(
-    name: str,
+    name: str | None,
     address: str,
     rssi: int,
     *,
@@ -285,6 +298,55 @@ async def test_user_flow_failed_scan_rejects_stale_cache(
     assert result["reason"] == "no_devices_found"
 
 
+async def test_user_flow_rejects_registration_cache_replay(
+    hass: HomeAssistant,
+) -> None:
+    """A synchronous callback replay cannot satisfy a new setup scan."""
+    stale_discovery = _service_info(
+        "GVH7124STALE",
+        "AA:BB:CC:DD:EE:FF",
+        -68,
+        advertisement_time=time.monotonic() - 60,
+    )
+    cancel_callback = MagicMock()
+
+    def register_callback(
+        _: HomeAssistant,
+        callback: object,
+        *__: object,
+        **___: object,
+    ) -> MagicMock:
+        assert callable(callback)
+        callback(stale_discovery)
+        return cancel_callback
+
+    with (
+        patch.object(
+            config_flow_module.bluetooth,
+            "async_register_callback",
+            side_effect=register_callback,
+        ),
+        patch.object(
+            config_flow_module.bluetooth,
+            "async_request_active_scan",
+            new_callable=AsyncMock,
+            create=True,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "async_discovered_service_info",
+            return_value=(stale_discovery,),
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "no_devices_found"
+    cancel_callback.assert_called_once_with()
+
+
 async def test_user_flow_waits_full_window_when_active_scan_returns_early(
     hass: HomeAssistant,
 ) -> None:
@@ -325,6 +387,101 @@ async def test_user_flow_waits_full_window_when_active_scan_returns_early(
     assert result["type"] is FlowResultType.FORM
     assert elapsed >= 0.045
     request_active_scan.assert_awaited_once_with(hass, duration=0.05)
+
+
+async def test_each_user_flow_starts_a_new_active_scan(
+    hass: HomeAssistant,
+) -> None:
+    """Each blue Add device flow owns a separate discovery sweep."""
+    discovery = _service_info("GVH7124BEDROOM", "AA:BB:CC:DD:EE:FF", -52)
+
+    async def active_scan(_: HomeAssistant, *, duration: float) -> None:
+        discovery.time = time.monotonic()
+
+    with (
+        patch.object(
+            config_flow_module.bluetooth,
+            "async_request_active_scan",
+            new=AsyncMock(side_effect=active_scan),
+            create=True,
+        ) as request_active_scan,
+        patch(
+            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "async_discovered_service_info",
+            return_value=(discovery,),
+        ),
+    ):
+        first = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+        second = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+
+    assert first["type"] is FlowResultType.FORM
+    assert second["type"] is FlowResultType.FORM
+    assert request_active_scan.await_count == 2
+    assert request_active_scan.await_args_list[0].kwargs == {"duration": 0.0}
+    assert request_active_scan.await_args_list[1].kwargs == {"duration": 0.0}
+
+
+async def test_user_flow_retains_valid_name_seen_during_scan(
+    hass: HomeAssistant,
+) -> None:
+    """A later nameless sighting cannot erase a valid purifier identity."""
+    address = "AA:BB:CC:DD:EE:FF"
+    named = _service_info("ihoment_H7129_BEDROOM", address, -61)
+    nameless = _service_info(None, address, -58)
+    callbacks: list[object] = []
+    cancel_callback = MagicMock()
+
+    def register_callback(
+        _: HomeAssistant,
+        callback: object,
+        match_dict: dict[str, object],
+        mode: object,
+        **__: object,
+    ) -> MagicMock:
+        assert match_dict == {"connectable": True}
+        assert mode is config_flow_module.bluetooth.BluetoothScanningMode.PASSIVE
+        callbacks.append(callback)
+        return cancel_callback
+
+    async def active_scan(_: HomeAssistant, *, duration: float) -> None:
+        callback = callbacks[-1]
+        assert callable(callback)
+        callback(named)
+        callback(nameless)
+
+    with (
+        patch.object(
+            config_flow_module.bluetooth,
+            "async_register_callback",
+            side_effect=register_callback,
+        ),
+        patch.object(
+            config_flow_module.bluetooth,
+            "async_request_active_scan",
+            new=AsyncMock(side_effect=active_scan),
+            create=True,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "async_discovered_service_info",
+            return_value=(nameless,),
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["data_schema"]({CONF_ADDRESS: address}) == {
+        CONF_ADDRESS: address
+    }
+    option_validator = next(iter(result["data_schema"].schema.values()))
+    assert option_validator.container[address] == "ihoment_H7129_BEDROOM (Near)"
+    cancel_callback.assert_called_once_with()
 
 
 async def test_user_flow_requires_fresh_selected_device_advertisement(
@@ -378,6 +535,120 @@ async def test_user_flow_requires_fresh_selected_device_advertisement(
     validate.assert_not_awaited()
 
 
+async def test_user_flow_retains_valid_name_when_fresh_packet_is_nameless(
+    hass: HomeAssistant,
+) -> None:
+    """Fresh reachability need not repeat the name learned during the scan."""
+    discovery = _service_info("GVH7124BEDROOM", "AA:BB:CC:DD:EE:FF", -52)
+    fresh_nameless = _service_info(None, discovery.address, -49)
+
+    async def active_scan(_: HomeAssistant, *, duration: float) -> None:
+        discovery.time = time.monotonic()
+
+    with (
+        patch.object(
+            config_flow_module.bluetooth,
+            "async_request_active_scan",
+            new=AsyncMock(side_effect=active_scan),
+            create=True,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "async_discovered_service_info",
+            return_value=(discovery,),
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "async_process_advertisements",
+            new=AsyncMock(return_value=fresh_nameless),
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.config_flow."
+            "_async_validate_purifier",
+            new_callable=AsyncMock,
+        ) as validate,
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_ADDRESS: discovery.address},
+        )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == discovery.name
+    validate.assert_awaited_once_with(
+        hass,
+        address=discovery.address,
+        model="H7124",
+        name=discovery.name,
+    )
+
+
+async def test_user_flow_accepts_fresh_cache_when_callback_is_deduplicated(
+    hass: HomeAssistant,
+) -> None:
+    """A refreshed HA cache timestamp can prove selected-address freshness."""
+    discovery = _service_info("ihoment_H7129_BEDROOM", "AA:BB:CC:DD:EE:FF", -62)
+    cached_calls = 0
+
+    async def active_scan(_: HomeAssistant, *, duration: float) -> None:
+        discovery.time = time.monotonic()
+
+    async def no_callback(*_: object, **__: object) -> None:
+        await asyncio.Event().wait()
+
+    def refreshed_cache(*_: object, **__: object) -> SimpleNamespace:
+        nonlocal cached_calls
+        cached_calls += 1
+        if cached_calls > 1:
+            discovery.time = time.monotonic()
+        return discovery
+
+    with (
+        patch.object(
+            config_flow_module.bluetooth,
+            "async_request_active_scan",
+            new=AsyncMock(side_effect=active_scan),
+            create=True,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "async_discovered_service_info",
+            return_value=(discovery,),
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "async_process_advertisements",
+            side_effect=no_callback,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "async_last_service_info",
+            side_effect=refreshed_cache,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.config_flow."
+            "_async_validate_purifier",
+            new_callable=AsyncMock,
+        ) as validate,
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+        # Make the first selected-address cache lookup older than its cutoff.
+        discovery.time = time.monotonic() - 1
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_ADDRESS: discovery.address},
+        )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert cached_calls >= 2
+    validate.assert_awaited_once()
+
+
 async def test_user_flow_aborts_when_no_supported_device_is_visible(
     hass: HomeAssistant,
 ) -> None:
@@ -395,60 +666,44 @@ async def test_user_flow_aborts_when_no_supported_device_is_visible(
     assert result["reason"] == "no_devices_found"
 
 
-async def test_duplicate_bluetooth_discovery_is_aborted(hass: HomeAssistant) -> None:
-    """A discovered address can belong to only one config entry."""
+async def test_user_flow_excludes_already_configured_purifier(
+    hass: HomeAssistant,
+) -> None:
+    """A configured address is not offered by a later manual scan."""
+    discovery = _service_info("GVH7124BEDROOM", "AA:BB:CC:DD:EE:FF", -52)
     entry = MockConfigEntry(
         domain=DOMAIN,
         unique_id="aa:bb:cc:dd:ee:ff",
-        data={CONF_ADDRESS: "aa:bb:cc:dd:ee:ff", CONF_MODEL: "H7124"},
+        data={CONF_ADDRESS: discovery.address, CONF_MODEL: "H7124"},
     )
     entry.add_to_hass(hass)
 
-    discovery = MagicMock()
-    discovery.address = "AA:BB:CC:DD:EE:FF"
-    discovery.name = "GVH7124ABCD"
-    discovery.connectable = True
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN,
-        context={"source": config_entries.SOURCE_BLUETOOTH},
-        data=discovery,
-    )
+    async def active_scan(_: HomeAssistant, *, duration: float) -> None:
+        discovery.time = time.monotonic()
 
-    assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "already_configured"
-
-
-async def test_bluetooth_flow_confirms_and_infers_model(
-    hass: HomeAssistant,
-) -> None:
-    """A narrow future Bluetooth matcher can use the confirmation flow."""
-    discovery = MagicMock()
-    discovery.address = "AA:BB:CC:DD:EE:FF"
-    discovery.name = "ihoment_H7129_ABCD"
-    discovery.connectable = True
-
-    with patch(
-        "custom_components.govee_ble_air_purifier.config_flow."
-        "_async_validate_purifier",
-        new_callable=AsyncMock,
+    with (
+        patch.object(
+            config_flow_module.bluetooth,
+            "async_request_active_scan",
+            new=AsyncMock(side_effect=active_scan),
+            create=True,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "async_discovered_service_info",
+            return_value=(discovery,),
+        ),
     ):
         result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": config_entries.SOURCE_BLUETOOTH},
-            data=discovery,
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
         )
-        assert result["type"] is FlowResultType.FORM
-        assert result["step_id"] == "bluetooth_confirm"
 
-        result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
-
-    assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert result["data"][CONF_MODEL] == "H7129"
-    assert result["data"][CONF_ADDRESS] == "AA:BB:CC:DD:EE:FF"
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "no_devices_found"
 
 
 def test_model_inference_accepts_only_supported_advertised_names() -> None:
-    """Model inference follows the two narrow manifest matcher families."""
+    """Model inference follows the two supported advertised-name families."""
     assert _model_from_name("GVH7124ABCD") == "H7124"
     assert _model_from_name("ihoment_H7129_ABCD") == "H7129"
     assert _model_from_name("Govee H7124 1234") is None
@@ -457,19 +712,35 @@ def test_model_inference_accepts_only_supported_advertised_names() -> None:
 
 def test_discovery_options_rank_near_and_far_without_showing_addresses() -> None:
     """The strongest device is Near and Bluetooth addresses stay hidden."""
-    discoveries = _discover_purifiers(
-        (
-            _service_info("ihoment_H7129_BASEMENT", "22:22:22:22:22:22", -82),
-            _service_info("GVH7124BEDROOM", "11:11:11:11:11:11", -41),
-            _service_info("Other device", "33:33:33:33:33:33", -20),
-        )
+    discoveries = (
+        DiscoveredPurifier(
+            address="11:11:11:11:11:11",
+            name="GVH7124BEDROOM",
+            model="H7124",
+            rssi=-41,
+        ),
+        DiscoveredPurifier(
+            address="22:22:22:22:22:22",
+            name="ihoment_H7129_BASEMENT",
+            model="H7129",
+            rssi=-82,
+        ),
     )
-
-    assert [device.name for device in discoveries] == [
-        "GVH7124BEDROOM",
-        "ihoment_H7129_BASEMENT",
-    ]
     assert _discovery_options(discoveries) == {
         "11:11:11:11:11:11": "GVH7124BEDROOM (Near)",
         "22:22:22:22:22:22": "ihoment_H7129_BASEMENT (Far)",
     }
+
+
+def test_manifest_disables_automatic_bluetooth_discovery() -> None:
+    """The integration exposes only its explicit manual setup flow."""
+    manifest_path = (
+        Path(__file__).parents[1]
+        / "custom_components"
+        / "govee_ble_air_purifier"
+        / "manifest.json"
+    )
+    manifest = json.loads(manifest_path.read_text())
+
+    assert "bluetooth" not in manifest
+    assert "bluetooth" in manifest["dependencies"]

@@ -1,111 +1,236 @@
 # Govee BLE Air Purifier
 
-A Home Assistant custom integration for local control of Govee H7124 and H7129
-air purifiers over Bluetooth. H7124 uses plaintext application frames. H7129
-negotiates a fresh encrypted session for every Bluetooth connection.
+A Home Assistant custom integration for private, local Bluetooth control of
+Govee H7124 and H7129 air purifiers. No Govee cloud account or user-entered
+Bluetooth address is required.
+
+The integration follows the captured Govee protocol closely while adding
+bounded connection recovery for weak signals, abrupt power loss, Home Assistant
+restarts, and devices temporarily connected to the Govee app.
 
 ## Supported devices
 
-- Govee H7124
-- Govee H7129
+| Model | Advertised-name family | Application channel |
+| --- | --- | --- |
+| Govee H7124 | `GVH7124*` | Plaintext 20-byte frames |
+| Govee H7129 | `ihoment_H7129_*` | Fresh encrypted session for every BLE connection |
 
-## Features
+`*` means any sequence of characters. The advertised name determines the model;
+the Bluetooth address is used only as the stable device identity. The integration
+does not guess a model from an address prefix.
 
-- Purifier power
-- Low, medium, and high manual fan speeds
-- Auto, Sleep, and Turbo fan presets
-- Night-light power, brightness, and RGB colour
-- PM2.5 and filter-life sensors
-- Physical-control updates received through Bluetooth notifications
-- Automatic reconnection and bounded command recovery for unreliable Bluetooth
-  links
+Other Govee models are not currently supported.
+
+## Home Assistant entities
+
+Each configured purifier creates four entities:
+
+| Entity | Capabilities |
+| --- | --- |
+| Fan | Power, Low/Medium/High percentage speeds, Auto/Sleep/Turbo presets |
+| Night light | Power, brightness, and RGB colour |
+| PM2.5 sensor | Current particulate concentration in µg/m³ |
+| Filter-life sensor | Remaining filter life as a percentage; diagnostic category |
+
+Entities use the integration's cached push state and do not independently poll
+Bluetooth. Physical controls update Home Assistant when the purifier sends the
+corresponding notification.
+
+## Requirements
+
+- Home Assistant 2025.1.0 or newer
+- A connectable local Bluetooth adapter or Bluetooth proxy that can see the
+  purifier
+- The purifier powered on and not connected to the Govee app
+
+The purifiers accept only one Bluetooth central connection. Close the Govee app
+before setup and normal Home Assistant use. Signal quality still matters even
+when the purifier appears in Home Assistant's Bluetooth cache.
 
 ## Installation with HACS
 
-1. Add this repository to HACS as a custom repository with the **Integration**
-   category.
-2. Download **Govee BLE Air Purifier**.
+1. In HACS, add this repository as a custom repository with category
+   **Integration**.
+2. Install **Govee BLE Air Purifier**.
 3. Restart Home Assistant.
-4. Home Assistant should discover nearby supported purifiers automatically. You
-   can also go to **Settings > Devices & services > Add integration**, select
-   **Govee BLE Air Purifier**, and choose a discovered purifier from the list.
+4. Go to **Settings > Devices & services**.
+5. Select **Add integration**, choose **Govee BLE Air Purifier**, and wait for
+   the scan to finish. For another purifier, open the installed integration and
+   select its blue **Add device** button.
 
-The purifier must be visible to a connectable Home Assistant Bluetooth adapter
-or Bluetooth proxy during setup. Close the Govee app before setup because the
-purifier permits only one Bluetooth central connection at a time.
+For manual installation, copy
+`custom_components/govee_ble_air_purifier` into the same path under the Home
+Assistant configuration directory, restart Home Assistant, and follow steps 4
+and 5 above.
 
-The integration matches the observed advertised-name families `GVH7124*` and
-`ihoment_H7129_*`; the model is inferred from that name. Manual setup never asks
-for a Bluetooth address. Opening **Add device** runs a complete ten-second
-observation window using Home Assistant's shared Bluetooth scanner and requests
-a one-shot active scan on supported versions. The integration owns the full
-deadline because Home Assistant may return early when no `AUTO` scanner can open
-an active window. Only unconfigured purifiers actually observed during that
-window are listed. The strongest current signal is labeled **Near** and the
-remaining devices are labeled **Far**. The list is held stable while the user
-makes a selection. After selection, setup waits up to ten seconds for a new
-advertisement from that specific purifier and connects immediately when it is
-received. The address is retained internally only as the stable device
-identity.
+This integration intentionally does not register Home Assistant manifest
+Bluetooth discovery matchers. It therefore does not create the green, pending
+**Discovered** cards that Home Assistant may retain after a device is no longer
+currently visible. The explicit blue **Add device** flow is the only supported
+setup path.
 
-## Data updates
+## How setup discovery works
 
-On each connection, the integration subscribes to notifications and reproduces
-the protocol's response-paced startup initialization. H7129 session negotiation
-happens before that sweep. Startup matching preserves H7124's exact
-`aa 1e 01 02` and `aa 10` echoes while recognizing H7129's observed
-model-specific responses. During normal operation, only the documented
-`aa 01` device-state query is polled, on the official fixed three-second cadence.
-For H7124, the first idle poll preserves the captured 1.936-second post-startup
-gap; subsequent requests use the fixed write-to-write cadence.
-PM2.5, filter life, fan mode, and night-light state otherwise come from startup,
-refresh sweeps, and unsolicited device notifications.
+Every new **Add device** flow performs a new scan; it does not reuse the choices
+from a previous setup flow.
 
-If Bluetooth drops or the purifier is unplugged, the integration marks state
-unavailable, discards any H7129 session material, and reconnects with capped
-exponential backoff. Each connection cycle ignores replayed discovery cache,
-waits for a live advertisement, resolves Home Assistant's current best local or
-proxy route, and creates one fresh Bluetooth client. A failed route is discarded
-before the next cycle. A command interrupted by a disconnect is verified after
-a new connection when the protocol exposes authoritative state; old commands
-are not replayed indefinitely.
+1. The integration registers a temporary listener on Home Assistant's shared
+   Bluetooth scanner.
+2. On supported Home Assistant versions, it requests a ten-second active scan.
+   The integration owns the full ten-second observation deadline even if Home
+   Assistant returns early because no `AUTO` scanner can open an active window.
+   If the API is unavailable or the request fails, it still observes the shared
+   scanner for all ten seconds.
+3. It remembers the last valid supported name seen for each address. A later
+   nameless or address-only packet cannot erase a valid identity learned during
+   that window.
+4. At the end of the window it also merges Home Assistant cache entries whose
+   timestamps were refreshed during that same window. Older cached discoveries
+   are excluded.
+5. Already configured addresses and unsupported or non-connectable devices are
+   removed. Remaining choices are sorted by RSSI: the strongest is labelled
+   **Near**, and all others are labelled **Far**.
+6. The choices are frozen while the user selects a purifier.
+7. After selection, the integration waits up to ten seconds for a fresh,
+   connectable advertisement from that exact address. It connects immediately
+   when one arrives rather than waiting out the timeout. A fresh nameless packet
+   is acceptable because the valid name and model were retained from the scan.
+8. Setup validates the purifier by connecting and completing initialization
+   before saving the config entry.
 
-## Known limitations
+If no eligible purifier appears, start a new **Add device** flow after moving the
+purifier or Bluetooth proxy closer. If a listed purifier disappears before it
+is selected, the form reports that it is not currently visible instead of
+starting from a stale route.
 
-- The official protocol exposes no authoritative fan-mode query. Fan mode is
-  known after the integration sets it or receives an `ee 05` notification.
-- Some H7129 RGB responses acknowledge receipt without proving the colour being
-  displayed. The last usable colour is retained.
+Home Assistant owns adapters, proxies, scanning, and route selection. This
+integration does not start a private Bleak scanner and does not permanently bind
+a purifier to the route that first saw it.
+
+## Runtime communication
+
+The integration maintains one serialized connection owner per purifier:
+
+1. Wait for recent or newly observed connectable advertisement evidence.
+2. Ask Home Assistant for the current best local-adapter or proxy route.
+3. Clean up any stale address-level connection without touching a healthy
+   client owned by the current runtime.
+4. Create a fresh Bleak client and discover GATT services.
+5. Subscribe to notifications before sending protocol traffic.
+6. Use a plaintext H7124 channel or negotiate a fresh H7129 encrypted session.
+7. Run the captured startup initialization sweep in order.
+8. Mark entities available only after the entire sweep succeeds.
+9. Process commands, unsolicited notifications, refresh requests, and the one
+   documented periodic state query.
+
+H7129 session keys exist only for one BLE connection. They are discarded on
+every disconnect, negotiation failure, shutdown, or reconnect and are never
+logged.
+
+### Polling and notifications
+
+During normal operation, the only periodic request is the documented `aa 01`
+device-state query on a fixed three-second write-to-write cadence. H7124
+preserves the captured 1.936-second delay between startup and its first idle
+poll; H7129 begins with the normal three-second delay.
+
+The integration does not continuously poll PM2.5, filter life, fan mode, or
+night-light state. Those values come from startup initialization, a documented
+H7129 refresh sweep triggered by `ee aa`, control confirmations, and unsolicited
+device notifications.
+
+## Poor-signal and disconnect handling
+
+An unplugged purifier, radio loss, proxy loss, adapter reset, or connection by
+the Govee app is treated as a transient disconnect:
+
+- current entities become unavailable;
+- the active protocol wait is interrupted immediately;
+- stale notification and disconnect callbacks are rejected by connection
+  generation;
+- H7129 session material is invalidated;
+- the active or partially connecting client is disconnected;
+- stale local address-level connections are closed and verified when possible;
+- Home Assistant's best route is resolved again for the next cycle; and
+- recovery uses exponential backoff from 1 to 60 seconds with jitter.
+
+The first runtime connection attempt can accept a cached connectable
+advertisement no more than five seconds old. After a failed route, retry requires
+newer advertisement evidence. Each advertisement wait is bounded to ten seconds,
+each GATT connection attempt to 25 seconds, and initial setup to 90 seconds.
+Home Assistant can then retry a temporarily unavailable config entry.
+
+Commands are serialized and have a 30-second end-to-end deadline. Up to three
+bounded sends are permitted across recovery. Newer pending controls of the same
+type supersede older ones. After an ambiguous disconnect, initialization first
+re-queries authoritative state and suppresses a replay if the requested state is
+already confirmed. Commands are never replayed indefinitely.
+
+Cleanup runs before config-entry setup, before a new connection, after a failed
+connection cycle, during shutdown/unload, and after entry removal. Removal does
+not request Bluetooth rediscovery because automatic discovery is disabled.
+
+## State and protocol limitations
+
+- The protocol exposes no authoritative fan-mode query. Fan mode is known after
+  Home Assistant sets it or receives an `ee 05` notification, and it becomes
+  unknown during reconnection until reported again.
+- Some H7129 RGB responses acknowledge a query or command without proving the
+  colour currently displayed. The last authoritative colour is retained, and
+  ambiguous RGB commands are not treated as safely reconciled from cached state.
 - Physical brightness and RGB notification payloads are not fully documented.
-- A purifier connected to the Govee app cannot simultaneously connect to Home
-  Assistant.
+- PM2.5 wire values above 999 are treated as unavailable sentinels.
+- **Near** and **Far** are relative labels based on one scan's RSSI. They do not
+  guarantee that a GATT connection will succeed.
 
-## Debug logging
+See [the protocol document](govee-ble-air-purifier-protocol.md) for the
+trace-supported wire findings.
 
-Connection and protocol failures always appear in Home Assistant's normal log.
-They include the failed stage, request name, retry count, number of received
-frames, unmatched-frame samples, and the underlying Bleak exception when one is
-available. Connection failures additionally report elapsed time, disconnects
-that occurred before GATT discovery returned, and both the selected and current
-Bluetooth routes. Route details include the adapter or proxy source, RSSI, and
-advertisement age so a stale route can be distinguished from a weak fresh one.
-On supported Home Assistant versions, failures also include the platform's
-connection reachability and proxy-slot diagnosis. Setup cleanup preserves the
-last meaningful failure instead of replacing it with a generic disconnected
-message. Each BLE connection attempt has a 25-second deadline; an incomplete
-client is explicitly disconnected and local BlueZ connections for its address
-are closed and verified before the integration resolves another route. An
-initial connection may use a cached connectable advertisement no more than five
-seconds old; every retry requires advertisement evidence newer than the route
-that just failed. The integration does not clear Home Assistant's shared
-advertisement history. A surviving stale connection blocks the next attempt
-instead of consuming another adapter slot.
-The 90-second setup window permits at least two complete
-advertisement-and-connection attempts and retains a bounded history of recent
-connection and cleanup failures.
+## Troubleshooting
 
-For frame-by-frame diagnostics, add this to `configuration.yaml` and restart
-Home Assistant:
+### No devices found
+
+- Confirm the purifier is powered on.
+- Disconnect it from the Govee app and close the app.
+- Move the Home Assistant adapter or Bluetooth proxy closer.
+- Start a new **Add device** flow. Each flow runs a new ten-second scan.
+- Confirm the advertised name begins with `GVH7124` or `ihoment_H7129_`.
+
+### Device was listed but is no longer visible
+
+The purifier advertised during the list scan but did not produce another fresh
+advertisement during the selected-address check. This happens before a GATT
+connection is attempted. Retry after checking power, range, and the Govee app.
+
+### Unable to connect
+
+Fresh advertising proves only that attempting a connection is reasonable. It
+does not prove service discovery will complete. Check the logged route, RSSI,
+advertisement age, proxy slots, connection stage, and stale-connection cleanup
+result. A purifier at roughly -75 dBm or weaker may advertise successfully while
+GATT remains unreliable.
+
+### Physical changes are not reflected
+
+Confirm that the integration still owns the BLE connection. Another central,
+including the Govee app, can displace or block Home Assistant. Enable debug
+logging and look for notification RX, disconnect, and recovery messages.
+
+## Logs and diagnostics
+
+Connection and protocol failures appear in Home Assistant's normal log. Error
+details can include:
+
+- the client state and connection generation;
+- the selected and current adapter/proxy route;
+- RSSI and advertisement age;
+- Home Assistant reachability and connection-slot diagnostics;
+- GATT stage and elapsed connection time;
+- partial-client and stale-connection cleanup results;
+- request name, retry count, received and matched frames; and
+- a bounded sample of ignored application frames.
+
+Enable detailed logging in `configuration.yaml`:
 
 ```yaml
 logger:
@@ -115,16 +240,67 @@ logger:
     homeassistant.components.bluetooth: debug
 ```
 
-Reproduce the problem once, then open **Settings > System > Logs**. The custom
-integration trace records the advertisement route and RSSI, connection
-generation, GATT discovery, notification subscription, transaction names,
-plaintext application frames, response-matcher results, timeouts, disconnects,
-and recovery backoff. H7129 negotiation payloads and session keys are
-deliberately never logged; decrypted application frames are available at debug
-level. Debug output can contain Bluetooth addresses and device-specific metadata,
-so redact those before posting logs publicly.
+Restart Home Assistant, reproduce the problem once, then open
+**Settings > System > Logs**. Debug logging covers setup scan timing and
+candidates, route selection, connection stages, characteristic discovery,
+notification subscription, transaction matching, disconnects, cleanup, and
+recovery. Encryption keys and H7129 negotiation payloads are deliberately not
+logged, but decrypted application frames are logged at debug level. Bluetooth
+addresses and device-specific metadata should be redacted before sharing logs.
 
-## PacketLogger trace extraction
+Home Assistant config-entry diagnostics expose redacted entry data, cached
+purifier state, connection status, route evidence, transport counters, current
+stage, cleanup statistics, and recent bounded failures.
+
+## Removal and updates
+
+Remove a purifier from **Settings > Devices & services**. The integration shuts
+down its runtime connection and performs best-effort address-level cleanup. A
+later setup requires opening **Add device** again; there is no automatic
+rediscovery card.
+
+During an integration reload, Home Assistant shutdown, or update, the owner task
+is cancelled, outstanding commands fail cleanly, the active client is
+disconnected, H7129 session state is erased, and stale address-level cleanup is
+attempted. After a host crash or power loss, the next setup performs defensive
+cleanup before reconnecting.
+
+## Developer guide
+
+### Architecture
+
+| Module | Responsibility |
+| --- | --- |
+| `config_flow.py` | Manual scan window, name/model classification, selection freshness, validation |
+| `bluetooth.py` | Home Assistant scanner/cache adapter, route diagnostics, GATT transport, connection cleanup |
+| `channel.py` | Plaintext H7124 channel and per-connection H7129 negotiation/encryption |
+| `frame.py` / `crypto.py` | Frame validation, checksum, and cryptographic transforms |
+| `protocol.py` / `models.py` | Typed commands, events, response matching, model-specific request sequences |
+| `client.py` | Single connection owner, initialization, notifications, polling, command queue, recovery |
+| `coordinator.py` | Cached push state and Home Assistant availability/error propagation |
+| `fan.py`, `light.py`, `sensor.py` | Entity mappings only; no direct Bluetooth I/O |
+| `diagnostics.py` | Redacted config-entry and runtime diagnostics |
+
+The dependency direction is deliberate: Home Assistant entities call the
+coordinator, the coordinator calls the reliable client, the client composes a
+protocol with a channel, and the channel uses the GATT transport. Protocol and
+models remain independent of Home Assistant and Bluetooth.
+
+### Local development
+
+Create a Python environment with the project dependencies, then run:
+
+```bash
+env PYTHONPATH=. .venv/bin/ruff check .
+env PYTHONPATH=. .venv/bin/pytest -q
+```
+
+The tests cover setup scanning and cache freshness, model/name retention,
+connection timeouts and cleanup, stale callback generations, H7129 session
+negotiation, request/response matching, notification decoding, command recovery,
+entities, diagnostics-related lifecycle behavior, and trace extraction.
+
+### PacketLogger trace extraction
 
 Apple PacketLogger `.pklg` files can be reduced to purifier advertisements,
 connection setup, GATT discovery, and ATT traffic with the included extractor:
@@ -137,17 +313,15 @@ python3 scripts/extract_air_purifier_trace.py \
   "/path/to/H7129 Negotiation.pklg"
 ```
 
-The source capture is read-only. The output retains original PacketLogger
-record numbers, absolute and connection-relative timestamps, direction,
-connection handle, L2CAP channel, decoded ATT operation, and raw bytes.
+The capture is read-only. Output retains original record numbers, absolute and
+connection-relative timestamps, direction, connection handle, L2CAP channel,
+decoded ATT operation, and raw bytes.
 
-## Developer references
+## References
 
 - [Govee purifier protocol](govee-ble-air-purifier-protocol.md)
 - [Home Assistant Bluetooth expectations, APIs, and reliable handling](home-assistant-bluetooth-expectations-and-api.md)
 - [Home Assistant integration and HACS reference](home-assistant-bluetooth-integration-reference.md)
+- [License](LICENSE)
 
-## Removal
-
-Remove the purifier under **Settings > Devices & services**, then remove the
-integration from HACS if it is no longer needed.
+Release documentation reflects integration version 0.3.14.

@@ -1,7 +1,7 @@
 # Home Assistant Bluetooth Expectations, APIs, and Reliable Handling
 
 Practical engineering reference for Home Assistant Bluetooth integrations.
-Verified against the Home Assistant developer documentation on 2026-08-23.
+Verified against the Home Assistant developer documentation on 2026-08-24.
 
 This document focuses on Bluetooth behavior: scanner ownership, discovery,
 advertisement delivery, route selection, GATT connections, lifecycle,
@@ -65,20 +65,25 @@ connection ownership.
 
 ## 4. Manifest expectations
 
-An integration that needs access to local or remote Bluetooth adapters should
-declare:
+An integration that directly calls Home Assistant's Bluetooth APIs from a
+manual flow and has no manifest discovery matcher should declare both the
+Bluetooth manager and adapter infrastructure:
 
 ```json
 {
-  "dependencies": ["bluetooth_adapters"]
+  "dependencies": ["bluetooth", "bluetooth_adapters"]
 }
 ```
 
-This allows supported remote adapters to be ready before the integration tries
-to use them.
+This ensures that the shared Bluetooth manager exists and that supported remote
+adapters are ready before the integration tries to use them. Integrations with
+manifest Bluetooth matchers may receive equivalent manager loading through the
+discovery platform, but explicit dependencies should still reflect APIs used
+outside that path.
 
-Bluetooth discovery matchers belong in the manifest's `bluetooth` array. A
-matcher can use:
+Bluetooth discovery matchers belong in the manifest's `bluetooth` array when an
+integration wants Home Assistant to create automatic discovery flows. A matcher
+can use:
 
 - `connectable`
 - `local_name`
@@ -96,6 +101,13 @@ Set `connectable: false` when advertisements are sufficient; this permits data
 from both connectable and listening-only controllers. `connectable` defaults to
 `true` in the APIs, but it should still be made explicit where it communicates
 intent.
+
+The `bluetooth` array is optional. An integration may deliberately omit it and
+offer only an explicit `SOURCE_USER` config flow. This is useful when every
+setup attempt must run a new bounded scan and a pending automatic-discovery card
+could outlive the advertisement that originally created it. Omitting automatic
+discovery does not prevent the integration from using Home Assistant's shared
+scanner, cache, proxies, or connection APIs.
 
 ## 5. Scanner ownership and routes
 
@@ -202,8 +214,9 @@ Consequences:
 - Lack of repeated callbacks does not prove the device stopped advertising.
 - `async_last_service_info()` may contain a newer timestamp or RSSI than the
   integration's last callback.
-- A device that emits a static wake-up advertisement needs explicit history
-  clearing before the next identical packet can trigger a callback.
+- A device that emits static advertisements may require explicit history
+  clearing if the integration specifically needs another callback rather than a
+  refreshed shared-cache timestamp.
 
 Clear only advertisement deduplication state with:
 
@@ -262,20 +275,39 @@ stale selection from being handed to the connection layer.
 
 ### 6.6 Manual purifier setup policy
 
-This integration applies the APIs above as follows:
+This integration intentionally omits manifest Bluetooth matchers. Home
+Assistant therefore does not create a green pending automatic-discovery card;
+the explicit blue **Add device** flow is the only setup path.
 
-1. Clicking **Add device** records a monotonic start timestamp.
-2. It requests a ten-second one-shot active scan when the Home Assistant version
+Each newly opened user flow applies the APIs above as follows:
+
+1. Record a monotonic start timestamp and register a temporary, connectable
+   listener on Home Assistant's shared scanner. Disable cached replay when the
+   installed Home Assistant version exposes that option; on older versions,
+   ignore callbacks delivered synchronously during registration.
+2. Request a ten-second one-shot active scan when the Home Assistant version
    exposes that API.
-3. If that request fails, is unavailable, or returns early, it continues
-   observing Home Assistant's shared scanner until the full ten seconds elapse.
-4. It offers only supported, connectable, unconfigured purifiers whose cached
-   advertisement timestamp was updated during that window.
-5. After the user selects one purifier, it uses
-   `async_process_advertisements()` to wait up to ten seconds for a new
-   connectable advertisement from that address.
-6. It begins protocol initialization immediately after that fresh packet; it
-   does not wait out the remainder of the selected-device timeout.
+3. If the request fails, is unavailable, or returns early, continue observing
+   the shared scanner until the integration's full ten-second deadline elapses.
+4. Retain the last valid `GVH7124*` or `ihoment_H7129_*` name for each address.
+   A later nameless or address-only packet cannot erase an identity learned in
+   the same scan window.
+5. At the deadline, merge connectable shared-cache entries only when their
+   advertisement timestamp was refreshed during this window. This recovers
+   current static advertisements that Home Assistant deduplicated before
+   callback delivery without admitting old cache entries.
+6. Remove configured addresses and unsupported devices, sort the remaining
+   devices by RSSI, and freeze the choices for the rest of this flow.
+7. After selection, use `async_process_advertisements()` to request and wait up
+   to ten seconds for new connectable evidence from that exact address. Reject
+   cached replay with a timestamp predicate and concurrently accept a shared
+   cache timestamp refreshed after this wait began, because Home Assistant can
+   update history before suppressing an identical callback. A nameless fresh
+   packet is valid reachability evidence because the model identity was retained
+   from the list scan; a conflicting supported model name is rejected.
+8. Begin protocol initialization immediately after the fresh packet rather than
+   waiting out the selected-device timeout. Keep the setup form open with a
+   `not_discovered` error when no fresh packet arrives.
 
 This setup-only wait does not change normal operation or the protocol's
 three-second `aa 01` state-query cadence.
@@ -329,9 +361,10 @@ to them beyond immediate inspection.
 | `async_clear_address_from_match_history()` | Allow a future advertisement to trigger discovery again without immediately replaying cached data |
 | `async_rediscover_address()` | Clear discovery history and immediately reconsider cached data |
 
-Call `async_rediscover_address()` when a config entry or managed Bluetooth
-device is removed so it can be offered for setup again without restarting Home
-Assistant.
+Call `async_rediscover_address()` after removal only when the integration uses
+manifest-driven automatic discovery and wants Home Assistant to offer the device
+again without a restart. A manual-only integration should not call it; the next
+explicit user flow performs its own scan.
 
 ## 8. GATT connection expectations
 
@@ -521,7 +554,7 @@ not as the sole availability definition for an already connected device.
 
 ## 14. Config-flow and config-entry lifecycle
 
-### 14.1 Discovery flow
+### 14.1 Automatic and manual discovery flows
 
 A manifest match invokes `async_step_bluetooth()`. A discovery flow should:
 
@@ -533,6 +566,23 @@ A manifest match invokes `async_step_bluetooth()`. A discovery flow should:
 
 Do not ask users to type a Bluetooth address when Home Assistant already knows
 the supported devices. Device names are labels, not stable unique IDs.
+
+Automatic discovery is optional. A manual-only integration can omit the
+manifest `bluetooth` matchers and implement `async_step_user()` as a bounded
+discovery flow. In that design:
+
+- every click on **Add device** starts a new flow and a new observation window;
+- the integration must distinguish observations from cache entries that predate
+  the window;
+- choices can be frozen after discovery so the form does not change while the
+  user selects one;
+- the selected address should be revalidated immediately before connecting; and
+- deletion should clean runtime resources but does not need to retrigger
+  automatic discovery.
+
+A green **Discovered** card is a pending automatic config flow, not a live
+reachability indicator. Omitting manifest Bluetooth matchers avoids that UI path
+when stale pending flows conflict with an integration's setup policy.
 
 ### 14.2 Setup failure
 
@@ -611,11 +661,18 @@ but do not branch program behavior by searching their English text.
 
 Unit tests should cover at least:
 
-- manifest name matching and model inference;
+- the intended manifest discovery policy and model inference;
+- a new bounded scan for every independent manual user flow;
+- active-scan early return and failure while the integration still owns the
+  complete observation deadline;
+- last-valid-name retention across later nameless packets;
+- configured-address filtering and a stable choice snapshot;
+- fresh selected-address revalidation before connecting;
 - connectable and non-connectable filtering;
 - replay disabled when live packets are required;
 - stale cache rejection;
-- identical-advertisement history clearing;
+- identical-advertisement cache refresh or history clearing, according to the
+  integration's chosen freshness policy;
 - route re-resolution for each attempt;
 - missing route and no-scanner behavior;
 - connection timeout and partial-client cleanup;
@@ -655,6 +712,9 @@ Hassfest, and HACS validation for a custom integration.
 - Parsing human-readable reachability diagnostics.
 - Replacing a detailed failure with a generic `disconnected` message during
   cleanup.
+- Treating a pending automatic-discovery card as proof of current reachability.
+- Promising a fixed scan window but returning immediately when Home Assistant's
+  one-shot active-scan request returns early.
 
 ## 19. Policy used by this purifier integration
 
@@ -666,12 +726,22 @@ The Govee purifier integration applies the general model as follows:
   five seconds old; a retry requires evidence newer than its previous route.
 - Home Assistant's shared advertisement history is not cleared by a connection
   cycle.
-- Opening this integration's manual **Add device** flow requests one shared
-  active sweep before reading discoveries. After a successful sweep, only
-  purifiers observed during that window are offered and that list remains
-  stable through selection. The request affects `AUTO` scanners on supported
-  Home Assistant versions; if unavailable or unsuccessful, only cache entries
-  no more than five seconds old are offered.
+- Automatic manifest Bluetooth discovery is disabled. The blue **Add device**
+  user flow is the only setup path, so Home Assistant does not create green
+  pending-discovery cards for this integration.
+- Every new user flow registers a temporary shared-scanner listener, requests a
+  ten-second active window, and owns the full ten-second observation deadline
+  even if the Home Assistant request fails, is unavailable, or returns early.
+- Setup retains the last valid supported name per address and merges only cache
+  entries whose timestamps were refreshed during that window. Older cached
+  devices, unsupported names, non-connectable routes, and configured addresses
+  are excluded. Choices remain stable through selection.
+- Selection requires new connectable evidence from that address within ten
+  seconds. Cached replay cannot satisfy the timestamp predicate; either the
+  address-specific callback or a shared-cache timestamp refreshed during the
+  wait starts validation immediately. A fresh nameless packet preserves the
+  identity learned during the scan, while a conflicting supported model name is
+  rejected.
 - A new connectable `BLEDevice` and new Bleak client are used per cycle.
 - A GATT connection attempt has a 25-second deadline. This allows the
   connector's shorter internal attempt to finish before the integration's
@@ -679,6 +749,8 @@ The Govee purifier integration applies the general model as follows:
 - A partially connecting client is explicitly disconnected on timeout.
 - Local BlueZ connections for the purifier address are closed and verified
   before a new attempt, after a failed attempt, during shutdown, and on removal.
+- Removal does not call `async_rediscover_address()` because the integration has
+  no automatic discovery flow; the user can open a new **Add device** scan.
 - A surviving address-level connection blocks a new attempt so retries cannot
   consume additional adapter slots.
 - The setup window is 90 seconds, permitting at least two full
