@@ -19,6 +19,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.govee_ble_air_purifier import config_flow as config_flow_module
 from custom_components.govee_ble_air_purifier.config_flow import (
     DiscoveredPurifier,
+    _async_validate_purifier,
     _discovery_options,
     _model_from_name,
 )
@@ -70,6 +71,61 @@ def _prepare_bluetooth_test_environment(
 
 
 pytestmark = pytest.mark.usefixtures("enable_custom_integrations")
+
+
+async def test_explicit_validation_waits_for_ready_and_always_shuts_down(
+    hass: HomeAssistant,
+) -> None:
+    """The setup wizard remains strict after runtime startup becomes non-blocking."""
+    coordinator = SimpleNamespace(
+        async_start=AsyncMock(),
+        async_wait_until_ready=AsyncMock(),
+        async_shutdown=AsyncMock(),
+    )
+
+    with patch.object(
+        config_flow_module,
+        "GoveeDataUpdateCoordinator",
+        return_value=coordinator,
+    ):
+        await _async_validate_purifier(
+            hass,
+            address="AA:BB:CC:DD:EE:FF",
+            model="H7129",
+            name="ihoment_H7129_TEST",
+        )
+
+    coordinator.async_start.assert_awaited_once_with()
+    coordinator.async_wait_until_ready.assert_awaited_once_with()
+    coordinator.async_shutdown.assert_awaited_once_with()
+
+
+async def test_explicit_validation_failure_still_shuts_down(
+    hass: HomeAssistant,
+) -> None:
+    """A failed readiness wait cannot leave a validation client running."""
+    coordinator = SimpleNamespace(
+        async_start=AsyncMock(),
+        async_wait_until_ready=AsyncMock(side_effect=RuntimeError("not ready")),
+        async_shutdown=AsyncMock(),
+    )
+
+    with (
+        patch.object(
+            config_flow_module,
+            "GoveeDataUpdateCoordinator",
+            return_value=coordinator,
+        ),
+        pytest.raises(RuntimeError, match="not ready"),
+    ):
+        await _async_validate_purifier(
+            hass,
+            address="AA:BB:CC:DD:EE:FF",
+            model="H7124",
+            name="GVH7124TEST",
+        )
+
+    coordinator.async_shutdown.assert_awaited_once_with()
 
 
 def _service_info(

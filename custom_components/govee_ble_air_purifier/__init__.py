@@ -41,7 +41,7 @@ async def _async_cleanup_address(address: str, *, reason: str) -> None:
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: GoveeConfigEntry) -> bool:
-    """Set up a Govee purifier from a config entry."""
+    """Set up a purifier and recover unavailable hardware in the background."""
     address = entry.data[CONF_ADDRESS]
     await _async_cleanup_address(address, reason="entry_setup")
 

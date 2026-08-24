@@ -549,6 +549,7 @@ async def _async_validate_purifier(
     )
     try:
         await coordinator.async_start()
+        await coordinator.async_wait_until_ready()
     finally:
         await coordinator.async_shutdown()
 

@@ -176,12 +176,18 @@ the Govee app is treated as a transient disconnect:
 The first runtime connection attempt can accept a cached connectable
 advertisement no more than five seconds old. After a failed route, retry requires
 newer advertisement evidence. Each advertisement wait is bounded to ten seconds,
-each GATT connector cycle to 45 seconds, and initial setup to five minutes. A
-connector cycle permits up to three low-level attempts against the selected route
-before full cleanup, fresh-advertisement admission, and outer backoff. Individual
-setup cycles remain debug-only while that recovery window is active; only the
-final failure is returned to the setup flow. Home Assistant can then retry a
-temporarily unavailable config entry.
+each GATT connector cycle to 45 seconds, and explicit Add Device validation to
+five minutes. A connector cycle permits up to three low-level attempts against
+the selected route before full cleanup, fresh-advertisement admission, and outer
+backoff. Individual validation cycles remain debug-only while that window is
+active; only the final failure is returned to the setup flow.
+
+Previously configured entries do not wait for a first connection while Home
+Assistant is starting. Their entities load immediately as unavailable and the
+same connection owner recovers in the background. This prevents an unplugged or
+out-of-range purifier from consuming Home Assistant's global bootstrap timeout.
+Successful essential initialization automatically publishes current state and
+makes the entities available.
 
 Backend GATT calls are bounded independently so a connected-but-stalled BlueZ,
 adapter, or proxy operation cannot freeze the owner task. Notification
@@ -279,10 +285,12 @@ advertisement age, proxy slots, connection stage, and stale-connection cleanup
 result. A purifier at roughly -75 dBm or weaker may advertise successfully while
 GATT remains unreliable.
 
-Initial setup retries for up to five minutes. Intermediate connection failures
-are retained in debug diagnostics instead of appearing as coordinator errors.
-If setup ultimately reports `cannot_connect`, every bounded attempt in that
-five-minute window failed or the purifier stopped advertising.
+Add Device validation retries for up to five minutes. Intermediate connection
+failures are retained in debug diagnostics instead of appearing as coordinator
+errors. If setup ultimately reports `cannot_connect`, every bounded attempt in
+that five-minute window failed or the purifier stopped advertising. An already
+configured purifier instead loads as unavailable and keeps recovering in the
+background without delaying Home Assistant startup.
 
 ### Physical changes are not reflected
 
@@ -406,4 +414,4 @@ decoded ATT operation, and raw bytes.
 - [Home Assistant integration and HACS reference](home-assistant-bluetooth-integration-reference.md)
 - [License](LICENSE)
 
-Release documentation reflects integration version 0.3.21.
+Release documentation reflects integration version 0.3.22.

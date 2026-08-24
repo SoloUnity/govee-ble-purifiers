@@ -617,10 +617,19 @@ when stale pending flows conflict with an integration's setup policy.
 
 ### 14.2 Setup failure
 
-Temporary failures such as an unplugged device or unavailable Bluetooth route
-should raise `ConfigEntryNotReady` from the integration's top-level
-`async_setup_entry()`. Home Assistant will retry setup. Do not require a Home
-Assistant restart to recover from a temporary Bluetooth failure.
+Separate explicit device validation from loading an existing config entry.
+The Add Device flow should wait for its bounded connection and essential-state
+validation before creating an entry. An already configured peripheral being
+unplugged, out of range, connected to another central, or temporarily absent is
+not a reason to hold Home Assistant bootstrap open. Start the owned recovery
+task, load its entities as unavailable, and let successful initialization restore
+availability in the background.
+
+Raise `ConfigEntryNotReady` from the integration's top-level
+`async_setup_entry()` only when the integration cannot establish the runtime it
+needs to perform background recovery, such as the shared Bluetooth subsystem
+itself being unavailable. Do not use it merely because one configured peripheral
+was not observed or did not connect during startup.
 
 Allow the original exception to remain the cause and include a concise message
 so the UI and logs retain useful context. Home Assistant handles retry logging;
@@ -730,7 +739,10 @@ Unit tests should cover at least:
 - initialization and response matching;
 - unsolicited notification handling;
 - command coalescing, deadlines, and ambiguous-write reconciliation;
-- setup raising `ConfigEntryNotReady` for transient failures; and
+- config-entry setup returning while an absent peripheral remains unavailable;
+- later background recovery restoring that peripheral without a reload;
+- explicit Add Device validation retaining its bounded readiness wait;
+- `ConfigEntryNotReady` for failure to establish the recovery runtime; and
 - unload leaving no client, callback, or task behind.
 
 CI should run the Python test suite, Ruff or equivalent linting, JSON validation,
@@ -811,9 +823,13 @@ The Govee purifier integration applies the general model as follows:
   no automatic discovery flow; the user can open a new **Add device** scan.
 - A surviving address-level connection blocks a new attempt so retries cannot
   consume additional adapter slots.
-- The setup window is five minutes. Intermediate connection-cycle failures are
-  diagnostic debug events; only expiration of the complete setup window is
-  returned to the config flow or config-entry setup.
+- Explicit Add Device validation has a five-minute window. Intermediate
+  connection-cycle failures are diagnostic debug events; only expiration of the
+  complete validation window is returned to the config flow.
+- Existing config entries start their recovery owner and load immediately with
+  unavailable entities. They do not wait for first readiness or compete with
+  Home Assistant's global bootstrap timeout. Recovery continues in the
+  background until essential initialization succeeds.
 - Recovery uses capped exponential backoff with jitter. Its normal ceiling is
   60 seconds, but the base delay is capped at eight seconds while Home Assistant
   retains a connectable advertisement no more than ten seconds old. The

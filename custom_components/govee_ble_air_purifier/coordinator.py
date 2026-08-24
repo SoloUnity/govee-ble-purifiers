@@ -66,8 +66,12 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
         )
 
     async def async_start(self) -> None:
-        """Connect, attempt the startup sweep, and require essential state."""
+        """Start persistent Bluetooth recovery in the background."""
         await self.client.async_start()
+
+    async def async_wait_until_ready(self) -> None:
+        """Wait for essential state during explicit setup validation."""
+        await self.client.async_wait_until_ready()
 
     @property
     def client_available(self) -> bool:

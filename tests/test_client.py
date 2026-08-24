@@ -134,8 +134,8 @@ def test_old_generation_callbacks_are_ignored() -> None:
     assert not client._disconnected.is_set()
 
 
-def test_startup_budget_is_five_minutes() -> None:
-    """Weak-signal setup gets a bounded five-minute recovery window."""
+def test_explicit_validation_budget_is_five_minutes() -> None:
+    """Explicit setup validation gets a bounded five-minute recovery window."""
     maximum_first_backoff = client_module.BACKOFF_MIN * 1.2
     two_cycle_budget = (
         2 * (client_module.FRESH_ADVERTISEMENT_TIMEOUT + CONNECTION_ATTEMPT_TIMEOUT)
@@ -181,8 +181,10 @@ async def test_startup_timeout_surfaces_one_final_diagnostic_without_callback(
 
     client._run = wait_forever  # type: ignore[method-assign]
 
+    await client.async_start()
+
     with pytest.raises(BluetoothUnavailableError) as raised:
-        await client.async_start()
+        await client.async_wait_until_ready()
 
     message = str(raised.value)
     assert "did not become ready" in message
@@ -190,6 +192,30 @@ async def test_startup_timeout_surfaces_one_final_diagnostic_without_callback(
     assert "route={'present': True, 'source': 'test', 'rssi': -50}" in message
     assert "reachability=test route is reachable" in message
     assert updates == []
+    assert client._runner is not None
+
+    await client.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_start_returns_while_initial_recovery_is_pending() -> None:
+    """An offline purifier cannot hold Home Assistant entry setup open."""
+    client = make_client()
+    recovery_started = asyncio.Event()
+
+    async def wait_forever() -> None:
+        recovery_started.set()
+        await asyncio.Event().wait()
+
+    client._run = wait_forever  # type: ignore[method-assign]
+
+    await asyncio.wait_for(client.async_start(), timeout=0.1)
+    await asyncio.wait_for(recovery_started.wait(), timeout=0.1)
+
+    assert client._runner is not None
+    assert not client._first_ready.done()
+
+    await client.async_shutdown()
 
 
 @pytest.mark.asyncio

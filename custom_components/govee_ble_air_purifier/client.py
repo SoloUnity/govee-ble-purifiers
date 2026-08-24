@@ -223,7 +223,7 @@ class ReliablePurifierClient:
         }
 
     async def async_start(self) -> None:
-        """Start recovery and wait for the first usable initialization."""
+        """Start persistent recovery without waiting for the purifier."""
         if self._runner is not None:
             return
 
@@ -233,16 +233,20 @@ class ReliablePurifierClient:
         self._runner = asyncio.create_task(
             self._run(), name=f"govee-purifier-{self._environment.address}"
         )
+
+    async def async_wait_until_ready(self, timeout: float | None = None) -> None:
+        """Wait for essential initialization during explicit validation."""
+        first_ready = self._first_ready
+        if self._runner is None or first_ready is None:
+            raise PurifierClientError("Purifier client is not running")
+        if timeout is None:
+            timeout = STARTUP_TIMEOUT
+
         try:
-            async with asyncio.timeout(STARTUP_TIMEOUT):
-                await asyncio.shield(self._first_ready)
-        except asyncio.CancelledError:
-            await self.async_shutdown()
-            raise
+            async with asyncio.timeout(timeout):
+                await asyncio.shield(first_ready)
         except Exception as err:
-            # Cancel only after a bounded setup window. Home Assistant may then
-            # retry the config entry instead of leaving a hidden task behind.
-            startup_error = BluetoothUnavailableError(
+            raise BluetoothUnavailableError(
                 f"Purifier {self._environment.address} did not become ready; "
                 f"status={self.status.value}; "
                 f"last_cycle_error={self._last_error}; "
@@ -250,9 +254,7 @@ class ReliablePurifierClient:
                 f"route={self._environment.route_diagnostics()}; "
                 f"reachability={self._environment.reachability_diagnostics()}; "
                 f"transport={self._transport.diagnostic_snapshot()}"
-            )
-            await self.async_shutdown()
-            raise startup_error from err
+            ) from err
 
     async def async_shutdown(self) -> None:
         """Stop recovery, fail outstanding controls, and release BLE resources."""

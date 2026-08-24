@@ -17,6 +17,7 @@ from custom_components.govee_ble_air_purifier.models import Model
 def _setup_objects() -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace]:
     coordinator = SimpleNamespace(
         async_start=AsyncMock(),
+        async_wait_until_ready=AsyncMock(),
         async_shutdown=AsyncMock(),
     )
     config_entries = SimpleNamespace(
@@ -71,6 +72,7 @@ async def test_setup_cleans_address_before_start_and_registers_stop() -> None:
     hass.config_entries.async_forward_entry_setups.assert_awaited_once_with(
         entry, PLATFORMS
     )
+    coordinator.async_wait_until_ready.assert_not_awaited()
     hass.bus.async_listen_once.assert_called_once()
     event_type, stop_callback = hass.bus.async_listen_once.call_args.args
     assert event_type == EVENT_HOMEASSISTANT_STOP
@@ -97,6 +99,7 @@ async def test_setup_cleanup_failure_does_not_prevent_normal_connection() -> Non
         assert await async_setup_entry(hass, entry)  # type: ignore[arg-type]
 
     coordinator.async_start.assert_awaited_once_with()
+    coordinator.async_wait_until_ready.assert_not_awaited()
 
 
 async def test_unload_shuts_down_after_platforms_unload() -> None:
