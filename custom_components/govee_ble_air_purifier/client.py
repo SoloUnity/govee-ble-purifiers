@@ -98,6 +98,10 @@ class CommandSuperseded(PurifierClientError):
     """Raised when a newer pending control replaces an older one."""
 
 
+class _RefreshPreempted(PurifierClientError):
+    """Interrupt lower-priority refresh work when a command is waiting."""
+
+
 @dataclass(slots=True)
 class _Operation:
     command: ProtocolCommand
@@ -140,6 +144,9 @@ class ReliablePurifierClient:
         self._session_generation = 0
         self._refresh_pending = False
         self._refresh_running = False
+        self._refresh_resume_requests: tuple[RequestDescriptor, ...] = ()
+        self._refresh_preemptions = 0
+        self._last_refresh_preempted_request: str | None = None
         self._incomplete_refresh_requests: tuple[str, ...] = ()
         self._refresh_failure_summaries: dict[str, str] = {}
         self._next_poll_due = 0.0
@@ -189,6 +196,28 @@ class ReliablePurifierClient:
             ),
             "incomplete_refresh_requests": self._incomplete_refresh_requests,
             "refresh_failure_summaries": dict(self._refresh_failure_summaries),
+            "refresh_pending": self._refresh_pending,
+            "refresh_running": self._refresh_running,
+            "refresh_resume_requests": tuple(
+                descriptor.name for descriptor in self._refresh_resume_requests
+            ),
+            "refresh_preemptions": self._refresh_preemptions,
+            "last_refresh_preempted_request": (
+                self._last_refresh_preempted_request
+            ),
+            "pending_command_count": sum(
+                not operation.future.done() for operation in self._operations
+            ),
+            "active_command": (
+                type(self._active_operation.command).__name__
+                if self._active_operation is not None
+                else None
+            ),
+            "active_command_send_attempts": (
+                self._active_operation.send_attempts
+                if self._active_operation is not None
+                else None
+            ),
             "route": self._environment.route_diagnostics(),
             "transport": self._transport.diagnostic_snapshot(),
         }
@@ -341,6 +370,7 @@ class ReliablePurifierClient:
         self._drain_frame_queue()
         self._refresh_pending = False
         self._refresh_running = False
+        self._refresh_resume_requests = ()
         self._incomplete_refresh_requests = ()
         self._refresh_failure_summaries = {}
         self._incomplete_initialization_requests = ()
@@ -587,43 +617,101 @@ class ReliablePurifierClient:
             operation.future.set_result(None)
             return
 
-        operation.send_attempts += 1
-        descriptor = self._protocol.command_request(operation.command)
-        try:
-            await self._async_execute_descriptor(descriptor, attempts=1)
-        except Exception:
-            if (
-                not operation.future.done()
-                and loop.time() < operation.deadline
-                and operation.send_attempts < COMMAND_SEND_ATTEMPTS
-            ):
-                self._operations.appendleft(operation)
-                self._operation_event.set()
-            elif not operation.future.done():
-                operation.future.set_exception(
-                    CommandDeadlineExceeded(
-                        "Command remained unconfirmed after bounded retries"
-                    )
+        if operation.send_attempts >= COMMAND_SEND_ATTEMPTS:
+            operation.future.set_exception(
+                CommandDeadlineExceeded(
+                    "Command remained unconfirmed after bounded retries"
                 )
-            raise
-        else:
-            if not operation.future.done():
-                operation.future.set_result(None)
+            )
+            return
+
+        descriptor = self._protocol.command_request(operation.command)
+        while operation.send_attempts < COMMAND_SEND_ATTEMPTS:
+            if operation.future.done():
+                return
+            if loop.time() >= operation.deadline:
+                operation.future.set_exception(
+                    CommandDeadlineExceeded("Command deadline expired before retry")
+                )
+                return
+
+            _LOGGER.debug(
+                "Command transaction: command=%s attempt=%d/%d remaining=%.3fs",
+                type(operation.command).__name__,
+                operation.send_attempts + 1,
+                COMMAND_SEND_ATTEMPTS,
+                max(0.0, operation.deadline - loop.time()),
+            )
+
+            send_recorded = False
+
+            def record_send() -> None:
+                nonlocal send_recorded
+                if not send_recorded:
+                    operation.send_attempts += 1
+                    send_recorded = True
+
+            try:
+                async with asyncio.timeout_at(operation.deadline):
+                    await self._async_execute_descriptor(
+                        descriptor,
+                        attempts=1,
+                        on_send=record_send,
+                    )
+            except TransactionTimeoutError:
+                if (
+                    operation.send_attempts < COMMAND_SEND_ATTEMPTS
+                    and not operation.future.done()
+                    and loop.time() < operation.deadline
+                ):
+                    _LOGGER.debug(
+                        "Command response stayed silent; retrying on the same "
+                        "session command=%s next_attempt=%d/%d",
+                        type(operation.command).__name__,
+                        operation.send_attempts + 1,
+                        COMMAND_SEND_ATTEMPTS,
+                    )
+                    continue
+                self._queue_operation_for_reconciliation(operation)
+                raise
+            except TimeoutError as err:
+                if not operation.future.done():
+                    operation.future.set_exception(
+                        CommandDeadlineExceeded(
+                            "Command deadline expired during Bluetooth transaction"
+                        )
+                    )
+                raise CommandDeadlineExceeded(
+                    "Command deadline expired during Bluetooth transaction"
+                ) from err
+            except Exception:
+                self._queue_operation_for_reconciliation(operation)
+                raise
+            else:
+                if not operation.future.done():
+                    operation.future.set_result(None)
+                return
 
     async def _async_run_refresh(
         self, descriptors: tuple[RequestDescriptor, ...]
     ) -> None:
-        """Retry a refresh while preserving secondary best-effort telemetry."""
-        failures: dict[str, str] = {}
+        """Run resumable best-effort telemetry below queued command priority."""
+        resuming = bool(self._refresh_resume_requests)
+        active_descriptors = self._refresh_resume_requests or descriptors
+        failures = dict(self._refresh_failure_summaries) if resuming else {}
         self._refresh_running = True
         self._refresh_pending = False
+        self._refresh_resume_requests = ()
         self._update_refresh_failures(failures)
         try:
-            for index, descriptor in enumerate(descriptors):
+            for index, descriptor in enumerate(active_descriptors):
+                if self._has_pending_command():
+                    self._defer_refresh(active_descriptors[index:], descriptor.name)
+                    return
                 _LOGGER.debug(
                     "Refresh request %d/%d: name=%s attempts=%d",
                     index + 1,
-                    len(descriptors),
+                    len(active_descriptors),
                     descriptor.name,
                     REFRESH_ATTEMPTS,
                 )
@@ -631,7 +719,11 @@ class ReliablePurifierClient:
                     await self._async_execute_descriptor(
                         descriptor,
                         attempts=REFRESH_ATTEMPTS,
+                        interrupt_for_command=True,
                     )
+                except _RefreshPreempted:
+                    self._defer_refresh(active_descriptors[index:], descriptor.name)
+                    return
                 except TransactionTimeoutError as err:
                     failures[descriptor.name] = str(err)
                     self._update_refresh_failures(failures)
@@ -651,10 +743,36 @@ class ReliablePurifierClient:
                         REFRESH_ATTEMPTS,
                         exc_info=True,
                     )
-                if index + 1 < len(descriptors):
+                if index + 1 < len(active_descriptors):
                     await asyncio.sleep(BETWEEN_REQUEST_DELAY)
         finally:
             self._refresh_running = False
+
+    def _has_pending_command(self) -> bool:
+        """Return whether an unexpired user command is waiting for the owner."""
+        now = asyncio.get_running_loop().time()
+        return any(
+            not operation.future.done() and now < operation.deadline
+            for operation in self._operations
+        )
+
+    def _defer_refresh(
+        self,
+        remaining: tuple[RequestDescriptor, ...],
+        interrupted_request: str,
+    ) -> None:
+        """Preserve refresh order and resume it after higher-priority controls."""
+        self._refresh_resume_requests = remaining
+        self._refresh_pending = True
+        self._refresh_preemptions += 1
+        self._last_refresh_preempted_request = interrupted_request
+        _LOGGER.debug(
+            "Refresh yielded to a pending command: request=%s remaining=%s "
+            "preemptions=%d",
+            interrupted_request,
+            tuple(descriptor.name for descriptor in remaining),
+            self._refresh_preemptions,
+        )
 
     def _update_refresh_failures(self, failures: dict[str, str]) -> None:
         """Publish response exhaustion from the most recent refresh sweep."""
@@ -667,6 +785,8 @@ class ReliablePurifierClient:
         *,
         attempts: int,
         is_periodic_poll: bool = False,
+        interrupt_for_command: bool = False,
+        on_send: Callable[[], None] | None = None,
     ) -> tuple[bytes, ...]:
         channel = self._channel
         if channel is None or not channel.ready:
@@ -693,6 +813,8 @@ class ReliablePurifierClient:
                     attempts,
                     descriptor.frame.hex(" "),
                 )
+                if on_send is not None:
+                    on_send()
                 await channel.async_send(descriptor.frame)
                 if is_periodic_poll:
                     # This is deliberately write-to-write, not response-to-write.
@@ -701,7 +823,10 @@ class ReliablePurifierClient:
 
                 try:
                     while not matcher.complete:
-                        frame = await self._async_next_transaction_frame(deadline)
+                        frame = await self._async_next_transaction_frame(
+                            deadline,
+                            interrupt_for_command=interrupt_for_command,
+                        )
                         observed_frames.append(frame)
                         self._process_plaintext_frame(frame)
                         result = matcher.feed(frame)
@@ -758,7 +883,12 @@ class ReliablePurifierClient:
         finally:
             self._active_request = None
 
-    async def _async_next_transaction_frame(self, deadline: float) -> bytes:
+    async def _async_next_transaction_frame(
+        self,
+        deadline: float,
+        *,
+        interrupt_for_command: bool = False,
+    ) -> bytes:
         loop = asyncio.get_running_loop()
         remaining = deadline - loop.time()
         if remaining <= 0:
@@ -766,7 +896,16 @@ class ReliablePurifierClient:
 
         frame_task = asyncio.create_task(self._frame_queue.get())
         disconnect_task = asyncio.create_task(self._disconnected.wait())
-        tasks = (frame_task, disconnect_task)
+        operation_task = (
+            asyncio.create_task(self._operation_event.wait())
+            if interrupt_for_command
+            else None
+        )
+        tasks = (
+            (frame_task, disconnect_task, operation_task)
+            if operation_task is not None
+            else (frame_task, disconnect_task)
+        )
         try:
             done, _ = await asyncio.wait(
                 tasks,
@@ -785,7 +924,11 @@ class ReliablePurifierClient:
             if not frame_task.done():
                 frame_task.cancel()
             raise GattTransportError("Purifier disconnected during transaction")
-        return frame_task.result()
+        if frame_task in done:
+            return frame_task.result()
+        if operation_task is not None and operation_task in done:
+            raise _RefreshPreempted("Refresh yielded to a pending command")
+        raise TimeoutError
 
     async def _async_wait_for_ready_work(self, timeout: float) -> None:
         frame_task = asyncio.create_task(self._frame_queue.get())
@@ -978,6 +1121,18 @@ class ReliablePurifierClient:
             else:
                 retained.append(pending)
         self._operations = retained
+
+    def _queue_operation_for_reconciliation(self, operation: _Operation) -> None:
+        """Keep an ambiguous command pending for post-reconnect state checks."""
+        if operation.future.done():
+            return
+        if asyncio.get_running_loop().time() >= operation.deadline:
+            operation.future.set_exception(
+                CommandDeadlineExceeded("Command deadline expired during recovery")
+            )
+            return
+        self._operations.appendleft(operation)
+        self._operation_event.set()
 
     def _discard_expired_operations(self) -> None:
         now = asyncio.get_running_loop().time()

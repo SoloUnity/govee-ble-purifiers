@@ -211,12 +211,19 @@ The documented H7129 `ee aa` refresh uses the same three attempts per request.
 An exhausted secondary refresh response is recorded and the remaining refresh
 continues on the current session. Because `aa 01` is the connection's essential
 health signal, three missing `aa 01` refresh responses trigger reconnection.
+Refresh telemetry is lower priority than user controls. If a command arrives
+during a refresh transaction, the refresh yields without waiting for the rest of
+that transaction's timeout budget. After the command finishes, the sweep resumes
+at the interrupted request so requests are neither skipped nor reordered.
 
 Commands are serialized and have a 30-second end-to-end deadline. Up to three
-bounded sends are permitted across recovery. Newer pending controls of the same
-type supersede older ones. After an ambiguous disconnect, initialization first
-re-queries authoritative state and suppresses a replay if the requested state is
-already confirmed. Commands are never replayed indefinitely.
+bounded sends are permitted. Response silence is retried immediately on the
+existing application session, avoiding a full reconnect between each send. A
+transport failure enters normal recovery while preserving the absolute command.
+After an ambiguous timeout or disconnect, initialization first re-queries
+authoritative state and suppresses a replay if the requested state is already
+confirmed. Newer pending controls of the same type supersede older ones, and
+commands are never replayed after their deadline or beyond their send budget.
 
 Cleanup runs before config-entry setup, before a new connection, after a failed
 connection cycle, during shutdown/unload, and after entry removal. Removal does
@@ -291,6 +298,8 @@ details can include:
 - the client state and connection generation;
 - startup requests still incomplete after three response attempts;
 - refresh requests still incomplete after three response attempts;
+- queued/active command counts and the active command's send-attempt count;
+- refresh preemption count, interrupted request, and ordered resume requests;
 - the selected and current adapter/proxy route;
 - RSSI and advertisement age;
 - Home Assistant reachability and connection-slot diagnostics;
@@ -397,4 +406,4 @@ decoded ATT operation, and raw bytes.
 - [Home Assistant integration and HACS reference](home-assistant-bluetooth-integration-reference.md)
 - [License](LICENSE)
 
-Release documentation reflects integration version 0.3.20.
+Release documentation reflects integration version 0.3.21.

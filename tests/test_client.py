@@ -16,7 +16,6 @@ from custom_components.govee_ble_air_purifier.bluetooth import (
     GattTransportError,
 )
 from custom_components.govee_ble_air_purifier.client import (
-    CommandDeadlineExceeded,
     ReliablePurifierClient,
     _Operation,
 )
@@ -631,35 +630,147 @@ async def test_steady_scheduler_polls_only_aa01(
 
 @pytest.mark.asyncio
 async def test_ambiguous_command_is_bounded_and_reconciled() -> None:
-    """Retry count is bounded, while queried applied state prevents a replay."""
+    """Three same-session silences recycle once for authoritative reconciliation."""
+    client = make_client()
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[None] = loop.create_future()
+    operation = _Operation(SetPower(True), future, loop.time() + 30)
+    calls = 0
+
+    async def fail_transaction(*_: object, **kwargs: object) -> tuple[bytes, ...]:
+        nonlocal calls
+        calls += 1
+        on_send = kwargs["on_send"]
+        assert callable(on_send)
+        on_send()
+        raise client_module.TransactionTimeoutError("command response stayed silent")
+
+    client._async_execute_descriptor = fail_transaction  # type: ignore[method-assign]
+
+    with pytest.raises(
+        client_module.TransactionTimeoutError,
+        match="command response stayed silent",
+    ):
+        await client._async_execute_operation(operation)
+
+    assert calls == 3
+    assert operation.send_attempts == 3
+    assert not future.done()
+    assert client._operations.popleft() is operation
+
+    # Reconnect initialization observes that the ambiguous write was applied.
+    client.state = PurifierState(power=True)
+    await client._async_execute_operation(operation)
+    assert future.done()
+    assert future.exception() is None
+
+
+@pytest.mark.asyncio
+async def test_command_can_succeed_on_third_same_session_attempt() -> None:
+    """Response silence does not spend the command deadline reconnecting."""
+    client = make_client()
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[None] = loop.create_future()
+    operation = _Operation(SetPower(True), future, loop.time() + 30)
+    calls = 0
+
+    async def succeed_on_third(*_: object, **kwargs: object) -> tuple[bytes, ...]:
+        nonlocal calls
+        calls += 1
+        on_send = kwargs["on_send"]
+        assert callable(on_send)
+        on_send()
+        if calls < 3:
+            raise client_module.TransactionTimeoutError("temporary silence")
+        return ()
+
+    client._async_execute_descriptor = succeed_on_third  # type: ignore[method-assign]
+
+    await client._async_execute_operation(operation)
+
+    assert calls == 3
+    assert operation.send_attempts == 3
+    assert future.done()
+    assert future.exception() is None
+    assert not client._operations
+
+
+@pytest.mark.asyncio
+async def test_command_transport_failure_remains_pending_across_reconnect() -> None:
+    """A dropped link preserves an absolute command for normal recovery."""
     client = make_client()
     loop = asyncio.get_running_loop()
     future: asyncio.Future[None] = loop.create_future()
     operation = _Operation(SetPower(True), future, loop.time() + 30)
 
-    async def fail_transaction(*_: object, **__: object) -> tuple[bytes, ...]:
-        raise TimeoutError
+    async def disconnect(*_: object, **kwargs: object) -> tuple[bytes, ...]:
+        on_send = kwargs["on_send"]
+        assert callable(on_send)
+        on_send()
+        raise GattTransportError("link dropped during command")
 
-    client._async_execute_descriptor = fail_transaction  # type: ignore[method-assign]
-    for expected_attempt in range(1, 4):
-        with pytest.raises(TimeoutError):
-            await client._async_execute_operation(operation)
-        assert operation.send_attempts == expected_attempt
-        if expected_attempt < 3:
-            assert client._operations.popleft() is operation
+    client._async_execute_descriptor = disconnect  # type: ignore[method-assign]
 
-    with pytest.raises(CommandDeadlineExceeded):
-        await future
-    assert operation not in client._operations
+    with pytest.raises(GattTransportError, match="link dropped during command"):
+        await client._async_execute_operation(operation)
 
-    reconciled_future: asyncio.Future[None] = loop.create_future()
-    reconciled = _Operation(
-        SetPower(True), reconciled_future, loop.time() + 30, send_attempts=1
-    )
-    client.state = PurifierState(power=True)
-    await client._async_execute_operation(reconciled)
-    assert reconciled_future.done()
-    assert reconciled_future.exception() is None
+    assert operation.send_attempts == 1
+    assert not future.done()
+    assert client._operations.popleft() is operation
+
+
+@pytest.mark.asyncio
+async def test_refresh_yields_and_resumes_when_command_is_queued(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long best-effort refresh cannot hold the owner ahead of a control."""
+    monkeypatch.setattr(client_module, "TRANSACTION_TIMEOUT", 10.0)
+    client = make_client()
+    channel = SilentChannel()
+    client._channel = channel  # type: ignore[assignment]
+    descriptors = client._protocol.refresh_requests()
+
+    refresh_task = asyncio.create_task(client._async_run_refresh(descriptors))
+    while not channel.writes:
+        await asyncio.sleep(0)
+
+    loop = asyncio.get_running_loop()
+    command_future: asyncio.Future[None] = loop.create_future()
+    operation = _Operation(SetPower(True), command_future, loop.time() + 30)
+    client._operations.append(operation)
+    client._operation_event.set()
+
+    await asyncio.wait_for(refresh_task, 0.1)
+
+    assert len(channel.writes) == 1
+    assert client._refresh_pending
+    assert not client._refresh_running
+    assert client._refresh_resume_requests == descriptors
+    diagnostics = client.diagnostic_snapshot()
+    assert diagnostics["refresh_preemptions"] == 1
+    assert diagnostics["last_refresh_preempted_request"] == descriptors[0].name
+    assert diagnostics["pending_command_count"] == 1
+
+    # Once the higher-priority command is gone, resume with the interrupted
+    # request instead of skipping or reordering the protocol sweep.
+    client._operations.clear()
+    command_future.cancel()
+    client._operation_event.clear()
+    resumed: list[str] = []
+
+    async def complete(
+        descriptor: RequestDescriptor, *, attempts: int, **_: object
+    ) -> tuple[bytes, ...]:
+        assert attempts == 3
+        resumed.append(descriptor.name)
+        return ()
+
+    client._async_execute_descriptor = complete  # type: ignore[method-assign]
+    await client._async_run_refresh(descriptors)
+
+    assert resumed == [descriptor.name for descriptor in descriptors]
+    assert not client._refresh_pending
+    assert client._refresh_resume_requests == ()
 
 
 @pytest.mark.asyncio

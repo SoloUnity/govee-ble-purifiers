@@ -655,6 +655,20 @@ have applied the command before the link failed. On reconnect:
 - retry only idempotent or absolute commands; and
 - never replay a command after its user-facing deadline.
 
+Response silence does not necessarily mean the GATT session is broken. For an
+absolute or otherwise safely repeatable command, spend a small bounded send
+budget on the current session before paying the much larger cost of route
+selection, connection, service discovery, notification subscription, and
+application negotiation again. A transport or channel failure still leaves the
+ambiguous command pending across recovery. Reinitialization then reconciles
+authoritative state before another send.
+
+Long best-effort telemetry sweeps should not monopolize the serialized owner.
+When a user command arrives, interrupt the current refresh response wait, retain
+the interrupted descriptor and remaining request order, execute the command,
+then resume the sweep. Startup initialization remains non-preemptible because it
+establishes the authoritative state required for safe command reconciliation.
+
 Do not infer success from a local write call alone. For write-without-response,
 successful handoff to the OS is not device acknowledgement.
 
@@ -831,11 +845,19 @@ The Govee purifier integration applies the general model as follows:
 - The documented H7129 `ee aa` refresh gives every request three attempts.
   Exhausted secondary refresh requests are retained in diagnostics while the
   sweep and connection continue. An exhausted essential `aa 01` refresh request
-  triggers reconnection.
+  triggers reconnection. A queued user command preempts the current refresh wait;
+  the refresh resumes from the interrupted request after command work finishes.
+- Commands have a 30-second end-to-end deadline and at most three sends.
+  Response silence consumes those retries on the current application session.
+  Transport failure preserves the absolute command across reconnect, where
+  startup state is checked before any replay. An ambiguous command that has
+  exhausted its send budget may still be confirmed by that state check, but it
+  is never sent a fourth time.
 - Physical-control notifications update cached state without waiting for a poll.
 - Diagnostics retain recent connection failures, Home Assistant reachability,
   essential initialization batch/attempt counts, and GATT operation deadline,
-  timeout, cancellation, and elapsed-time information.
+  timeout, cancellation, and elapsed-time information. They also expose command
+  queue/attempt state and refresh preemption/resume state.
 
 These values are project policy based on the purifier traces and reliability
 goals. They are not universal Home Assistant constants.
