@@ -34,6 +34,9 @@ from custom_components.govee_ble_air_purifier.protocol import GoveePurifierProto
 class FakeEnvironment:
     address = "AA:BB:CC:DD:EE:FF"
 
+    async def async_start(self) -> None:
+        return
+
     def route_diagnostics(self) -> dict[str, object]:
         return {"present": True, "source": "test", "rssi": -50}
 
@@ -45,6 +48,9 @@ class FakeEnvironment:
             name="ihoment_H7129_TEST",
             address=self.address,
         )
+
+    async def async_stop(self) -> None:
+        return
 
 
 class FakeTransport:
@@ -111,6 +117,54 @@ def test_old_generation_callbacks_are_ignored() -> None:
 
     assert client._frame_queue.empty()
     assert not client._disconnected.is_set()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_does_not_overwrite_detailed_availability_error() -> None:
+    """Cleanup cannot replace a meaningful failure with disconnected."""
+    client = make_client()
+    updates: list[tuple[bool, Exception | None]] = []
+    client._availability_callback = lambda available, error: updates.append(
+        (available, error)
+    )
+    detailed_error = BluetoothUnavailableError(
+        "stage=establish_connection; reachability=no free proxy slots"
+    )
+    client._set_available(False, detailed_error)
+
+    await client.async_shutdown()
+
+    assert updates == [(False, detailed_error)]
+
+
+@pytest.mark.asyncio
+async def test_startup_timeout_surfaces_diagnostic_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bounded startup failure remains useful after cleanup completes."""
+    monkeypatch.setattr(client_module, "STARTUP_TIMEOUT", 0.01)
+    client = make_client()
+    updates: list[tuple[bool, Exception | None]] = []
+    client._availability_callback = lambda available, error: updates.append(
+        (available, error)
+    )
+
+    async def wait_forever() -> None:
+        await asyncio.Event().wait()
+
+    client._run = wait_forever  # type: ignore[method-assign]
+
+    with pytest.raises(BluetoothUnavailableError) as raised:
+        await client.async_start()
+
+    message = str(raised.value)
+    assert "did not become ready" in message
+    assert "cause=TimeoutError" in message
+    assert "route={'present': True, 'source': 'test', 'rssi': -50}" in message
+    assert "reachability=test route is reachable" in message
+    assert len(updates) == 1
+    assert updates[0][0] is False
+    assert updates[0][1] is raised.value
 
 
 @pytest.mark.asyncio

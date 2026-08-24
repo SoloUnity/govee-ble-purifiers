@@ -16,6 +16,7 @@ from .bluetooth import (
     GattTransport,
     GattTransportError,
     HomeAssistantBluetoothEnvironment,
+    exception_detail,
 )
 from .channel import (
     ChannelError,
@@ -180,10 +181,18 @@ class ReliablePurifierClient:
         except Exception as err:
             # Cancel only after a bounded setup window. Home Assistant may then
             # retry the config entry instead of leaving a hidden task behind.
+            startup_error = BluetoothUnavailableError(
+                f"Purifier {self._environment.address} did not become ready; "
+                f"status={self.status.value}; "
+                f"last_cycle_error={self._last_error}; "
+                f"cause={exception_detail(err)}; "
+                f"route={self._environment.route_diagnostics()}; "
+                f"reachability={self._environment.reachability_diagnostics()}; "
+                f"transport={self._transport.diagnostic_snapshot()}"
+            )
             await self.async_shutdown()
-            raise BluetoothUnavailableError(
-                f"Purifier {self._environment.address} did not become ready"
-            ) from err
+            self._set_available(False, startup_error)
+            raise startup_error from err
 
     async def async_shutdown(self) -> None:
         """Stop recovery, fail outstanding controls, and release BLE resources."""
@@ -210,7 +219,6 @@ class ReliablePurifierClient:
                 PurifierClientError("Purifier client stopped")
             )
         self._fail_all_operations(PurifierClientError("Purifier client stopped"))
-        self._set_available(False, None)
         self.status = ClientStatus.STOPPED
 
     async def async_execute(self, command: ProtocolCommand) -> None:

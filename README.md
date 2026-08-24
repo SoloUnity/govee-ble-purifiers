@@ -80,7 +80,9 @@ that occurred before GATT discovery returned, and both the selected and current
 Bluetooth routes. Route details include the adapter or proxy source, RSSI, and
 advertisement age so a stale route can be distinguished from a weak fresh one.
 On supported Home Assistant versions, failures also include the platform's
-connection reachability and proxy-slot diagnosis.
+connection reachability and proxy-slot diagnosis. Setup cleanup preserves the
+last meaningful failure instead of replacing it with a generic disconnected
+message.
 
 For frame-by-frame diagnostics, add this to `configuration.yaml` and restart
 Home Assistant:
