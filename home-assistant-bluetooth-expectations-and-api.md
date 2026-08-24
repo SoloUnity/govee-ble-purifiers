@@ -242,9 +242,43 @@ For one-shot discovery, `await bluetooth.async_request_active_scan(hass)` asks
 `AUTO` scanners to perform a shared active window. It does not override scanners
 the user explicitly placed in `PASSIVE` or `ACTIVE` mode.
 
+A normal return from `async_request_active_scan()` does not prove that a full
+active window occurred. Home Assistant's scheduler can return early when no
+`AUTO` scanner exists, all eligible scanners are busy connecting, or every
+scanner declines the requested window. The API returns `None` in both the
+completed-window and early-return cases. A config flow that promises a fixed
+observation period must therefore own that deadline itself and continue
+observing the shared scanner for the remaining time. It should then filter the
+cache using the observation start timestamp instead of presenting every device
+Home Assistant remembers.
+
 `async_process_advertisements()` is the higher-level API for waiting until an
 advertisement satisfies a predicate. When called with a specific address and a
 non-passive mode, its timeout also controls the requested active-scan window.
+Registration may replay cached data, so a setup freshness predicate should
+require the advertisement timestamp to be at least the start time of the wait.
+This permits immediate progress when a new packet arrives while preventing a
+stale selection from being handed to the connection layer.
+
+### 6.6 Manual purifier setup policy
+
+This integration applies the APIs above as follows:
+
+1. Clicking **Add device** records a monotonic start timestamp.
+2. It requests a ten-second one-shot active scan when the Home Assistant version
+   exposes that API.
+3. If that request fails, is unavailable, or returns early, it continues
+   observing Home Assistant's shared scanner until the full ten seconds elapse.
+4. It offers only supported, connectable, unconfigured purifiers whose cached
+   advertisement timestamp was updated during that window.
+5. After the user selects one purifier, it uses
+   `async_process_advertisements()` to wait up to ten seconds for a new
+   connectable advertisement from that address.
+6. It begins protocol initialization immediately after that fresh packet; it
+   does not wait out the remainder of the selected-device timeout.
+
+This setup-only wait does not change normal operation or the protocol's
+three-second `aa 01` state-query cadence.
 
 ## 7. API map
 

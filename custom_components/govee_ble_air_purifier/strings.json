@@ -24,7 +24,7 @@
     "abort": {
       "already_configured": "This purifier is already configured.",
       "discovery_expired": "The Bluetooth discovery is no longer available.",
-      "no_devices_found": "No unconfigured Govee H7124 or H7129 air purifiers are currently visible. Make sure the purifier is powered on, in range, and disconnected from the Govee app.",
+      "no_devices_found": "No unconfigured Govee H7124 or H7129 air purifiers were seen during the Bluetooth scan. Make sure the purifier is powered on, in range, and disconnected from the Govee app.",
       "not_connectable": "This discovery did not come from a Bluetooth adapter or proxy that can connect to the purifier.",
       "unsupported_device": "The discovered Bluetooth device does not advertise as a supported Govee H7124 or H7129 purifier."
     }

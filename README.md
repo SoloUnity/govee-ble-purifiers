@@ -36,13 +36,16 @@ purifier permits only one Bluetooth central connection at a time.
 
 The integration matches the observed advertised-name families `GVH7124*` and
 `ihoment_H7129_*`; the model is inferred from that name. Manual setup never asks
-for a Bluetooth address. Opening **Add device** requests Home Assistant's shared
-one-shot active scan on supported versions, then lists unconfigured discoveries
-observed during that completed scan. The strongest current signal is labeled
-**Near** and the remaining devices are labeled **Far**. The list is held stable
-while the user makes a selection. If active scanning is unavailable or the
-sweep fails, setup accepts only cache entries recent enough for an initial
-connection. The address is retained internally only as the stable device
+for a Bluetooth address. Opening **Add device** runs a complete ten-second
+observation window using Home Assistant's shared Bluetooth scanner and requests
+a one-shot active scan on supported versions. The integration owns the full
+deadline because Home Assistant may return early when no `AUTO` scanner can open
+an active window. Only unconfigured purifiers actually observed during that
+window are listed. The strongest current signal is labeled **Near** and the
+remaining devices are labeled **Far**. The list is held stable while the user
+makes a selection. After selection, setup waits up to ten seconds for a new
+advertisement from that specific purifier and connects immediately when it is
+received. The address is retained internally only as the stable device
 identity.
 
 ## Data updates
