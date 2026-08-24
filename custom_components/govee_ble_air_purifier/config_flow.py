@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, override
@@ -18,6 +19,8 @@ from .bluetooth import BluetoothUnavailableError
 from .const import CONF_MODEL, DOMAIN, INTEGRATION_NAME
 from .coordinator import GoveeDataUpdateCoordinator
 from .models import Model
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +83,25 @@ def _discovery_options(
         device.address: f"{device.name} ({'Near' if index == 0 else 'Far'})"
         for index, device in enumerate(discoveries)
     }
+
+
+async def _async_request_active_discovery_scan(hass: HomeAssistant) -> None:
+    """Refresh AUTO-mode scanner data without requiring a newer HA release."""
+    request_active_scan = getattr(bluetooth, "async_request_active_scan", None)
+    if request_active_scan is None:
+        _LOGGER.debug(
+            "One-shot active Bluetooth scanning is unavailable; using cached "
+            "discoveries"
+        )
+        return
+    try:
+        await request_active_scan(hass)
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.debug(
+            "One-shot active Bluetooth scan failed; using cached discoveries: %s",
+            err,
+            exc_info=True,
+        )
 
 
 async def _async_validate_purifier(
@@ -177,6 +199,9 @@ class GoveeBleAirPurifierConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Choose a currently discovered purifier without entering an address."""
+        if user_input is None:
+            await _async_request_active_discovery_scan(self.hass)
+
         errors: dict[str, str] = {}
         configured_ids = {
             entry.unique_id

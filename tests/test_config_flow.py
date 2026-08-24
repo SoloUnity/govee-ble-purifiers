@@ -12,6 +12,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.govee_ble_air_purifier import config_flow as config_flow_module
 from custom_components.govee_ble_air_purifier.config_flow import (
     _discover_purifiers,
     _discovery_options,
@@ -62,18 +63,33 @@ def _service_info(
 async def test_user_flow_selects_discovered_purifier_without_address_entry(
     hass: HomeAssistant,
 ) -> None:
-    """Manual setup chooses a named discovery and infers its model."""
+    """Manual setup scans once, chooses a discovery, and infers its model."""
     discovery = _service_info(
         "ihoment_H7129_BEDROOM",
         "AA:BB:CC:DD:EE:FF",
         -48,
     )
+    call_order: list[str] = []
+
+    async def active_scan(_: HomeAssistant) -> None:
+        call_order.append("active_scan")
+
+    def discoveries(*_: object, **__: object) -> tuple[SimpleNamespace, ...]:
+        call_order.append("discovery_cache")
+        return (discovery,)
 
     with (
+        patch.object(
+            config_flow_module.bluetooth,
+            "async_request_active_scan",
+            new_callable=AsyncMock,
+            side_effect=active_scan,
+            create=True,
+        ) as request_active_scan,
         patch(
             "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
             "async_discovered_service_info",
-            return_value=(discovery,),
+            side_effect=discoveries,
         ),
         patch(
             "custom_components.govee_ble_air_purifier.config_flow."
@@ -113,6 +129,35 @@ async def test_user_flow_selects_discovered_purifier_without_address_entry(
         model="H7129",
         name=discovery.name,
     )
+    request_active_scan.assert_awaited_once_with(hass)
+    assert call_order[:2] == ["active_scan", "discovery_cache"]
+
+
+async def test_user_flow_falls_back_to_cache_when_active_scan_fails(
+    hass: HomeAssistant,
+) -> None:
+    """A transient active-scan failure does not hide cached purifiers."""
+    discovery = _service_info("GVH7124BEDROOM", "AA:BB:CC:DD:EE:FF", -52)
+
+    with (
+        patch.object(
+            config_flow_module.bluetooth,
+            "async_request_active_scan",
+            new=AsyncMock(side_effect=RuntimeError("scanner unavailable")),
+            create=True,
+        ) as request_active_scan,
+        patch(
+            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "async_discovered_service_info",
+            return_value=(discovery,),
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    request_active_scan.assert_awaited_once_with(hass)
 
 
 async def test_user_flow_aborts_when_no_supported_device_is_visible(
