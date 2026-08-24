@@ -78,7 +78,7 @@ async def test_connect_error_preserves_underlying_bleak_detail(
     assert "stage=establish_connection" in str(
         transport.diagnostic_snapshot()["last_error"]
     )
-    assert connector_kwargs["max_attempts"] == 1
+    assert connector_kwargs["max_attempts"] == 3
 
 
 @pytest.mark.asyncio

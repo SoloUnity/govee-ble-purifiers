@@ -168,10 +168,12 @@ the Govee app is treated as a transient disconnect:
 The first runtime connection attempt can accept a cached connectable
 advertisement no more than five seconds old. After a failed route, retry requires
 newer advertisement evidence. Each advertisement wait is bounded to ten seconds,
-each GATT connection attempt to 25 seconds, and initial setup to five minutes.
-Individual setup cycles remain debug-only while that recovery window is active;
-only the final failure is returned to the setup flow. Home Assistant can then
-retry a temporarily unavailable config entry.
+each GATT connector cycle to 45 seconds, and initial setup to five minutes. A
+connector cycle permits up to three low-level attempts against the selected route
+before full cleanup, fresh-advertisement admission, and outer backoff. Individual
+setup cycles remain debug-only while that recovery window is active; only the
+final failure is returned to the setup flow. Home Assistant can then retry a
+temporarily unavailable config entry.
 
 After a purifier has connected successfully at least once, a dropped link marks
 its entities unavailable without generating a coordinator error for every
@@ -359,4 +361,4 @@ decoded ATT operation, and raw bytes.
 - [Home Assistant integration and HACS reference](home-assistant-bluetooth-integration-reference.md)
 - [License](LICENSE)
 
-Release documentation reflects integration version 0.3.16.
+Release documentation reflects integration version 0.3.17.

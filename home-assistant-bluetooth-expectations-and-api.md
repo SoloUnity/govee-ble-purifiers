@@ -411,12 +411,15 @@ and transient retry behavior. Decide whether retries occur inside one connector
 call or in the integration's outer state machine. Do not accidentally stack
 both into an unbounded retry tree.
 
-For route-sensitive or wake-up-sensitive devices, one bounded connector attempt
-per outer cycle is usually easier to reason about:
+For route-sensitive or wake-up-sensitive devices, one bounded connector call per
+outer cycle is usually easier to reason about. That call may contain a small,
+explicit number of low-level attempts when field evidence shows that a single
+attempt is too fragile:
 
 1. Wait for or select a route.
 2. Create one client.
-3. Attempt connection within a deadline.
+3. Attempt connection within one shared deadline and bounded internal retry
+   count.
 4. Clean up completely on failure.
 5. Back off.
 6. Re-resolve the route and create a new client.
@@ -764,13 +767,16 @@ The Govee purifier integration applies the general model as follows:
   wait starts validation immediately. A fresh nameless packet preserves the
   identity learned during the scan, while a conflicting supported model name is
   rejected.
-- A new connectable `BLEDevice` and new Bleak client are used per cycle.
-- A GATT connection attempt has a 25-second deadline. This allows the
-  connector's shorter internal attempt to finish before the integration's
-  outer safety deadline.
+- A new connectable `BLEDevice` is selected per outer cycle, and the connector
+  creates fresh Bleak clients as needed.
+- A GATT connector cycle permits up to three low-level attempts within one
+  45-second shared deadline. This lets weak links retry immediately without a
+  complete address cleanup, advertisement wait, and outer backoff between every
+  low-level failure.
 - A partially connecting client is explicitly disconnected on timeout.
 - Local BlueZ connections for the purifier address are closed and verified
-  before a new attempt, after a failed attempt, during shutdown, and on removal.
+  before a new outer cycle, after the connector cycle ultimately fails, during
+  shutdown, and on removal.
 - Removal does not call `async_rediscover_address()` because the integration has
   no automatic discovery flow; the user can open a new **Add device** scan.
 - A surviving address-level connection blocks a new attempt so retries cannot
