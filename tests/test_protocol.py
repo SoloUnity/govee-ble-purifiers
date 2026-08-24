@@ -188,31 +188,39 @@ def test_unrelated_notification_does_not_complete_transaction() -> None:
     assert matcher.feed(build_frame(b"\xaa\x05\x00")) is MatchResult.COMPLETE
 
 
-def test_capability_value_zero_payload_and_exact_echo_boundaries() -> None:
-    """Capability requests use their documented single-response boundaries."""
+def test_exact_echo_response_boundary() -> None:
+    """Exact-echo capability requests reject a differing payload."""
 
     requests = _protocol().initialization_requests()
-    b2_value = _protocol().new_response_matcher(requests[0])
-    b2_zero = _protocol().new_response_matcher(requests[0])
     exact_echo = _protocol().new_response_matcher(requests[8])
 
-    observed_b2 = bytes.fromhex(
-        "33 b2 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 80"
-    )
-    assert b2_value.feed(observed_b2) is MatchResult.COMPLETE
-    assert b2_zero.feed(build_frame(b"\x33\xb2")) is MatchResult.COMPLETE
     assert exact_echo.feed(build_frame(b"\xaa\x1e\x01\x03")) is MatchResult.IGNORED
     assert exact_echo.feed(requests[8].frame) is MatchResult.COMPLETE
 
 
-def test_capability_b2_rejects_unobserved_response_shapes() -> None:
-    """The physical finding does not broaden matching beyond its known shape."""
+@pytest.mark.parametrize("model", [Model.H7124, Model.H7129])
+@pytest.mark.parametrize("value", [0x00, 0x01])
+def test_capability_b2_accepts_observed_values(model: Model, value: int) -> None:
+    """Both models complete capability B2 on either observed value."""
 
-    descriptor = _protocol().initialization_requests()[0]
+    protocol = _protocol(model)
+    descriptor = protocol.initialization_requests()[0]
+    matcher = protocol.new_response_matcher(descriptor)
 
-    wrong_prefix = _protocol().new_response_matcher(descriptor)
-    unknown_value = _protocol().new_response_matcher(descriptor)
-    nonzero_tail = _protocol().new_response_matcher(descriptor)
+    assert matcher.feed(build_frame(bytes((0x33, 0xB2, value)))) is MatchResult.COMPLETE
+    assert matcher.complete
+
+
+@pytest.mark.parametrize("model", [Model.H7124, Model.H7129])
+def test_capability_b2_rejects_unobserved_response_shapes(model: Model) -> None:
+    """The observed values do not broaden matching beyond their known shape."""
+
+    protocol = _protocol(model)
+    descriptor = protocol.initialization_requests()[0]
+
+    wrong_prefix = protocol.new_response_matcher(descriptor)
+    unknown_value = protocol.new_response_matcher(descriptor)
+    nonzero_tail = protocol.new_response_matcher(descriptor)
 
     assert wrong_prefix.feed(build_frame(b"\x33\xb5\x01")) is MatchResult.IGNORED
     assert unknown_value.feed(build_frame(b"\x33\xb2\x02")) is MatchResult.IGNORED
@@ -221,17 +229,7 @@ def test_capability_b2_rejects_unobserved_response_shapes() -> None:
     invalid_checksum = bytearray(build_frame(b"\x33\xb2\x01"))
     invalid_checksum[-1] ^= 0x01
     with pytest.raises(FrameError):
-        _protocol().new_response_matcher(descriptor).feed(invalid_checksum)
-
-
-def test_h7129_capability_b2_rule_is_unchanged() -> None:
-    """The physical H7124 finding does not alter the H7129 response boundary."""
-
-    protocol = _protocol(Model.H7129)
-    descriptor = protocol.initialization_requests()[0]
-    matcher = protocol.new_response_matcher(descriptor)
-
-    assert matcher.feed(build_frame(b"\x33\xb2\x01")) is MatchResult.IGNORED
+        protocol.new_response_matcher(descriptor).feed(invalid_checksum)
 
 
 def test_power_confirmation_waits_for_applied_aa01_state() -> None:

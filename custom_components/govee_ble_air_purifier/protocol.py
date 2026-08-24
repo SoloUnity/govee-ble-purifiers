@@ -204,7 +204,11 @@ _BASE_INITIALIZATION_REQUESTS: tuple[RequestDescriptor, ...] = (
     _request(
         "capability_b2",
         b"\x33\xb2",
-        ResponseSpec(ResponseKind.ZERO_PAYLOAD, prefix=b"\x33\xb2"),
+        ResponseSpec(
+            ResponseKind.VALUE_BYTE,
+            prefix=b"\x33\xb2",
+            allowed_values=(0x00, 0x01),
+        ),
     ),
     _request(
         "capability_b5",
@@ -249,21 +253,6 @@ _BASE_INITIALIZATION_REQUESTS: tuple[RequestDescriptor, ...] = (
     ),
 )
 
-_H7124_CAPABILITY_B2_REQUEST = _request(
-    "capability_b2",
-    b"\x33\xb2",
-    ResponseSpec(
-        ResponseKind.VALUE_BYTE,
-        prefix=b"\x33\xb2",
-        allowed_values=(0x00, 0x01),
-    ),
-)
-
-_H7124_INITIALIZATION_REQUESTS = (
-    _H7124_CAPABILITY_B2_REQUEST,
-    *_BASE_INITIALIZATION_REQUESTS[1:],
-)
-
 _H7129_METADATA_REQUEST = _request(
     "metadata_02_02_00_01",
     b"\xab\x02\x02\x00\x01",
@@ -288,7 +277,7 @@ class GoveePurifierProtocol:
 
         if self.profile.model.value == "H7129":
             return _BASE_INITIALIZATION_REQUESTS + (_H7129_METADATA_REQUEST,)
-        return _H7124_INITIALIZATION_REQUESTS
+        return _BASE_INITIALIZATION_REQUESTS
 
     def refresh_requests(self) -> tuple[RequestDescriptor, ...]:
         """Return the documented short sweep triggered by active-session ``ee aa``."""
