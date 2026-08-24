@@ -213,6 +213,7 @@ class ReliablePurifierClient:
         if channel is not None:
             channel.invalidate()
         await self._transport.async_disconnect()
+        await self._transport.async_cleanup_stale_connection(reason="shutdown")
         await self._environment.async_stop()
         if active_operation is not None and not active_operation.future.done():
             active_operation.future.set_exception(
@@ -284,6 +285,9 @@ class ReliablePurifierClient:
                 if channel is not None:
                     channel.invalidate()
                 await self._transport.async_disconnect()
+                await self._transport.async_cleanup_stale_connection(
+                    reason="connection_cycle_end"
+                )
 
             if self._stopping.is_set():
                 break

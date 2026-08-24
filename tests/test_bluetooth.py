@@ -3,6 +3,7 @@
 import asyncio
 import time
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -13,6 +14,22 @@ from custom_components.govee_ble_air_purifier.bluetooth import (
     HomeAssistantBluetoothEnvironment,
     exception_chain_detail,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_bluez_connections(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep transport tests independent from the host Bluetooth stack."""
+
+    async def close_address(_: str) -> None:
+        return
+
+    async def no_connected_devices(_: object) -> list[object]:
+        return []
+
+    monkeypatch.setattr(
+        bluetooth_module, "close_stale_connections_by_address", close_address
+    )
+    monkeypatch.setattr(bluetooth_module, "get_connected_devices", no_connected_devices)
 
 
 def test_exception_chain_detail_preserves_nested_causes() -> None:
@@ -103,6 +120,7 @@ async def test_connection_deadline_cleans_partial_client_and_records_attempts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A stuck BlueZ attempt is released before a fresh-route retry."""
+    address_cleanups: list[str] = []
 
     class FakeClient:
         def __init__(self, *_: object, **__: object) -> None:
@@ -121,8 +139,18 @@ async def test_connection_deadline_cleans_partial_client_and_records_attempts(
         client_class(device)  # type: ignore[operator]
         await asyncio.Event().wait()
 
+    async def close_address(address: str) -> None:
+        address_cleanups.append(address)
+
+    async def no_connected_devices(_: object) -> list[object]:
+        return []
+
     monkeypatch.setattr(bluetooth_module, "BleakClientWithServiceCache", FakeClient)
     monkeypatch.setattr(bluetooth_module, "establish_connection", hang_connection)
+    monkeypatch.setattr(
+        bluetooth_module, "close_stale_connections_by_address", close_address
+    )
+    monkeypatch.setattr(bluetooth_module, "get_connected_devices", no_connected_devices)
     monkeypatch.setattr(bluetooth_module, "CONNECTION_ATTEMPT_TIMEOUT", 0.01)
     transport = GattTransport(name="Bedroom purifier")
     device = SimpleNamespace(
@@ -138,6 +166,7 @@ async def test_connection_deadline_cleans_partial_client_and_records_attempts(
 
     assert len(clients) == 2
     assert [client.disconnect_calls for client in clients] == [1, 1]
+    assert address_cleanups == [device.address] * 4
     diagnostics = transport.diagnostic_snapshot()
     assert diagnostics["connecting_client_present"] is False
     failures = diagnostics["recent_connection_failures"]
@@ -145,6 +174,64 @@ async def test_connection_deadline_cleans_partial_client_and_records_attempts(
     assert len(failures) == 2
     assert "attempt=1" in failures[0]
     assert "attempt=2" in failures[1]
+
+
+@pytest.mark.asyncio
+async def test_surviving_bluez_connection_blocks_new_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry cannot consume another slot while BlueZ retains the address."""
+    connector_called = False
+
+    async def close_address(_: str) -> None:
+        return
+
+    async def still_connected(device: object) -> list[object]:
+        return [device]
+
+    async def unexpected_connector(*_: object, **__: object) -> None:
+        nonlocal connector_called
+        connector_called = True
+
+    monkeypatch.setattr(
+        bluetooth_module, "close_stale_connections_by_address", close_address
+    )
+    monkeypatch.setattr(bluetooth_module, "get_connected_devices", still_connected)
+    monkeypatch.setattr(bluetooth_module, "establish_connection", unexpected_connector)
+    monkeypatch.setattr(bluetooth_module, "STALE_CONNECTION_CLEANUP_TIMEOUT", 0.01)
+    transport = GattTransport(name="Bedroom purifier")
+    device = SimpleNamespace(
+        address="AA:BB:CC:DD:EE:FF",
+        name="ihoment_H7129_TEST",
+    )
+
+    with pytest.raises(BluetoothUnavailableError) as raised:
+        await transport.async_connect(device)  # type: ignore[arg-type]
+
+    assert "Refusing to connect" in str(raised.value)
+    assert connector_called is False
+    diagnostics = transport.diagnostic_snapshot()
+    assert diagnostics["connection_attempts"] == 0
+    assert diagnostics["address_cleanup_failures"] == 1
+    assert diagnostics["last_address_cleanup_remaining_connections"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_cleanup_never_disconnects_healthy_owned_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defensive cleanup cannot tear down the transport's ready connection."""
+    close_address = AsyncMock()
+    monkeypatch.setattr(
+        bluetooth_module, "close_stale_connections_by_address", close_address
+    )
+    transport = GattTransport(name="Bedroom purifier")
+    transport._client = SimpleNamespace(is_connected=True)  # type: ignore[assignment]
+
+    cleaned = await transport.async_cleanup_stale_connection(reason="test")
+
+    assert cleaned is False
+    close_address.assert_not_awaited()
 
 
 def test_route_diagnostics_reports_advertisement_age(

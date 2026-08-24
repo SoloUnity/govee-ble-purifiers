@@ -12,7 +12,12 @@ from typing import Any
 
 from bleak.backends.device import BLEDevice
 from bleak.backends.service import BleakGATTServiceCollection
-from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
+from bleak_retry_connector import (
+    BleakClientWithServiceCache,
+    close_stale_connections_by_address,
+    establish_connection,
+    get_connected_devices,
+)
 from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant
 
@@ -25,6 +30,8 @@ COMMAND_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b11"
 CONNECT_ATTEMPTS = 1
 CONNECTION_ATTEMPT_TIMEOUT = 15.0
 CONNECTION_ABORT_TIMEOUT = 5.0
+STALE_CONNECTION_CLEANUP_TIMEOUT = 5.0
+STALE_CONNECTION_CHECK_INTERVAL = 0.25
 RECENT_CONNECTION_FAILURE_LIMIT = 4
 ADVERTISEMENT_CHECK_INTERVAL = 0.25
 
@@ -61,6 +68,16 @@ class BluetoothUnavailableError(ConnectionError):
 
 class GattTransportError(ConnectionError):
     """Raised when a GATT operation cannot be completed."""
+
+
+async def async_close_stale_connections(address: str, *, reason: str) -> None:
+    """Close local BlueZ connections for an address through HA's BLE library."""
+    _LOGGER.debug(
+        "Closing stale Bluetooth connections by address: address=%s reason=%s",
+        address,
+        reason,
+    )
+    await close_stale_connections_by_address(address)
 
 
 class HomeAssistantBluetoothEnvironment:
@@ -367,6 +384,7 @@ class GattTransport:
         self._client: BleakClientWithServiceCache | None = None
         self._connecting_client: BleakClientWithServiceCache | None = None
         self._connecting_address: str | None = None
+        self._last_device: BLEDevice | None = None
         self._notify_characteristic: Any = None
         self._command_characteristic: Any = None
         self._notification_callback: NotificationCallback | None = None
@@ -388,6 +406,13 @@ class GattTransport:
         self._recent_connection_failures: deque[str] = deque(
             maxlen=RECENT_CONNECTION_FAILURE_LIMIT
         )
+        self._address_cleanup_attempts = 0
+        self._address_cleanup_successes = 0
+        self._address_cleanup_failures = 0
+        self._last_address_cleanup_reason: str | None = None
+        self._last_address_cleanup_error: str | None = None
+        self._last_address_cleanup_elapsed: float | None = None
+        self._last_address_cleanup_remaining: int | None = None
 
     @property
     def generation(self) -> int:
@@ -415,6 +440,17 @@ class GattTransport:
             "last_disconnect_elapsed_seconds": self._last_disconnect_elapsed,
             "connecting_client_present": self._connecting_client is not None,
             "recent_connection_failures": list(self._recent_connection_failures),
+            "address_cleanup_attempts": self._address_cleanup_attempts,
+            "address_cleanup_successes": self._address_cleanup_successes,
+            "address_cleanup_failures": self._address_cleanup_failures,
+            "last_address_cleanup_reason": self._last_address_cleanup_reason,
+            "last_address_cleanup_error": self._last_address_cleanup_error,
+            "last_address_cleanup_elapsed_seconds": (
+                self._last_address_cleanup_elapsed
+            ),
+            "last_address_cleanup_remaining_connections": (
+                self._last_address_cleanup_remaining
+            ),
         }
 
     def _set_stage(self, stage: str) -> None:
@@ -449,8 +485,6 @@ class GattTransport:
         """Release a partially established client before another route is tried."""
         client = self._connecting_client
         address = self._connecting_address
-        self._connecting_client = None
-        self._connecting_address = None
         if client is None:
             return
 
@@ -477,6 +511,81 @@ class GattTransport:
         finally:
             self._set_stage("connection_aborted")
 
+    async def async_cleanup_stale_connection(self, *, reason: str) -> bool:
+        """Close and verify local BlueZ state without touching a healthy client."""
+        if self.is_connected:
+            self._last_address_cleanup_reason = reason
+            self._last_address_cleanup_error = "owned client is still connected"
+            self._last_address_cleanup_remaining = None
+            _LOGGER.debug(
+                "Skipping stale Bluetooth cleanup for %s: reason=%s "
+                "owned_client_connected=True",
+                self.name,
+                reason,
+            )
+            return False
+
+        device = self._last_device
+        address = device.address if device is not None else self._connecting_address
+        if address is None:
+            return True
+
+        self._address_cleanup_attempts += 1
+        self._last_address_cleanup_reason = reason
+        self._last_address_cleanup_error = None
+        self._last_address_cleanup_remaining = None
+        started = time.monotonic()
+        try:
+            async with asyncio.timeout(STALE_CONNECTION_CLEANUP_TIMEOUT):
+                await async_close_stale_connections(address, reason=reason)
+                if device is not None:
+                    deadline = time.monotonic() + STALE_CONNECTION_CLEANUP_TIMEOUT
+                    while True:
+                        connected_devices = await get_connected_devices(device)
+                        remaining = len(connected_devices)
+                        self._last_address_cleanup_remaining = remaining
+                        if remaining == 0:
+                            break
+                        if time.monotonic() >= deadline:
+                            raise BluetoothUnavailableError(
+                                f"BlueZ still reports {remaining} connection(s) "
+                                f"for {address}"
+                            )
+                        await asyncio.sleep(STALE_CONNECTION_CHECK_INTERVAL)
+        except Exception as err:
+            self._address_cleanup_failures += 1
+            self._last_address_cleanup_error = exception_detail(err)
+            self._last_address_cleanup_elapsed = round(
+                max(0.0, time.monotonic() - started), 3
+            )
+            _LOGGER.debug(
+                "Stale Bluetooth cleanup failed for %s at %s: reason=%s "
+                "elapsed=%.3fs remaining=%s cause=%s",
+                self.name,
+                address,
+                reason,
+                self._last_address_cleanup_elapsed,
+                self._last_address_cleanup_remaining,
+                self._last_address_cleanup_error,
+                exc_info=True,
+            )
+            return False
+
+        self._address_cleanup_successes += 1
+        self._last_address_cleanup_elapsed = round(
+            max(0.0, time.monotonic() - started), 3
+        )
+        self._connecting_client = None
+        self._connecting_address = None
+        _LOGGER.debug(
+            "Stale Bluetooth cleanup complete for %s at %s: reason=%s " "elapsed=%.3fs",
+            self.name,
+            address,
+            reason,
+            self._last_address_cleanup_elapsed,
+        )
+        return True
+
     def set_disconnect_callback(self, callback: DisconnectCallback | None) -> None:
         """Set the callback invoked for an unexpected current disconnect."""
         self._disconnect_callback = callback
@@ -484,6 +593,15 @@ class GattTransport:
     async def async_connect(self, device: BLEDevice) -> int:
         """Create and connect a fresh Bleak client."""
         await self.async_disconnect()
+        self._last_device = device
+        await self._async_abort_connecting_client()
+        if not await self.async_cleanup_stale_connection(reason="before_connection"):
+            raise BluetoothUnavailableError(
+                f"Refusing to connect to {self.name} at {device.address} while "
+                "a stale local Bluetooth connection may remain; "
+                f"cleanup_error={self._last_address_cleanup_error}; "
+                f"remaining={self._last_address_cleanup_remaining}"
+            )
         self._generation += 1
         generation = self._generation
         self._loop = asyncio.get_running_loop()
@@ -531,8 +649,17 @@ class GattTransport:
                 f"pre_return_disconnects={self._pre_return_disconnects}; "
                 "cause=TimeoutError: connection attempt deadline exceeded"
             )
-            self._record_connection_failure(detail)
             await self._async_abort_connecting_client()
+            cleanup_ok = await self.async_cleanup_stale_connection(
+                reason="connection_timeout"
+            )
+            if not cleanup_ok:
+                detail = (
+                    f"{detail}; address_cleanup_error="
+                    f"{self._last_address_cleanup_error}; "
+                    f"remaining={self._last_address_cleanup_remaining}"
+                )
+            self._record_connection_failure(detail)
             _LOGGER.debug(
                 "Bluetooth connection attempt timed out for %s at %s "
                 "generation=%d: %s",
@@ -548,11 +675,21 @@ class GattTransport:
             ) from err
         except asyncio.CancelledError:
             await self._async_abort_connecting_client()
+            await self.async_cleanup_stale_connection(reason="connection_cancelled")
             raise
         except Exception as err:
             detail = self._failure_summary(err)
-            self._record_connection_failure(detail)
             await self._async_abort_connecting_client()
+            cleanup_ok = await self.async_cleanup_stale_connection(
+                reason="connection_failed"
+            )
+            if not cleanup_ok:
+                detail = (
+                    f"{detail}; address_cleanup_error="
+                    f"{self._last_address_cleanup_error}; "
+                    f"remaining={self._last_address_cleanup_remaining}"
+                )
+            self._record_connection_failure(detail)
             _LOGGER.debug(
                 "Bluetooth connection failed for %s at %s generation=%d: %s",
                 self.name,

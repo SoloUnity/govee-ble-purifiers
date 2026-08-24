@@ -63,6 +63,9 @@ class FakeTransport:
     async def async_disconnect(self) -> None:
         self.disconnects += 1
 
+    async def async_cleanup_stale_connection(self, *, reason: str) -> bool:
+        return True
+
     def diagnostic_snapshot(self) -> dict[str, object]:
         return {"generation": self.generation, "is_connected": False}
 

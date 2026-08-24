@@ -83,10 +83,13 @@ On supported Home Assistant versions, failures also include the platform's
 connection reachability and proxy-slot diagnosis. Setup cleanup preserves the
 last meaningful failure instead of replacing it with a generic disconnected
 message. Each BLE connection attempt has a 15-second deadline; an incomplete
-client is explicitly disconnected before the integration waits for another
-live advertisement and retries through a freshly resolved route. The setup
-window permits at least two complete advertisement-and-connection attempts and
-retains a bounded history of recent connection failures.
+client is explicitly disconnected and local BlueZ connections for its address
+are closed and verified before the integration waits for another live
+advertisement and retries through a freshly resolved route. A surviving stale
+connection blocks the next attempt instead of consuming another adapter slot.
+The setup window permits at least two complete advertisement-and-connection
+attempts and retains a bounded history of recent connection and cleanup
+failures.
 
 For frame-by-frame diagnostics, add this to `configuration.yaml` and restart
 Home Assistant:
@@ -124,6 +127,12 @@ python3 scripts/extract_air_purifier_trace.py \
 The source capture is read-only. The output retains original PacketLogger
 record numbers, absolute and connection-relative timestamps, direction,
 connection handle, L2CAP channel, decoded ATT operation, and raw bytes.
+
+## Developer references
+
+- [Govee purifier protocol](govee-ble-air-purifier-protocol.md)
+- [Home Assistant Bluetooth expectations, APIs, and reliable handling](home-assistant-bluetooth-expectations-and-api.md)
+- [Home Assistant integration and HACS reference](home-assistant-bluetooth-integration-reference.md)
 
 ## Removal
 
