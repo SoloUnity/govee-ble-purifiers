@@ -779,6 +779,10 @@ async def test_fan_failure_preserves_wire_diagnostics_across_reconnect() -> None
         assert callable(on_send)
         on_send()
         if calls == 1:
+            client._on_plaintext_frame(
+                4,
+                build_frame(bytes.fromhex("3a 05 01 03")),
+            )
             client._on_plaintext_frame(4, build_frame(bytes.fromhex("ee 05 01 03")))
         raise client_module.TransactionTimeoutError(
             "received=1, matched_fragments=0, ignored=1, "
@@ -793,7 +797,7 @@ async def test_fan_failure_preserves_wire_diagnostics_across_reconnect() -> None
     assert calls == 3
     assert operation.send_attempts == 3
     assert len(operation.response_failures) == 3
-    assert len(operation.observed_fan_frames) == 1
+    assert len(operation.observed_fan_frames) == 2
 
     # The command survives the recovery connection and then reports why its
     # already-bounded sends could not be confirmed.
@@ -809,9 +813,62 @@ async def test_fan_failure_preserves_wire_diagnostics_across_reconnect() -> None
     assert "sends=3/3" in summary
     assert "generation=4" in summary
     assert "ignored_sample=ee 05 01 03" in summary
+    assert "observed_fan_frames=" in summary
+    assert "role=command_echo" in summary
+    assert "matches_request=False" in summary
+    assert "role=physical_update" in summary
     assert "decoded_mode=high" in summary
     assert "current_generation=5" in summary
     assert client.diagnostic_snapshot()["last_command_diagnostics"] == summary
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", [Model.H7124, Model.H7129])
+async def test_fan_echo_confirms_state_without_retry(model: Model) -> None:
+    """The first exact fan echo completes the command and publishes its mode."""
+
+    client = make_client()
+    client._profile = DeviceProfile.for_model(model)
+    client._protocol = GoveePurifierProtocol(client._profile)
+    published: list[PurifierState] = []
+    client._state_callback = published.append
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[None] = loop.create_future()
+    operation = _Operation(
+        SetFanMode(FanMode.HIGH),
+        future,
+        loop.time() + 30,
+        created_at=loop.time(),
+    )
+    calls = 0
+
+    async def acknowledge(
+        descriptor: RequestDescriptor,
+        **kwargs: object,
+    ) -> tuple[bytes, ...]:
+        nonlocal calls
+        calls += 1
+        on_send = kwargs["on_send"]
+        assert callable(on_send)
+        on_send()
+        matcher = client._protocol.new_response_matcher(descriptor)
+        assert matcher.feed(descriptor.frame) is client_module.MatchResult.COMPLETE
+        return matcher.frames
+
+    client._async_execute_descriptor = acknowledge  # type: ignore[method-assign]
+
+    await client._async_execute_operation(operation)
+
+    assert calls == 1
+    assert operation.send_attempts == 1
+    assert future.done()
+    assert future.exception() is None
+    assert client.state.fan_mode is FanMode.HIGH
+    assert published[-1].fan_mode is FanMode.HIGH
+
+    client._process_plaintext_frame(build_frame(b"\xee\x05\x01\x01"))
+    assert client.state.fan_mode is FanMode.LOW
+    assert published[-1].fan_mode is FanMode.LOW
 
 
 @pytest.mark.asyncio

@@ -728,10 +728,20 @@ class ReliablePurifierClient:
                 self._queue_operation_for_reconciliation(operation)
                 raise
             else:
+                self._apply_confirmed_command(operation.command)
                 if not operation.future.done():
                     operation.future.set_result(None)
                 self._last_command_diagnostics = None
                 return
+
+    def _apply_confirmed_command(self, command: ProtocolCommand) -> None:
+        """Publish state established by a documented command acknowledgement."""
+        if (
+            isinstance(command, SetFanMode)
+            and self.state.fan_mode is not command.mode
+        ):
+            self.state = replace(self.state, fan_mode=command.mode)
+            self._state_callback(self.state)
 
     async def _async_run_refresh(
         self, descriptors: tuple[RequestDescriptor, ...]
@@ -1079,7 +1089,7 @@ class ReliablePurifierClient:
             f"sends={operation.send_attempts}/{COMMAND_SEND_ATTEMPTS}; "
             f"send_timeline={sends or 'none'}; "
             f"response_failures={failures or 'none'}; "
-            f"observed_ee05={fan_frames or 'none'}; "
+            f"observed_fan_frames={fan_frames or 'none'}; "
             f"current_generation={self._session_generation}; "
             f"cached_fan_mode={cached_fan_mode}"
         )
@@ -1095,7 +1105,7 @@ class ReliablePurifierClient:
         return CommandDeadlineExceeded(summary)
 
     def _pending_fan_operation(self) -> _Operation | None:
-        """Return the fan command to which an ee-05 frame may be relevant."""
+        """Return the fan command to which a fan response may be relevant."""
         active = self._active_operation
         if (
             active is not None
@@ -1114,21 +1124,32 @@ class ReliablePurifierClient:
         )
 
     def _record_fan_frame_diagnostic(self, generation: int, frame: bytes) -> None:
-        """Correlate authoritative fan notifications with a pending command."""
-        if not frame.startswith(b"\xee\x05"):
+        """Correlate fan acknowledgements and notifications with a command."""
+        if not frame.startswith((b"\x3a\x05", b"\xee\x05")):
             return
         operation = self._pending_fan_operation()
         if operation is None:
             return
 
         mode: str | None = None
-        try:
-            event = self._protocol.decode(frame)
-        except Exception as err:  # noqa: BLE001 - diagnostics must not drop a frame
-            mode = f"decode_error:{type(err).__name__}"
+        if frame.startswith(b"\x3a\x05"):
+            role = "command_echo"
+            matches_request = (
+                frame
+                == self._protocol.command_request(operation.command).frame
+            )
+            if matches_request:
+                mode = operation.command.mode.value
         else:
-            if isinstance(event, FanModeEvent) and event.mode is not None:
-                mode = event.mode.value
+            role = "physical_update"
+            matches_request = False
+            try:
+                event = self._protocol.decode(frame)
+            except Exception as err:  # noqa: BLE001 - diagnostics must not drop a frame
+                mode = f"decode_error:{type(err).__name__}"
+            else:
+                if isinstance(event, FanModeEvent) and event.mode is not None:
+                    mode = event.mode.value
 
         loop = asyncio.get_running_loop()
         elapsed = (
@@ -1137,6 +1158,7 @@ class ReliablePurifierClient:
         phase = self._active_request or self.status.value
         detail = (
             f"generation={generation},elapsed={elapsed:.3f}s,phase={phase},"
+            f"role={role},matches_request={matches_request},"
             f"decoded_mode={mode},frame={frame.hex(' ')}"
         )
         operation.observed_fan_frames.append(detail)

@@ -241,8 +241,16 @@ commands are never replayed after their deadline or beyond their send budget.
 If a command remains unconfirmed, its final Home Assistant error retains the
 requested plaintext frame, each send's connection generation and timing, the
 three response-timeout summaries with ignored-frame samples, and any `ee 05`
-fan notification observed during or after the transaction. This bounded
-evidence survives the recovery reconnect that follows an ambiguous write.
+physical update or `3a 05` command echo observed during or after the
+transaction. This bounded evidence survives the recovery reconnect that
+follows an ambiguous write.
+
+Fan controls complete when the purifier returns the exact 20-byte `3a 05`
+command frame. This acknowledgement immediately publishes the requested mode
+and prevents unnecessary retries or reconnects. A different `3a 05` frame is
+ignored. Unsolicited `ee 05` frames continue to report physical fan-mode changes
+and may replace the acknowledged mode at any time. H7124 matches these frames
+directly; H7129 applies the same rules after decrypting them.
 
 Cleanup runs before config-entry setup, before a new connection, after a failed
 connection cycle, during shutdown/unload, and after entry removal. Removal does
@@ -251,8 +259,9 @@ not request Bluetooth rediscovery because automatic discovery is disabled.
 ## State and protocol limitations
 
 - The protocol exposes no authoritative fan-mode query. Fan mode is known after
-  Home Assistant sets it or receives an `ee 05` notification, and it becomes
-  unknown during reconnection until reported again.
+  an exact acknowledgement of a Home Assistant `3a 05` command or receipt of an
+  unsolicited `ee 05` physical update. It becomes unknown during reconnection
+  until reported again.
 - Some H7129 RGB responses acknowledge a query or command without proving the
   colour currently displayed. The last authoritative colour is retained, and
   ambiguous RGB commands are not treated as safely reconciled from cached state.
@@ -427,4 +436,4 @@ decoded ATT operation, and raw bytes.
 - [Home Assistant integration and HACS reference](home-assistant-bluetooth-integration-reference.md)
 - [License](LICENSE)
 
-Release documentation reflects integration version 0.3.24.
+Release documentation reflects integration version 0.3.25.

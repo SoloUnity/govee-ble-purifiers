@@ -881,14 +881,20 @@ The Govee purifier integration applies the general model as follows:
   startup state is checked before any replay. An ambiguous command that has
   exhausted its send budget may still be confirmed by that state check, but it
   is never sent a fourth time.
+- Fan controls accept the exact 20-byte `3a 05` command echo as acknowledgement
+  for both models. The acknowledged mode is published immediately, a different
+  `3a 05` frame is ignored, and unsolicited `ee 05` physical updates remain
+  authoritative afterward. H7129 uses these same plaintext rules after session
+  decryption.
 - Physical-control notifications update cached state without waiting for a poll.
 - Diagnostics retain recent connection failures, Home Assistant reachability,
   essential initialization batch/attempt counts, and GATT operation deadline,
   timeout, cancellation, and elapsed-time information. They also expose command
   queue/attempt state and refresh preemption/resume state. An unconfirmed
   command carries its bounded send timeline and response evidence across the
-  recovery reconnect, and fan controls correlate any observed `ee 05` frame
-  with its decoded mode, connection generation, transaction phase, and timing.
+  recovery reconnect, and fan controls correlate observed `3a 05` command
+  echoes and `ee 05` physical updates with their role, decoded mode, connection
+  generation, transaction phase, and timing.
 
 These values are project policy based on the purifier traces and reliability
 goals. They are not universal Home Assistant constants.

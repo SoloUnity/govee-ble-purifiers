@@ -327,6 +327,35 @@ def test_power_confirmation_waits_for_applied_aa01_state() -> None:
     assert matcher.feed(build_frame(b"\xaa\x01\x01")) is MatchResult.COMPLETE
 
 
+@pytest.mark.parametrize("model", [Model.H7124, Model.H7129])
+@pytest.mark.parametrize("mode", list(FanMode))
+def test_fan_command_accepts_only_its_exact_echo(model: Model, mode: FanMode) -> None:
+    """Both plaintext and decrypted sessions use the exact 3a-05 acknowledgement."""
+
+    protocol = _protocol(model)
+    descriptor = protocol.command_request(SetFanMode(mode))
+    matcher = protocol.new_response_matcher(descriptor)
+
+    assert matcher.feed(descriptor.frame) is MatchResult.COMPLETE
+    assert matcher.feed(descriptor.frame) is MatchResult.IGNORED
+
+
+@pytest.mark.parametrize("model", [Model.H7124, Model.H7129])
+def test_fan_command_rejects_a_different_mode_echo(model: Model) -> None:
+    """A stale or unrelated 3a-05 echo cannot confirm the pending mode."""
+
+    protocol = _protocol(model)
+    matcher = protocol.new_response_matcher(
+        protocol.command_request(SetFanMode(FanMode.HIGH))
+    )
+
+    assert (
+        matcher.feed(protocol.encode(SetFanMode(FanMode.MEDIUM)))
+        is MatchResult.IGNORED
+    )
+    assert matcher.feed(build_frame(b"\xee\x05\x01\x03")) is MatchResult.COMPLETE
+
+
 @pytest.mark.parametrize(
     ("mode", "notification"),
     [

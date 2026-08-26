@@ -66,6 +66,7 @@ class ResponseSpec:
     prefix: bytes = b""
     selector: bytes = b""
     exact: bytes = b""
+    exact_alternatives: tuple[bytes, ...] = ()
     fragments: tuple[int, ...] = ()
     allowed_prefixes: tuple[bytes, ...] = ()
     expected_fields: tuple[tuple[int, int], ...] = ()
@@ -124,7 +125,9 @@ class ResponseMatcher:
         )
         spec = self.descriptor.response
 
-        if spec.kind is ResponseKind.EXACT:
+        if data in spec.exact_alternatives:
+            matched = True
+        elif spec.kind is ResponseKind.EXACT:
             matched = data == spec.exact
         elif spec.kind is ResponseKind.VALUE_BYTE:
             matched = (
@@ -320,10 +323,11 @@ class GoveePurifierProtocol:
         """Build a transaction descriptor for a typed query or control.
 
         Power deliberately waits for matching ``aa 01`` applied state rather
-        than completing on a ``33 01`` echo.  Fan mode uses matching ``ee 05``
-        because it is the authoritative mode update.  A night-light RGB
-        ``3a`` echo is the strongest documented response, but it remains an
-        acknowledgement rather than independent displayed-color confirmation.
+        than completing on a ``33 01`` echo. Fan mode accepts either the exact
+        ``3a 05`` command acknowledgement or a matching unsolicited ``ee 05``
+        mode update. A night-light RGB ``3a`` echo is the strongest documented
+        response, but it remains an acknowledgement rather than independent
+        displayed-color confirmation.
         """
 
         frame = self.encode(command)
@@ -354,6 +358,7 @@ class GoveePurifierProtocol:
                 fan_fields = ((2, frame[2]),)
             response = ResponseSpec(
                 ResponseKind.FIELDS,
+                exact_alternatives=(frame,),
                 allowed_prefixes=(b"\xee\x05",),
                 expected_fields=fan_fields,
             )
