@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
@@ -55,7 +56,7 @@ ESSENTIAL_INITIALIZATION_MAX_BATCHES = 3
 INITIALIZATION_RETRY_DELAY = 3.0
 PERIODIC_POLL_ATTEMPTS = 3
 REFRESH_ATTEMPTS = 3
-COMMAND_DEADLINE = 30.0
+COMMAND_DEADLINE = 120.0
 COMMAND_SEND_ATTEMPTS = 3
 STARTUP_TIMEOUT = 300.0
 FRESH_ADVERTISEMENT_TIMEOUT = 10.0
@@ -63,6 +64,7 @@ BETWEEN_REQUEST_DELAY = 0.001
 BACKOFF_MIN = 1.0
 BACKOFF_MAX = 60.0
 RECENT_ADVERTISEMENT_BACKOFF_MAX = 8.0
+ADVERTISEMENT_RECOVERY_COOLDOWN = 1.0
 BACKOFF_RESET_AFTER = 30.0
 
 StateCallback = Callable[[PurifierState], None]
@@ -1165,6 +1167,9 @@ class ReliablePurifierClient:
                 return
 
     async def _async_backoff(self, delay: float) -> None:
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        advertisement_cutoff = time.monotonic()
         jittered_delay = delay * random.uniform(0.8, 1.2)
         _LOGGER.debug(
             "Bluetooth recovery backoff: base=%.1fs jittered=%.3fs next_max=%.1fs",
@@ -1172,8 +1177,56 @@ class ReliablePurifierClient:
             jittered_delay,
             BACKOFF_MAX,
         )
+        stop_task = asyncio.create_task(self._stopping.wait())
+        operation_task = asyncio.create_task(self._operation_event.wait())
+        advertisement_task = asyncio.create_task(
+            self._environment.async_wait_for_advertisement_after(
+                advertisement_cutoff
+            )
+        )
+        tasks = (stop_task, operation_task, advertisement_task)
         try:
-            async with asyncio.timeout(jittered_delay):
-                await self._stopping.wait()
-        except TimeoutError:
-            pass
+            done, _ = await asyncio.wait(
+                tasks,
+                timeout=jittered_delay,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                reason = "scheduled_delay"
+            elif stop_task in done and stop_task.result():
+                reason = "shutdown"
+            elif operation_task in done and operation_task.result():
+                reason = "queued_command"
+                # Consume this wake edge. The operation itself remains in the
+                # queue, so another failed connection cannot busy-loop merely
+                # because the same command is still pending.
+                self._operation_event.clear()
+            else:
+                reason = "fresh_advertisement"
+                cooldown = max(
+                    0.0,
+                    ADVERTISEMENT_RECOVERY_COOLDOWN - (loop.time() - started),
+                )
+                if cooldown:
+                    # Give BlueZ a brief settling period after the advertisement,
+                    # but never hold a shutdown or user command behind it.
+                    done, _ = await asyncio.wait(
+                        (stop_task, operation_task),
+                        timeout=cooldown,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if stop_task in done and stop_task.result():
+                        reason = "shutdown"
+                    elif operation_task in done and operation_task.result():
+                        reason = "queued_command"
+                        self._operation_event.clear()
+            _LOGGER.debug(
+                "Bluetooth recovery backoff ended: reason=%s elapsed=%.3fs",
+                reason,
+                loop.time() - started,
+            )
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)

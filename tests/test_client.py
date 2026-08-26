@@ -39,6 +39,7 @@ class FakeEnvironment:
 
     def __init__(self) -> None:
         self.recent_advertisement = False
+        self.advertisement_event = asyncio.Event()
 
     async def async_start(self) -> None:
         return
@@ -51,6 +52,9 @@ class FakeEnvironment:
 
     def has_recent_advertisement(self, _: float) -> bool:
         return self.recent_advertisement
+
+    async def async_wait_for_advertisement_after(self, _: float) -> None:
+        await self.advertisement_event.wait()
 
     async def async_wait_for_fresh_device(self, _: float) -> SimpleNamespace:
         return SimpleNamespace(
@@ -144,6 +148,12 @@ def test_explicit_validation_budget_is_five_minutes() -> None:
 
     assert client_module.STARTUP_TIMEOUT >= two_cycle_budget
     assert client_module.STARTUP_TIMEOUT == 300.0
+
+
+def test_command_recovery_budget_handles_slow_encrypted_reconnect() -> None:
+    """Controls remain pending through a poor-signal reconnect and negotiation."""
+    assert client_module.COMMAND_DEADLINE == 120.0
+    assert client_module.COMMAND_SEND_ATTEMPTS == 3
 
 
 @pytest.mark.asyncio
@@ -355,6 +365,60 @@ def test_recent_advertisements_cap_recovery_backoff() -> None:
 
     environment.recent_advertisement = False  # type: ignore[attr-defined]
     assert client._recovery_backoff_delay(60.0) == 60.0
+
+
+@pytest.mark.asyncio
+async def test_new_advertisement_wakes_long_recovery_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh radio evidence bypasses a minute-long scheduled recovery delay."""
+    monkeypatch.setattr(client_module.random, "uniform", lambda *_: 1.0)
+    monkeypatch.setattr(client_module, "ADVERTISEMENT_RECOVERY_COOLDOWN", 0.0)
+    client = make_client()
+    environment = client._environment
+
+    backoff = asyncio.create_task(client._async_backoff(60.0))
+    await asyncio.sleep(0)
+    environment.advertisement_event.set()  # type: ignore[attr-defined]
+
+    await asyncio.wait_for(backoff, timeout=0.1)
+
+
+@pytest.mark.asyncio
+async def test_queued_command_wakes_recovery_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user control never waits behind the current exponential delay."""
+    monkeypatch.setattr(client_module.random, "uniform", lambda *_: 1.0)
+    client = make_client()
+
+    backoff = asyncio.create_task(client._async_backoff(60.0))
+    await asyncio.sleep(0)
+    client._operation_event.set()
+
+    await asyncio.wait_for(backoff, timeout=0.1)
+    assert not client._operation_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_failure_before_command_send_does_not_spend_send_budget() -> None:
+    """Connection/channel recovery never counts as an application send."""
+    client = make_client()
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[None] = loop.create_future()
+    operation = _Operation(SetPower(True), future, loop.time() + 120)
+
+    async def fail_before_send(*_: object, **__: object) -> tuple[bytes, ...]:
+        raise GattTransportError("session dropped before command write")
+
+    client._async_execute_descriptor = fail_before_send  # type: ignore[method-assign]
+
+    with pytest.raises(GattTransportError, match="before command write"):
+        await client._async_execute_operation(operation)
+
+    assert operation.send_attempts == 0
+    assert not future.done()
+    assert client._operations.popleft() is operation
 
 
 def test_duplicate_unavailable_updates_are_suppressed() -> None:

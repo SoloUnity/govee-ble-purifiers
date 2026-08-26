@@ -19,7 +19,9 @@ from .frame import FrameError, build_frame, validate_frame
 
 _LOGGER = logging.getLogger(__name__)
 
-NEGOTIATION_PHASE_TIMEOUT = 3.0
+NEGOTIATION_ATTEMPTS = 3
+NEGOTIATION_RETRY_INTERVAL = 5.0
+NEGOTIATION_PHASE_TIMEOUT = 15.0
 NEGOTIATION_STEP_DELAY = 0.001
 FIRST_APPLICATION_DELAY = 0.003
 
@@ -168,21 +170,71 @@ class H7129SessionChannel(SecureChannel):
         future: asyncio.Future[bytes] = loop.create_future()
         self._phase_future = future
         request = create_negotiation_frame(step)
+        wire_request = encrypt_frame(request, COMMUNICATION_KEY)
         started = loop.time()
-        _LOGGER.debug(
-            "H7129 negotiation TX e7-%02x; random padding and keys are not logged",
-            step,
-        )
-        await self._transport.async_write(encrypt_frame(request, COMMUNICATION_KEY))
+        deadline = started + NEGOTIATION_PHASE_TIMEOUT
         try:
-            async with asyncio.timeout(NEGOTIATION_PHASE_TIMEOUT):
-                response = await future
+            for attempt in range(1, NEGOTIATION_ATTEMPTS + 1):
+                if future.done():
+                    response = future.result()
+                    break
+
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise TimeoutError
+
                 _LOGGER.debug(
-                    "H7129 negotiation RX e7-%02x completed in %.3f seconds",
+                    "H7129 negotiation TX e7-%02x attempt=%d/%d; random "
+                    "padding and keys are not logged",
                     step,
-                    loop.time() - started,
+                    attempt,
+                    NEGOTIATION_ATTEMPTS,
                 )
-                return response
+                # Reuse the exact encrypted request for every attempt. A late
+                # response to any send may therefore complete this one phase.
+                async with asyncio.timeout_at(deadline):
+                    await self._transport.async_write(wire_request)
+
+                if future.done():
+                    response = future.result()
+                    break
+
+                wait_for = min(
+                    NEGOTIATION_RETRY_INTERVAL,
+                    max(0.0, deadline - loop.time()),
+                )
+                if wait_for <= 0:
+                    raise TimeoutError
+                try:
+                    async with asyncio.timeout(wait_for):
+                        response = await asyncio.shield(future)
+                    break
+                except TimeoutError:
+                    _LOGGER.debug(
+                        "H7129 negotiation e7-%02x received no matching response "
+                        "after attempt=%d/%d elapsed=%.3fs",
+                        step,
+                        attempt,
+                        NEGOTIATION_ATTEMPTS,
+                        loop.time() - started,
+                    )
+            else:
+                raise TimeoutError
+
+            _LOGGER.debug(
+                "H7129 negotiation RX e7-%02x completed in %.3f seconds "
+                "after attempt=%d/%d",
+                step,
+                loop.time() - started,
+                attempt,
+                NEGOTIATION_ATTEMPTS,
+            )
+            return response
+        except TimeoutError as err:
+            raise TimeoutError(
+                f"no matching response after {NEGOTIATION_ATTEMPTS} attempt(s) "
+                f"within {NEGOTIATION_PHASE_TIMEOUT:.1f} seconds"
+            ) from err
         finally:
             if self._phase_future is future:
                 self._phase_future = None

@@ -485,7 +485,11 @@ otherwise a connection that succeeds for milliseconds can cause rapid retry
 loops. When a connectable device is still producing recent advertisements, an
 integration may cap the effective backoff below its disconnected-device maximum
 while still requiring fresh route evidence before the next attempt. This keeps
-a weak but present device responsive without busy-looping on a stale route.
+a weak but present device responsive without busy-looping on a stale route. A
+long backoff should also race a newly received connectable advertisement, a
+queued control, and shutdown. Fresh advertisement evidence may wake recovery
+after a short adapter-settling cooldown instead of waiting for the scheduled
+delay to expire.
 
 ## 10. Handling poor signals and stuck connections
 
@@ -833,7 +837,9 @@ The Govee purifier integration applies the general model as follows:
 - Recovery uses capped exponential backoff with jitter. Its normal ceiling is
   60 seconds, but the base delay is capped at eight seconds while Home Assistant
   retains a connectable advertisement no more than ten seconds old. The
-  resulting ceiling after jitter is approximately 6.4 to 9.6 seconds.
+  resulting ceiling after jitter is approximately 6.4 to 9.6 seconds. A newly
+  received connectable advertisement or queued command wakes an existing wait;
+  advertisement-triggered recovery retains a one-second settling cooldown.
 - Before the first successful initialization, transient failures do not publish
   coordinator update errors. After a device has been ready, link loss makes its
   entities unavailable without logging an error for each retry cycle. Recovery
@@ -841,6 +847,12 @@ The Govee purifier integration applies the general model as follows:
 - GATT, plaintext/encrypted channel, and purifier protocol are separate layers.
 - Notification subscription precedes H7129 negotiation and all application
   requests.
+- Each H7129 `e7-01` and `e7-02` phase stays open for at most 15 seconds. The
+  same protected request is sent up to three times about five seconds apart,
+  while one matcher accepts the first valid response, including a delayed
+  response to an earlier send. Duplicate responses from completed phases are
+  ignored. A real disconnect aborts immediately; otherwise the connection is
+  recycled only after the phase exhausts its retry budget.
 - H7129 session material is discarded on disconnect or negotiation failure.
 - Initialization is repeated after every reconnect.
 - Every startup request is attempted up to three times in documented order.
@@ -863,7 +875,7 @@ The Govee purifier integration applies the general model as follows:
   sweep and connection continue. An exhausted essential `aa 01` refresh request
   triggers reconnection. A queued user command preempts the current refresh wait;
   the refresh resumes from the interrupted request after command work finishes.
-- Commands have a 30-second end-to-end deadline and at most three sends.
+- Commands have a 120-second end-to-end deadline and at most three sends.
   Response silence consumes those retries on the current application session.
   Transport failure preserves the absolute command across reconnect, where
   startup state is checked before any replay. An ambiguous command that has

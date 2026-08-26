@@ -139,7 +139,11 @@ The integration maintains one serialized connection owner per purifier:
 
 H7129 session keys exist only for one BLE connection. They are discarded on
 every disconnect, negotiation failure, shutdown, or reconnect and are never
-logged.
+logged. Each `e7-01` and `e7-02` phase remains open for up to 15 seconds and
+reuses the same protected request for as many as three sends about five seconds
+apart. The first matching response completes the phase, including a delayed
+response to an earlier send. Only phase exhaustion or an actual connection
+failure recycles the GATT connection.
 
 ### Polling and notifications
 
@@ -171,7 +175,11 @@ the Govee app is treated as a transient disconnect:
 - recovery uses exponential backoff from 1 to 60 seconds with jitter. Its base
   delay is capped at eight seconds while Home Assistant still has an
   advertisement no more than ten seconds old, producing an approximately
-  6.4-to-9.6-second jittered wait at the ceiling.
+  6.4-to-9.6-second jittered wait at the ceiling; and
+- a newly received connectable advertisement or queued user command wakes the
+  current backoff early. Advertisement-triggered recovery keeps a one-second
+  settling cooldown so repeated negotiation failures cannot create a tight
+  connection loop.
 
 The first runtime connection attempt can accept a cached connectable
 advertisement no more than five seconds old. After a failed route, retry requires
@@ -222,7 +230,7 @@ during a refresh transaction, the refresh yields without waiting for the rest of
 that transaction's timeout budget. After the command finishes, the sweep resumes
 at the interrupted request so requests are neither skipped nor reordered.
 
-Commands are serialized and have a 30-second end-to-end deadline. Up to three
+Commands are serialized and have a 120-second end-to-end deadline. Up to three
 bounded sends are permitted. Response silence is retried immediately on the
 existing application session, avoiding a full reconnect between each send. A
 transport failure enters normal recovery while preserving the absolute command.
@@ -414,4 +422,4 @@ decoded ATT operation, and raw bytes.
 - [Home Assistant integration and HACS reference](home-assistant-bluetooth-integration-reference.md)
 - [License](LICENSE)
 
-Release documentation reflects integration version 0.3.22.
+Release documentation reflects integration version 0.3.23.

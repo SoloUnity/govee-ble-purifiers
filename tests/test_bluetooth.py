@@ -469,6 +469,32 @@ def test_recent_advertisement_uses_timestamp_not_presence_history(
 
 
 @pytest.mark.asyncio
+async def test_recovery_wait_is_woken_by_connectable_advertisement() -> None:
+    """Backoff can react to a callback outside a route-selection wait."""
+    environment = HomeAssistantBluetoothEnvironment(
+        SimpleNamespace(),  # type: ignore[arg-type]
+        "AA:BB:CC:DD:EE:FF",
+    )
+    cutoff = time.monotonic()
+    wait_task = asyncio.create_task(
+        environment.async_wait_for_advertisement_after(cutoff)
+    )
+    await asyncio.sleep(0)
+
+    environment._advertisement_received(
+        SimpleNamespace(
+            name="ihoment_H7129_TEST",
+            source="test-adapter",
+            rssi=-75,
+            connectable=True,
+            time=time.monotonic(),
+        )
+    )
+
+    await asyncio.wait_for(wait_task, timeout=0.1)
+
+
+@pytest.mark.asyncio
 async def test_callback_registration_disables_cached_replay_when_supported(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

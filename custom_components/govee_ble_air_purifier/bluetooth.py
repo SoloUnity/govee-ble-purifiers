@@ -158,7 +158,9 @@ class HomeAssistantBluetoothEnvironment:
         if is_live:
             self._live_service_info = service_info
             self._fresh_advertisements += 1
-            self._advertisement_event.set()
+        # Recovery backoff also listens to this event. Signal every callback,
+        # not only callbacks belonging to an active route-selection wait.
+        self._advertisement_event.set()
 
     def get_connectable_device(self) -> BLEDevice | None:
         """Return the best currently reachable connectable route."""
@@ -360,6 +362,18 @@ class HomeAssistantBluetoothEnvironment:
             isinstance(advertisement_time, int | float)
             and max(0.0, time.monotonic() - advertisement_time) <= max_age
         )
+
+    async def async_wait_for_advertisement_after(self, cutoff: float) -> None:
+        """Wait until this integration receives a connectable advertisement."""
+        while self._last_callback_time is None or self._last_callback_time <= cutoff:
+            self._advertisement_event.clear()
+            # Close the callback/check/clear race before blocking.
+            if (
+                self._last_callback_time is not None
+                and self._last_callback_time > cutoff
+            ):
+                return
+            await self._advertisement_event.wait()
 
     async def async_wait_for_fresh_device(self, timeout: float) -> BLEDevice | None:
         """Resolve a recent route, or wait for evidence newer than the last route."""
