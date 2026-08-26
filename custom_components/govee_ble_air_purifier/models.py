@@ -186,6 +186,17 @@ class FanModeEvent(ProtocolEvent):
 
 
 @dataclass(frozen=True, slots=True)
+class StartupFanModeEvent(ProtocolEvent):
+    """An ``aa 05`` startup or refresh response with its observed layout."""
+
+    selector: int
+    mode_code: int | None
+    manual_level: int | None
+    level_or_configuration: int | None
+    auto_parameter: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class NightLightStateEvent(ProtocolEvent):
     """Night-light power/brightness response, echo, or notification."""
 
@@ -256,6 +267,7 @@ class UnknownEvent(ProtocolEvent):
 type DecodedEvent = (
     DeviceStateEvent
     | FanModeEvent
+    | StartupFanModeEvent
     | NightLightStateEvent
     | NightLightColorEvent
     | AirQualityEvent

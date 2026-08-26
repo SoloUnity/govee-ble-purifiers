@@ -128,13 +128,16 @@ The integration maintains one serialized connection owner per purifier:
 6. Use a plaintext H7124 channel or negotiate a fresh H7129 encrypted session.
 7. Run the complete captured startup initialization sweep in order, allowing up
    to three attempts for every request.
-8. Require the essential `aa 01` device-state response, but record an exhausted
+8. Restore fan mode from the existing matched `aa 05` responses. H7124 resolves
+   from `aa 05 00`; H7129 combines `aa 05 00` and `aa 05 01` only for manual
+   Low/Medium/High modes.
+9. Require the essential `aa 01` device-state response, but record an exhausted
    secondary request as best-effort and continue the rest of the sweep. A silent
    essential request receives at most three three-attempt batches on one
    connection before that session is recycled.
-9. Mark entities available after the full sweep has been attempted and essential
+10. Mark entities available after the full sweep has been attempted and essential
    state is known. Values missed during secondary initialization remain unknown.
-10. Process commands, unsolicited notifications, refresh requests, and the one
+11. Process commands, unsolicited notifications, refresh requests, and the one
    documented periodic state query.
 
 H7129 session keys exist only for one BLE connection. They are discarded on
@@ -252,16 +255,24 @@ ignored. Unsolicited `ee 05` frames continue to report physical fan-mode changes
 and may replace the acknowledged mode at any time. H7124 matches these frames
 directly; H7129 applies the same rules after decrypting them.
 
+Startup and reconnect initialization restore current fan mode without adding a
+new poll. Only an `aa 05` response matched to its active selector request can
+change state. H7124 resolves all six modes from `aa 05 00`; H7129 resolves
+Auto/Sleep/Turbo there and waits for the matched `aa 05 01` manual level before
+publishing Low/Medium/High. Unknown combinations remain unknown. The same logic
+is reused by the documented H7129 `ee aa` refresh sweep.
+
 Cleanup runs before config-entry setup, before a new connection, after a failed
 connection cycle, during shutdown/unload, and after entry removal. Removal does
 not request Bluetooth rediscovery because automatic discovery is disabled.
 
 ## State and protocol limitations
 
-- The protocol exposes no authoritative fan-mode query. Fan mode is known after
-  an exact acknowledgement of a Home Assistant `3a 05` command or receipt of an
-  unsolicited `ee 05` physical update. It becomes unknown during reconnection
-  until reported again.
+- Fan mode is restored by the matched startup `aa 05` requests, confirmed after
+  a Home Assistant command by the exact `3a 05` acknowledgement, and superseded
+  by unsolicited `ee 05` physical updates. It becomes unknown during
+  reconnection until the new startup responses resolve it. If a secondary mode
+  query remains silent, availability is preserved with fan mode unknown.
 - Some H7129 RGB responses acknowledge a query or command without proving the
   colour currently displayed. The last authoritative colour is retained, and
   ambiguous RGB commands are not treated as safely reconciled from cached state.
@@ -361,7 +372,9 @@ addresses and device-specific metadata should be redacted before sharing logs.
 
 Home Assistant config-entry diagnostics expose redacted entry data, cached
 purifier state, connection status, route evidence, transport counters, current
-stage, cleanup statistics, and recent bounded failures.
+stage, cleanup statistics, recent bounded failures, and startup fan-mode
+fragments (including the selector-01 value), resolution, and connection
+generation.
 
 ## Removal and updates
 
@@ -436,4 +449,4 @@ decoded ATT operation, and raw bytes.
 - [Home Assistant integration and HACS reference](home-assistant-bluetooth-integration-reference.md)
 - [License](LICENSE)
 
-Release documentation reflects integration version 0.3.25.
+Release documentation reflects integration version 0.3.26.

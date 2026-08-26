@@ -859,6 +859,12 @@ The Govee purifier integration applies the general model as follows:
   Exhausted secondary capability, metadata, and telemetry requests are recorded
   and do not discard an otherwise healthy application channel. The complete
   sweep is still attempted.
+- The existing startup `aa 05 00`, `aa 05 01`, and `aa 05 03` requests restore
+  fan mode without adding a periodic query. H7124 resolves directly from its
+  matched selector-00 response. H7129 resolves Auto/Sleep/Turbo from selector
+  00 and combines a manual selector-00 category with the matched selector-01
+  level. A mode response affects state only when it completes its active named
+  request, and incomplete or unknown combinations leave fan mode unknown.
 - The `aa 01` device-state request is essential. If its three-attempt batch stays
   silent, the connected session remains in initialization and starts another
   batch after a short delay. At most three batches (nine wire attempts) run on
@@ -895,6 +901,9 @@ The Govee purifier integration applies the general model as follows:
   recovery reconnect, and fan controls correlate observed `3a 05` command
   echoes and `ee 05` physical updates with their role, decoded mode, connection
   generation, transaction phase, and timing.
+  Startup fan diagnostics additionally retain the last mode code, manual-level
+  and raw selector-01 values, Auto parameter, pair-assembly status, resolution
+  reason, and connection generation without exposing H7129 session secrets.
 
 These values are project policy based on the purifier traces and reliability
 goals. They are not universal Home Assistant constants.

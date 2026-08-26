@@ -29,6 +29,7 @@ from .models import (
     AirQualityEvent,
     DeviceProfile,
     DeviceStateEvent,
+    FanMode,
     FanModeEvent,
     Model,
     NightLightColorEvent,
@@ -42,6 +43,7 @@ from .models import (
     SetNightLightColor,
     SetNightLightPower,
     SetPower,
+    StartupFanModeEvent,
 )
 from .protocol import GoveePurifierProtocol, MatchResult, RequestDescriptor
 
@@ -169,6 +171,13 @@ class ReliablePurifierClient:
         self._essential_initialization_attempts = 0
         self._has_ever_been_ready = False
         self._reported_available: bool | None = None
+        self._last_startup_mode_code: int | None = None
+        self._last_startup_manual_level: int | None = None
+        self._last_startup_selector_01_value: int | None = None
+        self._last_startup_auto_parameter: int | None = None
+        self._startup_mode_generation: int | None = None
+        self._awaiting_h7129_manual_level = False
+        self._startup_mode_resolution = "not_observed"
 
     @property
     def is_ready(self) -> bool:
@@ -187,6 +196,24 @@ class ReliablePurifierClient:
             "last_error": self._last_error,
             "last_timeout_summary": self._last_timeout_summary,
             "last_command_diagnostics": self._last_command_diagnostics,
+            "startup_fan_mode": {
+                "last_mode_code": self._last_startup_mode_code,
+                "last_manual_level": self._last_startup_manual_level,
+                "last_selector_01_value": (
+                    self._last_startup_selector_01_value
+                ),
+                "last_auto_parameter": self._last_startup_auto_parameter,
+                "awaiting_h7129_manual_level": (
+                    self._awaiting_h7129_manual_level
+                ),
+                "resolved_mode": (
+                    self.state.fan_mode.value
+                    if self.state.fan_mode is not None
+                    else None
+                ),
+                "resolution": self._startup_mode_resolution,
+                "generation": self._startup_mode_generation,
+            },
             "incomplete_initialization_requests": (
                 self._incomplete_initialization_requests
             ),
@@ -736,12 +763,13 @@ class ReliablePurifierClient:
 
     def _apply_confirmed_command(self, command: ProtocolCommand) -> None:
         """Publish state established by a documented command acknowledgement."""
-        if (
-            isinstance(command, SetFanMode)
-            and self.state.fan_mode is not command.mode
-        ):
-            self.state = replace(self.state, fan_mode=command.mode)
-            self._state_callback(self.state)
+        if isinstance(command, SetFanMode):
+            self._clear_startup_mode_partial("superseded_by_command_acknowledgement")
+            self._startup_mode_resolution = "superseded_by_command_acknowledgement"
+            self._startup_mode_generation = self._session_generation
+            if self.state.fan_mode is not command.mode:
+                self.state = replace(self.state, fan_mode=command.mode)
+                self._state_callback(self.state)
 
     async def _async_run_refresh(
         self, descriptors: tuple[RequestDescriptor, ...]
@@ -879,8 +907,15 @@ class ReliablePurifierClient:
                             interrupt_for_command=interrupt_for_command,
                         )
                         observed_frames.append(frame)
-                        self._process_plaintext_frame(frame)
                         result = matcher.feed(frame)
+                        self._process_plaintext_frame(
+                            frame,
+                            matched_request=(
+                                descriptor.name
+                                if result is MatchResult.COMPLETE
+                                else None
+                            ),
+                        )
                         _LOGGER.debug(
                             "Transaction candidate: request=%s attempt=%d/%d "
                             "match=%s frame=%s",
@@ -1005,12 +1040,25 @@ class ReliablePurifierClient:
         if operation_task in done:
             self._operation_event.clear()
 
-    def _process_plaintext_frame(self, frame: bytes) -> None:
+    def _process_plaintext_frame(
+        self,
+        frame: bytes,
+        *,
+        matched_request: str | None = None,
+    ) -> None:
         event = self._protocol.decode(frame)
         new_state = self.state
         if isinstance(event, DeviceStateEvent) and event.power is not None:
             new_state = replace(new_state, power=event.power)
-        elif isinstance(event, FanModeEvent) and event.mode is not None:
+        elif isinstance(event, StartupFanModeEvent):
+            new_state = self._apply_startup_fan_mode_event(
+                event,
+                matched_request=matched_request,
+            )
+        elif isinstance(event, FanModeEvent):
+            self._clear_startup_mode_partial("superseded_by_physical_update")
+            self._startup_mode_resolution = "superseded_by_physical_update"
+            self._startup_mode_generation = self._session_generation
             new_state = replace(new_state, fan_mode=event.mode)
         elif isinstance(event, NightLightStateEvent):
             changes: dict[str, object] = {}
@@ -1048,6 +1096,165 @@ class ReliablePurifierClient:
         if new_state != self.state:
             self.state = new_state
             self._state_callback(new_state)
+
+    def _apply_startup_fan_mode_event(
+        self,
+        event: StartupFanModeEvent,
+        *,
+        matched_request: str | None,
+    ) -> PurifierState:
+        """Apply an ``aa 05`` response only to its completed named query."""
+        expected_request = f"mode_data_{event.selector:02x}"
+        if matched_request != expected_request or expected_request not in {
+            "mode_data_00",
+            "mode_data_01",
+            "mode_data_03",
+        }:
+            _LOGGER.debug(
+                "Ignoring unmatched startup fan-mode response: selector=%02x "
+                "matched_request=%s expected_request=%s frame=%s",
+                event.selector,
+                matched_request,
+                expected_request,
+                event.frame.hex(" "),
+            )
+            return self.state
+
+        if event.selector == 0x03:
+            self._startup_mode_generation = self._session_generation
+            self._last_startup_auto_parameter = event.auto_parameter
+            _LOGGER.debug(
+                "Recorded startup fan Auto parameter: model=%s generation=%d "
+                "value=%s",
+                self._profile.model.value,
+                self._session_generation,
+                event.auto_parameter,
+            )
+            return self.state
+
+        if event.selector == 0x01:
+            self._last_startup_selector_01_value = event.level_or_configuration
+            if self._profile.model is not Model.H7129:
+                self._startup_mode_generation = self._session_generation
+                return self.state
+            completes_current_pair = (
+                self._awaiting_h7129_manual_level
+                and self._startup_mode_generation == self._session_generation
+            )
+            self._startup_mode_generation = self._session_generation
+            if not completes_current_pair:
+                _LOGGER.debug(
+                    "Ignoring H7129 startup manual-level response without a "
+                    "current manual category: generation=%d value=%s frame=%s",
+                    self._session_generation,
+                    event.level_or_configuration,
+                    event.frame.hex(" "),
+                )
+                return self.state
+
+            self._last_startup_manual_level = event.level_or_configuration
+            mode = {
+                0x01: FanMode.LOW,
+                0x02: FanMode.MEDIUM,
+                0x03: FanMode.HIGH,
+            }.get(event.level_or_configuration)
+            self._awaiting_h7129_manual_level = False
+            if mode is None:
+                self._startup_mode_resolution = (
+                    f"unknown_manual_level:{event.level_or_configuration}"
+                )
+                _LOGGER.debug(
+                    "H7129 startup fan mode remains unknown: generation=%d "
+                    "mode_code=01 manual_level=%s frame=%s",
+                    self._session_generation,
+                    event.level_or_configuration,
+                    event.frame.hex(" "),
+                )
+                return replace(self.state, fan_mode=None)
+            self._startup_mode_resolution = f"resolved:{mode.value}"
+            return replace(self.state, fan_mode=mode)
+
+        assert event.selector == 0x00
+        self._last_startup_mode_code = event.mode_code
+        self._last_startup_manual_level = event.manual_level
+        self._clear_startup_mode_partial("new_mode_category")
+        self._startup_mode_generation = self._session_generation
+
+        if self._profile.model is Model.H7124:
+            mode = self._decode_h7124_startup_mode(
+                event.mode_code,
+                event.manual_level,
+            )
+            if mode is None:
+                self._startup_mode_resolution = (
+                    f"unknown_h7124_combination:{event.mode_code}:"
+                    f"{event.manual_level}"
+                )
+                _LOGGER.debug(
+                    "H7124 startup fan mode remains unknown: generation=%d "
+                    "mode_code=%s manual_level=%s frame=%s",
+                    self._session_generation,
+                    event.mode_code,
+                    event.manual_level,
+                    event.frame.hex(" "),
+                )
+            else:
+                self._startup_mode_resolution = f"resolved:{mode.value}"
+            return replace(self.state, fan_mode=mode)
+
+        if event.mode_code == 0x01:
+            self._awaiting_h7129_manual_level = True
+            self._startup_mode_resolution = "awaiting_manual_level"
+            return replace(self.state, fan_mode=None)
+
+        mode = {
+            0x03: FanMode.AUTO,
+            0x05: FanMode.SLEEP,
+            0x07: FanMode.TURBO,
+        }.get(event.mode_code)
+        if mode is None:
+            self._startup_mode_resolution = (
+                f"unknown_h7129_mode_code:{event.mode_code}"
+            )
+            _LOGGER.debug(
+                "H7129 startup fan mode remains unknown: generation=%d "
+                "mode_code=%s frame=%s",
+                self._session_generation,
+                event.mode_code,
+                event.frame.hex(" "),
+            )
+        else:
+            self._startup_mode_resolution = f"resolved:{mode.value}"
+        return replace(self.state, fan_mode=mode)
+
+    @staticmethod
+    def _decode_h7124_startup_mode(
+        mode_code: int | None,
+        manual_level: int | None,
+    ) -> FanMode | None:
+        if mode_code == 0x01:
+            return {
+                0x01: FanMode.LOW,
+                0x02: FanMode.MEDIUM,
+                0x03: FanMode.HIGH,
+            }.get(manual_level)
+        if manual_level != 0x00:
+            return None
+        return {
+            0x03: FanMode.AUTO,
+            0x05: FanMode.SLEEP,
+            0x07: FanMode.TURBO,
+        }.get(mode_code)
+
+    def _clear_startup_mode_partial(self, reason: str) -> None:
+        """Discard connection-scoped H7129 mode assembly state."""
+        if self._awaiting_h7129_manual_level:
+            _LOGGER.debug(
+                "Clearing pending H7129 startup fan mode: generation=%s reason=%s",
+                self._startup_mode_generation,
+                reason,
+            )
+        self._awaiting_h7129_manual_level = False
 
     def _command_is_satisfied(self, command: ProtocolCommand) -> bool:
         if isinstance(command, SetPower):
@@ -1169,7 +1376,9 @@ class ReliablePurifierClient:
         )
 
     def _invalidate_connection_scoped_state(self) -> None:
-        """Forget values startup cannot authoritatively query after reconnect."""
+        """Forget values that must be re-established after reconnect."""
+        self._clear_startup_mode_partial("connection_invalidated")
+        self._startup_mode_resolution = "awaiting_startup_query"
         if self.state.fan_mode is not None:
             self.state = replace(self.state, fan_mode=None)
 
@@ -1225,6 +1434,7 @@ class ReliablePurifierClient:
         channel = self._channel
         if channel is not None:
             channel.invalidate()
+        self._invalidate_connection_scoped_state()
         self._disconnected.set()
 
     def _set_available(self, available: bool, error: Exception | None) -> None:

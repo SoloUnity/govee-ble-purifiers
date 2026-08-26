@@ -211,14 +211,41 @@ model-specific response boundary: H7129 returns capability data where the
 captured H7124 transaction used an exact echo. The meanings of the
 `00 ff ff ff` response values have not been established.
 
-Observed H7124 `aa 05` responses begin as follows; remaining payload bytes are
-zero through byte 18, followed by the checksum:
+### Startup fan-mode responses: `aa 05`
 
-```text
-aa 05 00 -> aa 05 00 01 03
-aa 05 01 -> aa 05 01 03
-aa 05 03 -> aa 05 03 00 00 14
-```
+Controlled startup captures establish that the existing `aa 05 00`, `aa 05 01`,
+and `aa 05 03` initialization requests expose fan-mode state. Each response
+echoes the request selector in byte 2.
+
+For H7124, `aa 05 00` contains the active mode code in byte 3 and the manual
+level in byte 4:
+
+| Active mode | Response bytes 0-4 |
+| --- | --- |
+| Low | `aa 05 00 01 01` |
+| Medium | `aa 05 00 01 02` |
+| High | `aa 05 00 01 03` |
+| Auto | `aa 05 00 03 00` |
+| Sleep | `aa 05 00 05 00` |
+| Turbo | `aa 05 00 07 00` |
+
+For H7129, `aa 05 00` supplies the active mode category in byte 3. When that
+category is manual (`01`), `aa 05 01` supplies the manual level in byte 3:
+
+| Active mode | `aa 05 00` byte 3 | `aa 05 01` byte 3 |
+| --- | ---: | ---: |
+| Low | `01` | `01` |
+| Medium | `01` | `02` |
+| High | `01` | `03` |
+| Auto | `03` | `04` |
+| Sleep | `05` | `04` |
+| Turbo | `07` | `05` |
+
+The `aa 05 01` values for H7129 Auto, Sleep, and Turbo are observed but their
+semantics are not established; the `aa 05 00` category alone identifies those
+three modes. The `aa 05 03` response carried the model Auto parameter in byte 5:
+`14` for H7124 and `12` for H7129. Remaining payload bytes in these controlled
+responses were zero through byte 18, followed by the XOR checksum.
 
 The `aa 07 10`, `aa 07 11`, and `aa 07 06` responses contain device-specific
 binary identifiers. Do not treat their captured payload bytes as model-wide
@@ -502,6 +529,7 @@ These queries are not specified for H7129.
 | `aa 07 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ae` | Hardware version/device data |
 | `aa 20 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 8a` | Hardware version |
 
-`aa 05` is mode-related but is not fully specified. Current captures use `3a 05`
-for Bluetooth mode control and its exact acknowledgement, while `ee 05` reports
-physical fan-mode changes.
+The established portions of `aa 05` are documented in the startup fan-mode
+section above. The meaning of `aa 05 01` outside H7129 manual category `01`
+remains unspecified. Bluetooth mode control uses `3a 05` and its exact
+acknowledgement, while `ee 05` reports physical fan-mode changes.

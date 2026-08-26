@@ -25,6 +25,7 @@ from custom_components.govee_ble_air_purifier.models import (
     SetNightLightColor,
     SetNightLightPower,
     SetPower,
+    StartupFanModeEvent,
 )
 from custom_components.govee_ble_air_purifier.protocol import (
     GoveePurifierProtocol,
@@ -75,6 +76,36 @@ def test_documented_query_vectors(command: ProtocolCommand, expected: str) -> No
     """The only steady poll and the on-demand state queries match captures."""
 
     assert _protocol().encode(command) == bytes.fromhex(expected)
+
+
+@pytest.mark.parametrize(
+    ("content", "selector", "mode_code", "manual_level", "value", "auto"),
+    [
+        ("aa 05 00 01 03", 0x00, 0x01, 0x03, None, None),
+        ("aa 05 01 04", 0x01, None, None, 0x04, None),
+        ("aa 05 03 00 00 12", 0x03, None, None, None, 0x12),
+    ],
+)
+def test_decode_startup_fan_mode_selector_layouts(
+    content: str,
+    selector: int,
+    mode_code: int | None,
+    manual_level: int | None,
+    value: int | None,
+    auto: int | None,
+) -> None:
+    """The typed aa-05 event preserves each observed selector layout."""
+
+    frame = build_frame(bytes.fromhex(content))
+    event = _protocol().decode(frame)
+
+    assert isinstance(event, StartupFanModeEvent)
+    assert event.frame == frame
+    assert event.selector == selector
+    assert event.mode_code == mode_code
+    assert event.manual_level == manual_level
+    assert event.level_or_configuration == value
+    assert event.auto_parameter == auto
 
 
 def test_h7129_auto_uses_model_specific_parameter() -> None:

@@ -29,6 +29,7 @@ from .models import (
     SetNightLightColor,
     SetNightLightPower,
     SetPower,
+    StartupFanModeEvent,
     UnknownEvent,
 )
 
@@ -455,6 +456,17 @@ class GoveePurifierProtocol:
                 power=self._decode_bool(data[2]),
                 status_flags=data[4],
                 volatile_state=data[6],
+            )
+
+        if data[:2] == b"\xaa\x05":
+            selector = data[2]
+            return StartupFanModeEvent(
+                data,
+                selector=selector,
+                mode_code=data[3] if selector == 0x00 else None,
+                manual_level=data[4] if selector == 0x00 else None,
+                level_or_configuration=data[3] if selector == 0x01 else None,
+                auto_parameter=data[5] if selector == 0x03 else None,
             )
 
         if data[:2] == b"\xee\x05":

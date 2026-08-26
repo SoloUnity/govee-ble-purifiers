@@ -97,7 +97,7 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
         await self._async_execute(SetPower(bool(on)))
 
     async def async_set_fan_mode(self, mode: FanMode) -> None:
-        """Set a documented fan mode and wait for authoritative ee-05 state."""
+        """Set a documented fan mode and wait for its exact acknowledgement."""
         await self._async_execute(SetFanMode(FanMode(mode)))
 
     async def async_set_light_power(self, on: bool) -> None:

@@ -437,7 +437,7 @@ def test_duplicate_unavailable_updates_are_suppressed() -> None:
 
 
 def test_reconnect_invalidates_fan_and_never_assumes_cached_rgb() -> None:
-    """Unqueryable state cannot suppress recovery commands after reconnect."""
+    """Connection-scoped state cannot suppress recovery commands after reconnect."""
     client = make_client()
     client.state = PurifierState(
         fan_mode=FanMode.HIGH,
@@ -448,6 +448,230 @@ def test_reconnect_invalidates_fan_and_never_assumes_cached_rgb() -> None:
 
     assert client.state.fan_mode is None
     assert not client._command_is_satisfied(SetNightLightColor(10, 20, 30))
+
+
+@pytest.mark.parametrize(
+    ("mode_code", "manual_level", "expected"),
+    [
+        (0x01, 0x01, FanMode.LOW),
+        (0x01, 0x02, FanMode.MEDIUM),
+        (0x01, 0x03, FanMode.HIGH),
+        (0x03, 0x00, FanMode.AUTO),
+        (0x05, 0x00, FanMode.SLEEP),
+        (0x07, 0x00, FanMode.TURBO),
+    ],
+)
+def test_h7124_matched_startup_response_restores_all_fan_modes(
+    mode_code: int,
+    manual_level: int,
+    expected: FanMode,
+) -> None:
+    """H7124 resolves all six modes directly from matched aa-05-00."""
+    client = make_client()
+    client._session_generation = 2
+
+    client._process_plaintext_frame(
+        build_frame(bytes((0xAA, 0x05, 0x00, mode_code, manual_level))),
+        matched_request="mode_data_00",
+    )
+
+    assert client.state.fan_mode is expected
+    diagnostics = client.diagnostic_snapshot()["startup_fan_mode"]
+    assert isinstance(diagnostics, dict)
+    assert diagnostics["last_mode_code"] == mode_code
+    assert diagnostics["last_manual_level"] == manual_level
+    assert diagnostics["resolved_mode"] == expected.value
+    assert diagnostics["generation"] == 2
+
+
+@pytest.mark.parametrize(
+    ("level", "expected"),
+    [
+        (0x01, FanMode.LOW),
+        (0x02, FanMode.MEDIUM),
+        (0x03, FanMode.HIGH),
+    ],
+)
+def test_h7129_manual_startup_pair_restores_mode(
+    level: int,
+    expected: FanMode,
+) -> None:
+    """H7129 manual state remains unknown until the matched second fragment."""
+    client = make_client()
+    client._profile = DeviceProfile.for_model(Model.H7129)
+    client._protocol = GoveePurifierProtocol(client._profile)
+    client._session_generation = 3
+    client.state = PurifierState(fan_mode=FanMode.TURBO)
+
+    client._process_plaintext_frame(
+        build_frame(b"\xaa\x05\x00\x01"),
+        matched_request="mode_data_00",
+    )
+    assert client.state.fan_mode is None
+    diagnostics = client.diagnostic_snapshot()["startup_fan_mode"]
+    assert isinstance(diagnostics, dict)
+    assert diagnostics["awaiting_h7129_manual_level"] is True
+
+    client._process_plaintext_frame(
+        build_frame(bytes((0xAA, 0x05, 0x01, level))),
+        matched_request="mode_data_01",
+    )
+
+    assert client.state.fan_mode is expected
+    diagnostics = client.diagnostic_snapshot()["startup_fan_mode"]
+    assert isinstance(diagnostics, dict)
+    assert diagnostics["awaiting_h7129_manual_level"] is False
+    assert diagnostics["resolved_mode"] == expected.value
+
+
+@pytest.mark.parametrize(
+    ("mode_code", "selector_01_value", "expected"),
+    [
+        (0x03, 0x04, FanMode.AUTO),
+        (0x05, 0x04, FanMode.SLEEP),
+        (0x07, 0x05, FanMode.TURBO),
+    ],
+)
+def test_h7129_special_startup_modes_resolve_from_first_response(
+    mode_code: int,
+    selector_01_value: int,
+    expected: FanMode,
+) -> None:
+    """H7129 special categories do not depend on selector-01 semantics."""
+    client = make_client()
+    client._profile = DeviceProfile.for_model(Model.H7129)
+    client._protocol = GoveePurifierProtocol(client._profile)
+
+    client._process_plaintext_frame(
+        build_frame(bytes((0xAA, 0x05, 0x00, mode_code))),
+        matched_request="mode_data_00",
+    )
+    client._process_plaintext_frame(
+        build_frame(bytes((0xAA, 0x05, 0x01, selector_01_value))),
+        matched_request="mode_data_01",
+    )
+
+    assert client.state.fan_mode is expected
+
+
+@pytest.mark.parametrize(
+    ("model", "first", "second"),
+    [
+        (Model.H7124, b"\xaa\x05\x00\x01\x09", None),
+        (Model.H7124, b"\xaa\x05\x00\x09\x00", None),
+        (Model.H7129, b"\xaa\x05\x00\x09", None),
+        (Model.H7129, b"\xaa\x05\x00\x01", b"\xaa\x05\x01\x09"),
+    ],
+)
+def test_unknown_startup_mode_values_remain_unknown(
+    model: Model,
+    first: bytes,
+    second: bytes | None,
+) -> None:
+    """Unproven startup combinations are never guessed."""
+    client = make_client()
+    client._profile = DeviceProfile.for_model(model)
+    client._protocol = GoveePurifierProtocol(client._profile)
+    client.state = PurifierState(fan_mode=FanMode.HIGH)
+
+    client._process_plaintext_frame(
+        build_frame(first),
+        matched_request="mode_data_00",
+    )
+    if second is not None:
+        client._process_plaintext_frame(
+            build_frame(second),
+            matched_request="mode_data_01",
+        )
+
+    assert client.state.fan_mode is None
+
+
+def test_unmatched_or_orphan_startup_mode_response_cannot_change_state() -> None:
+    """Delayed duplicates and selector-01 without a current pair are inert."""
+    client = make_client()
+    client._profile = DeviceProfile.for_model(Model.H7129)
+    client._protocol = GoveePurifierProtocol(client._profile)
+    client.state = PurifierState(fan_mode=FanMode.AUTO)
+
+    client._process_plaintext_frame(build_frame(b"\xaa\x05\x00\x01"))
+    client._process_plaintext_frame(
+        build_frame(b"\xaa\x05\x01\x03"),
+        matched_request="mode_data_01",
+    )
+
+    assert client.state.fan_mode is FanMode.AUTO
+    diagnostics = client.diagnostic_snapshot()["startup_fan_mode"]
+    assert isinstance(diagnostics, dict)
+    assert diagnostics["awaiting_h7129_manual_level"] is False
+
+
+def test_reconnect_and_physical_update_clear_h7129_partial_mode() -> None:
+    """Connection changes and ee-05 supersede an incomplete startup pair."""
+    client = make_client()
+    client._profile = DeviceProfile.for_model(Model.H7129)
+    client._protocol = GoveePurifierProtocol(client._profile)
+    client._session_generation = 4
+
+    client._process_plaintext_frame(
+        build_frame(b"\xaa\x05\x00\x01"),
+        matched_request="mode_data_00",
+    )
+    client._process_plaintext_frame(build_frame(b"\xee\x05\x07\x03"))
+    assert client.state.fan_mode is FanMode.TURBO
+    assert not client._awaiting_h7129_manual_level
+
+    client._process_plaintext_frame(
+        build_frame(b"\xaa\x05\x00\x01"),
+        matched_request="mode_data_00",
+    )
+    client._on_disconnected(4, 7)
+    assert client.state.fan_mode is None
+    assert not client._awaiting_h7129_manual_level
+
+
+def test_matched_mode_diagnostics_record_selector_01_and_03() -> None:
+    """Secondary aa-05 fragments remain available in redacted diagnostics."""
+    client = make_client()
+
+    client._process_plaintext_frame(
+        build_frame(b"\xaa\x05\x01\x03"),
+        matched_request="mode_data_01",
+    )
+    client._process_plaintext_frame(
+        build_frame(b"\xaa\x05\x03\x00\x00\x14"),
+        matched_request="mode_data_03",
+    )
+
+    diagnostics = client.diagnostic_snapshot()["startup_fan_mode"]
+    assert isinstance(diagnostics, dict)
+    assert diagnostics["last_selector_01_value"] == 0x03
+    assert diagnostics["last_auto_parameter"] == 0x14
+
+
+@pytest.mark.asyncio
+async def test_transaction_applies_only_the_active_mode_selector_response() -> None:
+    """A delayed aa-05 duplicate is inert while another selector is active."""
+    client = make_client()
+    client.state = PurifierState(fan_mode=FanMode.AUTO)
+    client._channel = SilentChannel()  # type: ignore[assignment]
+    descriptors = {
+        descriptor.name: descriptor
+        for descriptor in client._protocol.initialization_requests()
+    }
+    client._frame_queue.put_nowait(build_frame(b"\xaa\x05\x00\x01\x03"))
+    client._frame_queue.put_nowait(build_frame(b"\xaa\x05\x03\x00\x00\x14"))
+
+    await client._async_execute_descriptor(
+        descriptors["mode_data_03"],
+        attempts=1,
+    )
+
+    assert client.state.fan_mode is FanMode.AUTO
+    diagnostics = client.diagnostic_snapshot()["startup_fan_mode"]
+    assert isinstance(diagnostics, dict)
+    assert diagnostics["last_mode_code"] is None
+    assert diagnostics["last_auto_parameter"] == 0x14
 
 
 def test_brightness_echo_does_not_clear_cached_light_power() -> None:
@@ -489,6 +713,29 @@ async def test_initialization_exhausts_secondary_request_then_completes_sweep() 
     assert diagnostics["initialization_failure_summaries"] == {
         "capability_b2": "secondary stayed silent"
     }
+
+
+@pytest.mark.asyncio
+async def test_failed_startup_mode_query_does_not_prevent_initialization() -> None:
+    """Fan-mode restoration remains secondary best-effort startup work."""
+    client = make_client()
+    descriptors = client._protocol.initialization_requests()
+
+    async def execute(
+        descriptor: RequestDescriptor, *, attempts: int, **_: object
+    ) -> tuple[bytes, ...]:
+        assert attempts == 3
+        if descriptor.name == "mode_data_00":
+            raise client_module.TransactionTimeoutError("mode query stayed silent")
+        return ()
+
+    client._async_execute_descriptor = execute  # type: ignore[method-assign]
+
+    await client._async_run_initialization(descriptors)
+
+    assert client.diagnostic_snapshot()["incomplete_initialization_requests"] == (
+        "mode_data_00",
+    )
 
 
 @pytest.mark.asyncio
@@ -664,6 +911,41 @@ async def test_refresh_exhausts_secondary_request_and_preserves_connection() -> 
 
 
 @pytest.mark.asyncio
+async def test_h7129_refresh_restores_fan_mode_through_matched_responses() -> None:
+    """The existing ee-aa sweep reuses startup fan-mode assembly."""
+    client = make_client()
+    client._profile = DeviceProfile.for_model(Model.H7129)
+    client._protocol = GoveePurifierProtocol(client._profile)
+    descriptors = client._protocol.refresh_requests()
+
+    async def execute(
+        descriptor: RequestDescriptor, *, attempts: int, **_: object
+    ) -> tuple[bytes, ...]:
+        assert attempts == 3
+        if descriptor.name == "mode_data_00":
+            frame = build_frame(b"\xaa\x05\x00\x01")
+            client._process_plaintext_frame(
+                frame,
+                matched_request=descriptor.name,
+            )
+            return (frame,)
+        if descriptor.name == "mode_data_01":
+            frame = build_frame(b"\xaa\x05\x01\x02")
+            client._process_plaintext_frame(
+                frame,
+                matched_request=descriptor.name,
+            )
+            return (frame,)
+        return ()
+
+    client._async_execute_descriptor = execute  # type: ignore[method-assign]
+
+    await client._async_run_refresh(descriptors)
+
+    assert client.state.fan_mode is FanMode.MEDIUM
+
+
+@pytest.mark.asyncio
 async def test_refresh_essential_exhaustion_requires_reconnect() -> None:
     """A refresh cannot remain healthy after three missing aa-01 responses."""
     client = make_client()
@@ -757,6 +1039,44 @@ async def test_ambiguous_command_is_bounded_and_reconciled() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model", [Model.H7124, Model.H7129])
+async def test_startup_fan_state_suppresses_unnecessary_command_replay(
+    model: Model,
+) -> None:
+    """Authoritative startup mode reconciles an ambiguous queued fan write."""
+    client = make_client()
+    client._profile = DeviceProfile.for_model(model)
+    client._protocol = GoveePurifierProtocol(client._profile)
+    client._session_generation = 6
+    client._process_plaintext_frame(
+        build_frame(
+            b"\xaa\x05\x00\x01\x03"
+            if model is Model.H7124
+            else b"\xaa\x05\x00\x01"
+        ),
+        matched_request="mode_data_00",
+    )
+    if model is Model.H7129:
+        client._process_plaintext_frame(
+            build_frame(b"\xaa\x05\x01\x03"),
+            matched_request="mode_data_01",
+        )
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[None] = loop.create_future()
+    operation = _Operation(
+        SetFanMode(FanMode.HIGH),
+        future,
+        loop.time() + 30,
+        send_attempts=3,
+    )
+
+    await client._async_execute_operation(operation)
+
+    assert future.done()
+    assert future.exception() is None
+
+
+@pytest.mark.asyncio
 async def test_fan_failure_preserves_wire_diagnostics_across_reconnect() -> None:
     """The final HA error retains all fan evidence from the prior session."""
     client = make_client()
@@ -840,6 +1160,7 @@ async def test_fan_echo_confirms_state_without_retry(model: Model) -> None:
         loop.time() + 30,
         created_at=loop.time(),
     )
+    client._awaiting_h7129_manual_level = True
     calls = 0
 
     async def acknowledge(
@@ -864,6 +1185,7 @@ async def test_fan_echo_confirms_state_without_retry(model: Model) -> None:
     assert future.done()
     assert future.exception() is None
     assert client.state.fan_mode is FanMode.HIGH
+    assert not client._awaiting_h7129_manual_level
     assert published[-1].fan_mode is FanMode.HIGH
 
     client._process_plaintext_frame(build_frame(b"\xee\x05\x01\x01"))
