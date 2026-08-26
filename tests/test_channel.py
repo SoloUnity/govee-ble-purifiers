@@ -154,6 +154,63 @@ async def test_h7129_disconnect_aborts_negotiation_without_more_sends(
 
 
 @pytest.mark.asyncio
+async def test_h7129_disconnect_after_retry_has_no_orphaned_future_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A disconnect after a retry wakes only the owning negotiation task."""
+    monkeypatch.setattr(channel_module, "NEGOTIATION_RETRY_INTERVAL", 0.005)
+    monkeypatch.setattr(channel_module, "NEGOTIATION_PHASE_TIMEOUT", 1.0)
+    session_key = b"0123456789abcdef"
+
+    class SilentTransport:
+        def __init__(self) -> None:
+            self.callback: Callable[[bytes], None] | None = None
+            self.writes: list[bytes] = []
+            self.retry_written = asyncio.Event()
+
+        async def async_subscribe(self, callback: Callable[[bytes], None]) -> None:
+            self.callback = callback
+
+        async def async_write(self, data: bytes) -> None:
+            self.writes.append(data)
+            plaintext = decrypt_frame(data, COMMUNICATION_KEY)
+            assert self.callback is not None
+            if plaintext[:2] == b"\xe7\x01":
+                response = encrypt_frame(
+                    build_frame(b"\xe7\x01" + session_key),
+                    COMMUNICATION_KEY,
+                )
+                self.callback(response)
+            elif len(self.writes) == 3:
+                self.retry_written.set()
+
+    transport = SilentTransport()
+    channel = H7129SessionChannel(transport, lambda _: None)  # type: ignore[arg-type]
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    unexpected_contexts: list[dict[str, object]] = []
+    loop.set_exception_handler(
+        lambda _loop, context: unexpected_contexts.append(context)
+    )
+
+    try:
+        establish = asyncio.create_task(channel.async_establish())
+        async with asyncio.timeout(1.0):
+            await transport.retry_written.wait()
+
+        channel.invalidate()
+
+        with pytest.raises(NegotiationError, match=r"e7-02.*invalidated"):
+            await establish
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert len(transport.writes) == 3
+    assert unexpected_contexts == []
+
+
+@pytest.mark.asyncio
 async def test_h7129_reconnects_only_after_phase_retry_budget_is_exhausted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

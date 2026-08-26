@@ -120,7 +120,7 @@ class H7129SessionChannel(SecureChannel):
         super().__init__(transport, plaintext_callback)
         self._session_key: bytes | None = None
         self._phase = 0
-        self._phase_future: asyncio.Future[bytes] | None = None
+        self._phase_future: asyncio.Future[bytes | None] | None = None
         self._refresh_during_negotiation = False
 
     async def async_establish(self) -> None:
@@ -129,6 +129,7 @@ class H7129SessionChannel(SecureChannel):
         self.invalidate()
         await self._transport.async_subscribe(self._wire_received)
 
+        failed_phase = 0x01
         try:
             response_01 = await self._exchange_step(0x01)
             self._session_key = extract_session_key(response_01)
@@ -136,9 +137,9 @@ class H7129SessionChannel(SecureChannel):
             # Captures place e7-02 1-2 ms after e7-01. Yielding for one
             # millisecond preserves that ordering without busy waiting.
             await asyncio.sleep(NEGOTIATION_STEP_DELAY)
+            failed_phase = 0x02
             await self._exchange_step(0x02)
         except (TimeoutError, ValueError, ConnectionError) as err:
-            failed_phase = self._phase
             self.invalidate()
             detail = str(err).strip() or repr(err)
             raise NegotiationError(
@@ -167,7 +168,7 @@ class H7129SessionChannel(SecureChannel):
     async def _exchange_step(self, step: int) -> bytes:
         self._phase = step
         loop = asyncio.get_running_loop()
-        future: asyncio.Future[bytes] = loop.create_future()
+        future: asyncio.Future[bytes | None] = loop.create_future()
         self._phase_future = future
         request = create_negotiation_frame(step)
         wire_request = encrypt_frame(request, COMMUNICATION_KEY)
@@ -176,7 +177,7 @@ class H7129SessionChannel(SecureChannel):
         try:
             for attempt in range(1, NEGOTIATION_ATTEMPTS + 1):
                 if future.done():
-                    response = future.result()
+                    response = self._phase_response(future)
                     break
 
                 remaining = deadline - loop.time()
@@ -196,7 +197,7 @@ class H7129SessionChannel(SecureChannel):
                     await self._transport.async_write(wire_request)
 
                 if future.done():
-                    response = future.result()
+                    response = self._phase_response(future)
                     break
 
                 wait_for = min(
@@ -205,19 +206,18 @@ class H7129SessionChannel(SecureChannel):
                 )
                 if wait_for <= 0:
                     raise TimeoutError
-                try:
-                    async with asyncio.timeout(wait_for):
-                        response = await asyncio.shield(future)
+                done, _ = await asyncio.wait((future,), timeout=wait_for)
+                if future in done:
+                    response = self._phase_response(future)
                     break
-                except TimeoutError:
-                    _LOGGER.debug(
-                        "H7129 negotiation e7-%02x received no matching response "
-                        "after attempt=%d/%d elapsed=%.3fs",
-                        step,
-                        attempt,
-                        NEGOTIATION_ATTEMPTS,
-                        loop.time() - started,
-                    )
+                _LOGGER.debug(
+                    "H7129 negotiation e7-%02x received no matching response "
+                    "after attempt=%d/%d elapsed=%.3fs",
+                    step,
+                    attempt,
+                    NEGOTIATION_ATTEMPTS,
+                    loop.time() - started,
+                )
             else:
                 raise TimeoutError
 
@@ -256,7 +256,16 @@ class H7129SessionChannel(SecureChannel):
         future = self._phase_future
         self._phase_future = None
         if future is not None and not future.done():
-            future.set_exception(NegotiationError("Connection was invalidated"))
+            # A normal sentinel result wakes the owning negotiation task without
+            # leaving an exception on an expired retry waiter for asyncio to log.
+            future.set_result(None)
+
+    @staticmethod
+    def _phase_response(future: asyncio.Future[bytes | None]) -> bytes:
+        response = future.result()
+        if response is None:
+            raise NegotiationError("Connection was invalidated")
+        return response
 
     def _wire_received(self, wire_frame: bytes) -> None:
         """Decrypt one frame while safely recognizing delayed e7 duplicates."""

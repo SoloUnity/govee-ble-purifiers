@@ -146,7 +146,9 @@ logged. Each `e7-01` and `e7-02` phase remains open for up to 15 seconds and
 reuses the same protected request for as many as three sends about five seconds
 apart. The first matching response completes the phase, including a delayed
 response to an earlier send. Only phase exhaustion or an actual connection
-failure recycles the GATT connection.
+failure recycles the GATT connection. A disconnect wakes the active negotiation
+without producing a second orphaned-future error, and recovery diagnostics retain
+the `e7-01` or `e7-02` phase that was interrupted.
 
 ### Polling and notifications
 

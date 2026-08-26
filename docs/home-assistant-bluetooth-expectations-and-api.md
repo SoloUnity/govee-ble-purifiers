@@ -852,7 +852,9 @@ The Govee purifier integration applies the general model as follows:
   while one matcher accepts the first valid response, including a delayed
   response to an earlier send. Duplicate responses from completed phases are
   ignored. A real disconnect aborts immediately; otherwise the connection is
-  recycled only after the phase exhausts its retry budget.
+  recycled only after the phase exhausts its retry budget. Disconnect
+  invalidation wakes only the negotiation owner, without leaving an exception
+  on an expired retry waiter, and preserves the interrupted phase in diagnostics.
 - H7129 session material is discarded on disconnect or negotiation failure.
 - Initialization is repeated after every reconnect.
 - Every startup request is attempted up to three times in documented order.
