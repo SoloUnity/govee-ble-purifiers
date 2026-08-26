@@ -117,6 +117,12 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
         try:
             await self.client.async_execute(command)
         except (PurifierClientError, ValueError) as err:
+            _LOGGER.error(
+                "Purifier control failed: name=%s command=%s error=%s",
+                self.name,
+                repr(command),
+                err,
+            )
             raise HomeAssistantError(
                 f"Unable to apply {type(command).__name__} to {self.name}: {err}"
             ) from err

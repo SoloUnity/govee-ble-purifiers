@@ -238,6 +238,11 @@ After an ambiguous timeout or disconnect, initialization first re-queries
 authoritative state and suppresses a replay if the requested state is already
 confirmed. Newer pending controls of the same type supersede older ones, and
 commands are never replayed after their deadline or beyond their send budget.
+If a command remains unconfirmed, its final Home Assistant error retains the
+requested plaintext frame, each send's connection generation and timing, the
+three response-timeout summaries with ignored-frame samples, and any `ee 05`
+fan notification observed during or after the transaction. This bounded
+evidence survives the recovery reconnect that follows an ambiguous write.
 
 Cleanup runs before config-entry setup, before a new connection, after a failed
 connection cycle, during shutdown/unload, and after entry removal. Removal does
@@ -422,4 +427,4 @@ decoded ATT operation, and raw bytes.
 - [Home Assistant integration and HACS reference](home-assistant-bluetooth-integration-reference.md)
 - [License](LICENSE)
 
-Release documentation reflects integration version 0.3.23.
+Release documentation reflects integration version 0.3.24.

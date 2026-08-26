@@ -9,7 +9,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 
 from .bluetooth import (
@@ -110,6 +110,10 @@ class _Operation:
     future: asyncio.Future[None]
     deadline: float
     send_attempts: int = 0
+    created_at: float = 0.0
+    send_diagnostics: list[str] = field(default_factory=list)
+    response_failures: list[str] = field(default_factory=list)
+    observed_fan_frames: list[str] = field(default_factory=list)
 
 
 class ReliablePurifierClient:
@@ -158,6 +162,7 @@ class ReliablePurifierClient:
         self._active_request: str | None = None
         self._last_error: str | None = None
         self._last_timeout_summary: str | None = None
+        self._last_command_diagnostics: str | None = None
         self._incomplete_initialization_requests: tuple[str, ...] = ()
         self._initialization_failure_summaries: dict[str, str] = {}
         self._essential_initialization_batches = 0
@@ -181,6 +186,7 @@ class ReliablePurifierClient:
             "active_request": self._active_request,
             "last_error": self._last_error,
             "last_timeout_summary": self._last_timeout_summary,
+            "last_command_diagnostics": self._last_command_diagnostics,
             "incomplete_initialization_requests": (
                 self._incomplete_initialization_requests
             ),
@@ -293,7 +299,13 @@ class ReliablePurifierClient:
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[None] = loop.create_future()
-        operation = _Operation(command, future, loop.time() + COMMAND_DEADLINE)
+        now = loop.time()
+        operation = _Operation(
+            command,
+            future,
+            now + COMMAND_DEADLINE,
+            created_at=now,
+        )
         self._coalesce_pending(operation)
         self._operations.append(operation)
         self._operation_event.set()
@@ -306,8 +318,9 @@ class ReliablePurifierClient:
                 future.cancel()
             with suppress(ValueError):
                 self._operations.remove(operation)
-            raise CommandDeadlineExceeded(
-                f"Command was not confirmed within {COMMAND_DEADLINE:.0f} seconds"
+            raise self._command_failure_error(
+                operation,
+                f"Command was not confirmed within {COMMAND_DEADLINE:.0f} seconds",
             ) from err
         except asyncio.CancelledError:
             if not future.done():
@@ -612,7 +625,12 @@ class ReliablePurifierClient:
             return
         loop = asyncio.get_running_loop()
         if loop.time() >= operation.deadline:
-            operation.future.set_exception(CommandDeadlineExceeded())
+            operation.future.set_exception(
+                self._command_failure_error(
+                    operation,
+                    "Command deadline expired before execution",
+                )
+            )
             return
 
         # Initialization after every reconnect re-queries the relevant state.
@@ -623,8 +641,9 @@ class ReliablePurifierClient:
 
         if operation.send_attempts >= COMMAND_SEND_ATTEMPTS:
             operation.future.set_exception(
-                CommandDeadlineExceeded(
-                    "Command remained unconfirmed after bounded retries"
+                self._command_failure_error(
+                    operation,
+                    "Command remained unconfirmed after bounded retries",
                 )
             )
             return
@@ -635,16 +654,22 @@ class ReliablePurifierClient:
                 return
             if loop.time() >= operation.deadline:
                 operation.future.set_exception(
-                    CommandDeadlineExceeded("Command deadline expired before retry")
+                    self._command_failure_error(
+                        operation,
+                        "Command deadline expired before retry",
+                    )
                 )
                 return
 
             _LOGGER.debug(
-                "Command transaction: command=%s attempt=%d/%d remaining=%.3fs",
+                "Command transaction: command=%s attempt=%d/%d remaining=%.3fs "
+                "session_generation=%d frame=%s",
                 type(operation.command).__name__,
                 operation.send_attempts + 1,
                 COMMAND_SEND_ATTEMPTS,
                 max(0.0, operation.deadline - loop.time()),
+                self._session_generation,
+                descriptor.frame.hex(" "),
             )
 
             send_recorded = False
@@ -654,6 +679,16 @@ class ReliablePurifierClient:
                 if not send_recorded:
                     operation.send_attempts += 1
                     send_recorded = True
+                    elapsed = (
+                        loop.time() - operation.created_at
+                        if operation.created_at > 0
+                        else 0.0
+                    )
+                    operation.send_diagnostics.append(
+                        f"attempt={operation.send_attempts},"
+                        f"generation={self._session_generation},"
+                        f"elapsed={elapsed:.3f}s"
+                    )
 
             try:
                 async with asyncio.timeout_at(operation.deadline):
@@ -662,7 +697,10 @@ class ReliablePurifierClient:
                         attempts=1,
                         on_send=record_send,
                     )
-            except TransactionTimeoutError:
+            except TransactionTimeoutError as err:
+                operation.response_failures.append(
+                    f"generation={self._session_generation}: {err}"
+                )
                 if (
                     operation.send_attempts < COMMAND_SEND_ATTEMPTS
                     and not operation.future.done()
@@ -679,21 +717,20 @@ class ReliablePurifierClient:
                 self._queue_operation_for_reconciliation(operation)
                 raise
             except TimeoutError as err:
+                failure = self._command_failure_error(
+                    operation,
+                    "Command deadline expired during Bluetooth transaction",
+                )
                 if not operation.future.done():
-                    operation.future.set_exception(
-                        CommandDeadlineExceeded(
-                            "Command deadline expired during Bluetooth transaction"
-                        )
-                    )
-                raise CommandDeadlineExceeded(
-                    "Command deadline expired during Bluetooth transaction"
-                ) from err
+                    operation.future.set_exception(failure)
+                raise failure from err
             except Exception:
                 self._queue_operation_for_reconciliation(operation)
                 raise
             else:
                 if not operation.future.done():
                     operation.future.set_result(None)
+                self._last_command_diagnostics = None
                 return
 
     async def _async_run_refresh(
@@ -1018,6 +1055,97 @@ class ReliablePurifierClient:
             return False
         return False
 
+    def _command_diagnostic_summary(
+        self,
+        operation: _Operation,
+        reason: str,
+    ) -> str:
+        """Return bounded evidence that survives command reconciliation."""
+        descriptor = self._protocol.command_request(operation.command)
+        command_detail = type(operation.command).__name__
+        if isinstance(operation.command, SetFanMode):
+            command_detail += f"(mode={operation.command.mode.value})"
+        sends = " | ".join(operation.send_diagnostics[-COMMAND_SEND_ATTEMPTS:])
+        failures = " | ".join(
+            operation.response_failures[-COMMAND_SEND_ATTEMPTS:]
+        )
+        fan_frames = " | ".join(operation.observed_fan_frames[-8:])
+        cached_fan_mode = (
+            self.state.fan_mode.value if self.state.fan_mode is not None else None
+        )
+        return (
+            f"{reason}; command={command_detail}; "
+            f"frame={descriptor.frame.hex(' ')}; "
+            f"sends={operation.send_attempts}/{COMMAND_SEND_ATTEMPTS}; "
+            f"send_timeline={sends or 'none'}; "
+            f"response_failures={failures or 'none'}; "
+            f"observed_ee05={fan_frames or 'none'}; "
+            f"current_generation={self._session_generation}; "
+            f"cached_fan_mode={cached_fan_mode}"
+        )
+
+    def _command_failure_error(
+        self,
+        operation: _Operation,
+        reason: str,
+    ) -> CommandDeadlineExceeded:
+        """Create and retain the final bounded diagnostic command error."""
+        summary = self._command_diagnostic_summary(operation, reason)
+        self._last_command_diagnostics = summary
+        return CommandDeadlineExceeded(summary)
+
+    def _pending_fan_operation(self) -> _Operation | None:
+        """Return the fan command to which an ee-05 frame may be relevant."""
+        active = self._active_operation
+        if (
+            active is not None
+            and isinstance(active.command, SetFanMode)
+            and not active.future.done()
+        ):
+            return active
+        return next(
+            (
+                operation
+                for operation in self._operations
+                if isinstance(operation.command, SetFanMode)
+                and not operation.future.done()
+            ),
+            None,
+        )
+
+    def _record_fan_frame_diagnostic(self, generation: int, frame: bytes) -> None:
+        """Correlate authoritative fan notifications with a pending command."""
+        if not frame.startswith(b"\xee\x05"):
+            return
+        operation = self._pending_fan_operation()
+        if operation is None:
+            return
+
+        mode: str | None = None
+        try:
+            event = self._protocol.decode(frame)
+        except Exception as err:  # noqa: BLE001 - diagnostics must not drop a frame
+            mode = f"decode_error:{type(err).__name__}"
+        else:
+            if isinstance(event, FanModeEvent) and event.mode is not None:
+                mode = event.mode.value
+
+        loop = asyncio.get_running_loop()
+        elapsed = (
+            loop.time() - operation.created_at if operation.created_at > 0 else 0.0
+        )
+        phase = self._active_request or self.status.value
+        detail = (
+            f"generation={generation},elapsed={elapsed:.3f}s,phase={phase},"
+            f"decoded_mode={mode},frame={frame.hex(' ')}"
+        )
+        operation.observed_fan_frames.append(detail)
+        _LOGGER.debug(
+            "Fan command diagnostic notification: requested_mode=%s %s",
+            operation.command.mode.value,
+            detail,
+        )
+
     def _invalidate_connection_scoped_state(self) -> None:
         """Forget values startup cannot authoritatively query after reconnect."""
         if self.state.fan_mode is not None:
@@ -1034,6 +1162,7 @@ class ReliablePurifierClient:
                 frame.hex(" "),
             )
             return
+        self._record_fan_frame_diagnostic(generation, frame)
         self._plaintext_rx_count += 1
         _LOGGER.debug(
             "RX plaintext queued: session_generation=%d count=%d active_request=%s "
@@ -1132,7 +1261,10 @@ class ReliablePurifierClient:
             return
         if asyncio.get_running_loop().time() >= operation.deadline:
             operation.future.set_exception(
-                CommandDeadlineExceeded("Command deadline expired during recovery")
+                self._command_failure_error(
+                    operation,
+                    "Command deadline expired during recovery",
+                )
             )
             return
         self._operations.appendleft(operation)
@@ -1146,7 +1278,12 @@ class ReliablePurifierClient:
             if operation.future.done():
                 continue
             if now >= operation.deadline:
-                operation.future.set_exception(CommandDeadlineExceeded())
+                operation.future.set_exception(
+                    self._command_failure_error(
+                        operation,
+                        "Command deadline expired while queued",
+                    )
+                )
             else:
                 retained.append(operation)
         self._operations = retained

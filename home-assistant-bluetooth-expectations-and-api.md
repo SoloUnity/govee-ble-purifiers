@@ -885,7 +885,10 @@ The Govee purifier integration applies the general model as follows:
 - Diagnostics retain recent connection failures, Home Assistant reachability,
   essential initialization batch/attempt counts, and GATT operation deadline,
   timeout, cancellation, and elapsed-time information. They also expose command
-  queue/attempt state and refresh preemption/resume state.
+  queue/attempt state and refresh preemption/resume state. An unconfirmed
+  command carries its bounded send timeline and response evidence across the
+  recovery reconnect, and fan controls correlate any observed `ee 05` frame
+  with its decoded mode, connection generation, transaction phase, and timing.
 
 These values are project policy based on the purifier traces and reliability
 goals. They are not universal Home Assistant constants.

@@ -25,6 +25,7 @@ from custom_components.govee_ble_air_purifier.models import (
     FanMode,
     Model,
     PurifierState,
+    SetFanMode,
     SetNightLightColor,
     SetPower,
 )
@@ -753,6 +754,64 @@ async def test_ambiguous_command_is_bounded_and_reconciled() -> None:
     await client._async_execute_operation(operation)
     assert future.done()
     assert future.exception() is None
+
+
+@pytest.mark.asyncio
+async def test_fan_failure_preserves_wire_diagnostics_across_reconnect() -> None:
+    """The final HA error retains all fan evidence from the prior session."""
+    client = make_client()
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[None] = loop.create_future()
+    operation = _Operation(
+        SetFanMode(FanMode.MEDIUM),
+        future,
+        loop.time() + 30,
+        created_at=loop.time(),
+    )
+    client._active_operation = operation
+    client._session_generation = 4
+    calls = 0
+
+    async def fail_transaction(*_: object, **kwargs: object) -> tuple[bytes, ...]:
+        nonlocal calls
+        calls += 1
+        on_send = kwargs["on_send"]
+        assert callable(on_send)
+        on_send()
+        if calls == 1:
+            client._on_plaintext_frame(4, build_frame(bytes.fromhex("ee 05 01 03")))
+        raise client_module.TransactionTimeoutError(
+            "received=1, matched_fragments=0, ignored=1, "
+            "ignored_sample=ee 05 01 03"
+        )
+
+    client._async_execute_descriptor = fail_transaction  # type: ignore[method-assign]
+
+    with pytest.raises(client_module.TransactionTimeoutError):
+        await client._async_execute_operation(operation)
+
+    assert calls == 3
+    assert operation.send_attempts == 3
+    assert len(operation.response_failures) == 3
+    assert len(operation.observed_fan_frames) == 1
+
+    # The command survives the recovery connection and then reports why its
+    # already-bounded sends could not be confirmed.
+    client._active_operation = None
+    client._session_generation = 5
+    await client._async_execute_operation(operation)
+
+    error = future.exception()
+    assert isinstance(error, client_module.CommandDeadlineExceeded)
+    summary = str(error)
+    assert "SetFanMode(mode=medium)" in summary
+    assert "frame=3a 05 01 02" in summary
+    assert "sends=3/3" in summary
+    assert "generation=4" in summary
+    assert "ignored_sample=ee 05 01 03" in summary
+    assert "decoded_mode=high" in summary
+    assert "current_generation=5" in summary
+    assert client.diagnostic_snapshot()["last_command_diagnostics"] == summary
 
 
 @pytest.mark.asyncio
