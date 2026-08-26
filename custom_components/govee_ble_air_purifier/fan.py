@@ -17,15 +17,15 @@ from .entity import GoveePurifierEntity
 from .models import FanMode
 
 _MANUAL_MODES: tuple[FanMode, ...] = (
+    FanMode.SLEEP,
     FanMode.LOW,
     FanMode.MEDIUM,
     FanMode.HIGH,
-)
-_PRESET_MODES: tuple[FanMode, ...] = (
-    FanMode.AUTO,
-    FanMode.SLEEP,
     FanMode.TURBO,
 )
+_PRESET_MANUAL = "manual"
+_PRESET_AUTO = "auto"
+_PRESET_MODES = [_PRESET_MANUAL, _PRESET_AUTO]
 
 
 async def async_setup_entry(
@@ -48,7 +48,7 @@ class GoveePurifierFan(GoveePurifierEntity, FanEntity):
         | FanEntityFeature.TURN_OFF
     )
     _attr_speed_count = len(_MANUAL_MODES)
-    _attr_preset_modes = [mode.value for mode in _PRESET_MODES]
+    _attr_preset_modes = _PRESET_MODES
 
     def __init__(self, entry: GoveeConfigEntry) -> None:
         """Initialize the fan."""
@@ -74,7 +74,20 @@ class GoveePurifierFan(GoveePurifierEntity, FanEntity):
     def preset_mode(self) -> str | None:
         """Return the cached preset mode."""
         mode = self._state.fan_mode
-        return mode.value if mode in _PRESET_MODES else None
+        if mode in _MANUAL_MODES:
+            return _PRESET_MANUAL
+        if mode is FanMode.AUTO:
+            return _PRESET_AUTO
+        return None
+
+    def _fan_mode_for_preset(self, preset_mode: str) -> FanMode:
+        """Resolve an entity preset to a documented physical fan mode."""
+        if preset_mode == _PRESET_AUTO:
+            return FanMode.AUTO
+        if preset_mode == _PRESET_MANUAL:
+            mode = self._state.fan_mode
+            return mode if mode in _MANUAL_MODES else FanMode.LOW
+        raise ValueError(f"Unsupported preset mode: {preset_mode}")
 
     @override
     async def async_turn_on(
@@ -84,11 +97,18 @@ class GoveePurifierFan(GoveePurifierEntity, FanEntity):
         **kwargs: Any,
     ) -> None:
         """Turn on the purifier, optionally selecting a mode."""
-        await self._async_run_operation(self.coordinator.async_set_power(True))
+        mode: FanMode | None = None
         if percentage is not None:
-            await self.async_set_percentage(percentage)
+            if percentage == 0:
+                await self.async_turn_off()
+                return
+            mode = percentage_to_ordered_list_item(_MANUAL_MODES, percentage)
         elif preset_mode is not None:
-            await self.async_set_preset_mode(preset_mode)
+            mode = self._fan_mode_for_preset(preset_mode)
+
+        await self._async_run_operation(self.coordinator.async_set_power(True))
+        if mode is not None:
+            await self._async_run_operation(self.coordinator.async_set_fan_mode(mode))
 
     @override
     async def async_turn_off(self, **kwargs: Any) -> None:
@@ -97,24 +117,19 @@ class GoveePurifierFan(GoveePurifierEntity, FanEntity):
 
     @override
     async def async_set_percentage(self, percentage: int) -> None:
-        """Set one of the three manual fan speeds."""
+        """Set one of the five manual fan levels."""
         if percentage == 0:
             await self.async_turn_off()
             return
+        mode = percentage_to_ordered_list_item(_MANUAL_MODES, percentage)
         if self.is_on is False:
             await self._async_run_operation(self.coordinator.async_set_power(True))
-        mode = percentage_to_ordered_list_item(_MANUAL_MODES, percentage)
         await self._async_run_operation(self.coordinator.async_set_fan_mode(mode))
 
     @override
     async def async_set_preset_mode(self, preset_mode: str) -> None:
-        """Set Auto, Sleep, or Turbo mode."""
-        try:
-            mode = FanMode(preset_mode)
-        except ValueError as err:
-            raise ValueError(f"Unsupported preset mode: {preset_mode}") from err
-        if mode not in _PRESET_MODES:
-            raise ValueError(f"Unsupported preset mode: {preset_mode}")
+        """Set the Auto preset or select the current/default manual level."""
+        mode = self._fan_mode_for_preset(preset_mode)
         if self.is_on is False:
             await self._async_run_operation(self.coordinator.async_set_power(True))
         await self._async_run_operation(self.coordinator.async_set_fan_mode(mode))

@@ -27,7 +27,7 @@ Each configured purifier creates four entities:
 
 | Entity | Capabilities |
 | --- | --- |
-| Fan | Power, Low/Medium/High percentage speeds, Auto/Sleep/Turbo presets |
+| Fan | Power, five percentage levels from Sleep through Turbo, Manual/Auto presets |
 | Night light | Power, brightness, and RGB colour |
 | PM2.5 sensor | Current particulate concentration in µg/m³ |
 | Filter-life sensor | Remaining filter life as a percentage; diagnostic category |
@@ -35,6 +35,38 @@ Each configured purifier creates four entities:
 Entities use the integration's cached push state and do not independently poll
 Bluetooth. Physical controls update Home Assistant when the purifier sends the
 corresponding notification.
+
+The fan exposes the purifier's physical modes through this Home Assistant UI
+mapping:
+
+| Physical mode | Percentage | Preset |
+| --- | ---: | --- |
+| Sleep | 20% | Manual |
+| Low | 40% | Manual |
+| Medium | 60% | Manual |
+| High | 80% | Manual |
+| Turbo | 100% | Manual |
+| Auto | unset | Auto |
+
+Use the canonical percentages above in automations. Other nonzero percentages
+snap to one of the five ordered levels. Selecting Manual preserves and reapplies
+the current level; from Auto or an unknown mode it selects Low (40%). Manual is
+only a Home Assistant grouping, not an additional purifier mode.
+
+### Fan automation migration
+
+The fan UI model changed from three percentage speeds plus Auto/Sleep/Turbo
+presets to five percentage levels plus Manual/Auto presets. Existing automations
+should be updated as follows:
+
+| Previous request | Replacement |
+| --- | --- |
+| Sleep preset | `fan.set_percentage` with `percentage: 20` |
+| Turbo preset | `fan.set_percentage` with `percentage: 100` |
+| Low near 33% | `percentage: 40` |
+| Medium near 67% | `percentage: 60` |
+| High at 100% | `percentage: 80` (100% now selects Turbo) |
+| Auto preset | No change |
 
 ## Requirements
 
@@ -446,6 +478,7 @@ decoded ATT operation, and raw bytes.
 
 ## References
 
+- [Phased implementation plans](docs/plans/README.md)
 - [Govee purifier protocol](docs/govee-ble-air-purifier-protocol.md)
 - [Home Assistant Bluetooth expectations, APIs, and reliable handling](docs/home-assistant-bluetooth-expectations-and-api.md)
 - [Home Assistant integration and HACS reference](docs/home-assistant-bluetooth-integration-reference.md)

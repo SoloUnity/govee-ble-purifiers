@@ -17,9 +17,14 @@ Use the existing documentation as the source of truth:
   handling.
 - [Home Assistant integration reference](docs/home-assistant-bluetooth-integration-reference.md)
   — general Home Assistant and HACS requirements.
+- [Implementation plans](docs/plans/README.md) — ordered proposals for future
+  work; planned behavior is not current behavior until implemented and released.
 
 Inspect the implementation and tests as well as the documentation. When they
 disagree, identify the discrepancy rather than silently choosing one.
+
+Do not treat a plan as implemented behavior. Use the current README,
+architecture policy, implementation, and tests for the released contract.
 
 ## Project rules
 

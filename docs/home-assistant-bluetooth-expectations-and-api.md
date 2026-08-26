@@ -894,6 +894,12 @@ The Govee purifier integration applies the general model as follows:
   `3a 05` frame is ignored, and unsolicited `ee 05` physical updates remain
   authoritative afterward. H7129 uses these same plaintext rules after session
   decryption.
+- The fan entity presents Sleep, Low, Medium, High, and Turbo as an ordered five
+  level list at 20%, 40%, 60%, 80%, and 100%. All five report the `manual`
+  preset; hardware Auto has no percentage and reports `auto`. Unknown mode has
+  neither value. The `manual` preset is only an entity-layer grouping, never a
+  protocol `FanMode` or wire command. Selecting it reapplies an existing level
+  or falls back to Low when the device is in Auto or its mode is unknown.
 - Physical-control notifications update cached state without waiting for a poll.
 - Diagnostics retain recent connection failures, Home Assistant reachability,
   essential initialization batch/attempt counts, and GATT operation deadline,
