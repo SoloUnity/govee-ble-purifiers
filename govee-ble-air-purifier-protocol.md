@@ -264,6 +264,13 @@ Payload layout:
 | 3 | Manual level: `01` Low, `02` Medium, `03` High; otherwise `00` |
 | 5 | Auto parameter: H7124 `14`, H7129 `12`; otherwise `00` |
 
+In observed High-mode controls, both models acknowledged a Bluetooth-issued
+command by returning the exact 20-byte `3a 05` command frame on the notification
+characteristic. H7124 acknowledgements arrived 48-93 ms after each send. H7129
+acknowledgements arrived 30-117 ms after each send; two identical decrypted
+copies were observed per send in that capture. No `ee 05` followed these
+Bluetooth-issued commands.
+
 Use `3a 05`, not the alternate H7124 `33 05` path. H7129 Quiet and High
 Efficiency Auto parameters are unspecified.
 
@@ -402,9 +409,11 @@ sentinels.
 
 ### Fan mode: `ee 05`
 
-These notifications can be emitted directly after a physical control change,
-without a preceding app `3a 05` command. The payload normally matches the
-corresponding command payload, except that observed H7129 Sleep and Turbo
+These notifications were observed directly after physical fan-mode changes,
+without a preceding app `3a 05` command. They were not observed after the
+Bluetooth-issued High-mode commands described above; no other `ee 05` trigger
+is established by the current captures. The payload normally matches the
+corresponding mode payload, except that observed H7129 Sleep and Turbo
 notifications retain `03` in byte 3.
 
 | Mode | Model | Notification |
@@ -493,5 +502,6 @@ These queries are not specified for H7129.
 | `aa 07 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ae` | Hardware version/device data |
 | `aa 20 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 8a` | Hardware version |
 
-`aa 05` is mode-related but is not fully specified. Prefer `ee 05` for mode
-changes and `3a 05` for mode control.
+`aa 05` is mode-related but is not fully specified. Current captures use `3a 05`
+for Bluetooth mode control and its exact acknowledgement, while `ee 05` reports
+physical fan-mode changes.
