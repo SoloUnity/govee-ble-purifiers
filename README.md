@@ -281,7 +281,7 @@ not request Bluetooth rediscovery because automatic discovery is disabled.
 - **Near** and **Far** are relative labels based on one scan's RSSI. They do not
   guarantee that a GATT connection will succeed.
 
-See [the protocol document](govee-ble-air-purifier-protocol.md) for the
+See [the protocol document](docs/govee-ble-air-purifier-protocol.md) for the
 trace-supported wire findings.
 
 ## Troubleshooting
@@ -444,9 +444,9 @@ decoded ATT operation, and raw bytes.
 
 ## References
 
-- [Govee purifier protocol](govee-ble-air-purifier-protocol.md)
-- [Home Assistant Bluetooth expectations, APIs, and reliable handling](home-assistant-bluetooth-expectations-and-api.md)
-- [Home Assistant integration and HACS reference](home-assistant-bluetooth-integration-reference.md)
+- [Govee purifier protocol](docs/govee-ble-air-purifier-protocol.md)
+- [Home Assistant Bluetooth expectations, APIs, and reliable handling](docs/home-assistant-bluetooth-expectations-and-api.md)
+- [Home Assistant integration and HACS reference](docs/home-assistant-bluetooth-integration-reference.md)
 - [License](LICENSE)
 
 Release documentation reflects integration version 0.3.26.
