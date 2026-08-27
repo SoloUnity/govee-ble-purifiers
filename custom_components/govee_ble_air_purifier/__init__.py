@@ -11,6 +11,7 @@ from homeassistant.core import Event, HomeAssistant
 from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
 
 from .bluetooth import BluetoothUnavailableError, async_close_stale_connections
+from .bluetooth_profile import bluetooth_settings_from_profile
 from .const import CONF_MODEL, PLATFORMS
 from .coordinator import GoveeDataUpdateCoordinator
 from .profiles import ProfileError, async_get_profile_registry
@@ -54,16 +55,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: GoveeConfigEntry) -> boo
             f"model {requested_model!r} has no exact profile. Reinstall or "
             "update the integration before retrying setup."
         ) from err
+    bluetooth_settings = bluetooth_settings_from_profile(profile)
     await _async_cleanup_address(
         address,
         reason="entry_setup",
-        timeout=profile.timings.stale_connection_cleanup_timeout,
+        timeout=bluetooth_settings.cleanup.stale_connection_timeout,
     )
 
     coordinator = GoveeDataUpdateCoordinator(
         hass,
         address=address,
         profile=profile,
+        bluetooth_settings=bluetooth_settings,
         name=entry.title,
     )
 
@@ -105,9 +108,10 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     address = entry.data[CONF_ADDRESS]
     try:
         registry = await async_get_profile_registry(hass)
-        timeout = registry.for_model(
-            entry.data[CONF_MODEL]
-        ).timings.stale_connection_cleanup_timeout
+        profile = registry.for_model(entry.data[CONF_MODEL])
+        timeout = bluetooth_settings_from_profile(
+            profile
+        ).cleanup.stale_connection_timeout
     except (ProfileError, KeyError, ValueError):
         # Removal must remain bounded even when the artifact that prevented
         # setup is itself invalid. This is a safety fallback, not profile data.

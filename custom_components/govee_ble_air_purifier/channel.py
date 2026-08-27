@@ -15,7 +15,7 @@ from .crypto import (
     encrypt_frame,
     extract_session_key,
 )
-from .frame import FrameError, build_frame, validate_frame
+from .frame import FrameError, FrameLengthError, build_frame, validate_frame
 from .profiles import DeviceProfile, Model
 
 _LOGGER = logging.getLogger(__name__)
@@ -67,6 +67,16 @@ class SecureChannel:
     async def async_send(self, plaintext: bytes) -> None:
         raise NotImplementedError
 
+    async def _async_write_wire_frame(self, wire_frame: bytes) -> None:
+        """Enforce the profile frame size before handing opaque bytes to GATT."""
+        wire_frame = bytes(wire_frame)
+        expected = self.profile.protocol.frame_size
+        if len(wire_frame) != expected:
+            raise FrameLengthError(
+                f"wire frame is {len(wire_frame)} bytes; profile expects {expected}"
+            )
+        await self._transport.async_write(wire_frame)
+
     def invalidate(self) -> None:
         """Discard all connection-scoped state."""
         self._ready = False
@@ -105,7 +115,7 @@ class PlaintextChannel(SecureChannel):
             raise ChannelNotReadyError("Plaintext channel is not ready")
         plaintext = validate_frame(plaintext)
         _LOGGER.debug("H7124 TX plaintext: %s", plaintext.hex(" "))
-        await self._transport.async_write(plaintext)
+        await self._async_write_wire_frame(plaintext)
 
     def _wire_received(self, wire_frame: bytes) -> None:
         try:
@@ -218,7 +228,7 @@ class H7129SessionChannel(SecureChannel):
                 # Reuse the exact encrypted request for every attempt. A late
                 # response to any send may therefore complete this one phase.
                 async with asyncio.timeout_at(deadline):
-                    await self._transport.async_write(wire_request)
+                    await self._async_write_wire_frame(wire_request)
 
                 if future.done():
                     response = self._phase_response(future)
@@ -269,7 +279,7 @@ class H7129SessionChannel(SecureChannel):
             raise ChannelNotReadyError("H7129 session is not ready")
         plaintext = validate_frame(plaintext)
         _LOGGER.debug("H7129 TX application plaintext: %s", plaintext.hex(" "))
-        await self._transport.async_write(encrypt_frame(plaintext, key))
+        await self._async_write_wire_frame(encrypt_frame(plaintext, key))
 
     def invalidate(self) -> None:
         """Forget the negotiated key immediately on any disconnect/failure."""

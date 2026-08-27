@@ -7,19 +7,32 @@ is shared by the protocol codec, the reliable client, and unit tests.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 
-from .profiles import (
-    DeviceProfile as DeviceProfile,
-)
-from .profiles import (
-    FanMode as FanMode,
-)
-from .profiles import (
-    Model as Model,
-)
-from .profiles import (
-    SecurityMode as SecurityMode,
-)
+
+class Model(StrEnum):
+    """Supported purifier model values retained in config entries."""
+
+    H7124 = "H7124"
+    H7129 = "H7129"
+
+
+class SecurityMode(StrEnum):
+    """Closed application-channel strategy identifiers."""
+
+    PLAINTEXT = "plaintext"
+    H7129_SESSION = "h7129_session"
+
+
+class FanMode(StrEnum):
+    """Fan modes whose wire representation is documented."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    SLEEP = "sleep"
+    AUTO = "auto"
+    TURBO = "turbo"
 
 
 @dataclass(frozen=True, slots=True)

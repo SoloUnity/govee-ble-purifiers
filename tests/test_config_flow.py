@@ -16,15 +16,27 @@ from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.govee_ble_air_purifier import config_flow as config_flow_module
-from custom_components.govee_ble_air_purifier.config_flow import (
-    DiscoveredPurifier,
-    _async_validate_purifier,
-    _discovery_options,
-    _model_from_name,
+from custom_components.govee_ble_air_purifier import (
+    config_flow as config_flow_module,
+)
+from custom_components.govee_ble_air_purifier import (
+    discovery as discovery_module,
+)
+from custom_components.govee_ble_air_purifier import (
+    setup_validation as setup_validation_module,
 )
 from custom_components.govee_ble_air_purifier.const import CONF_MODEL, DOMAIN
-from custom_components.govee_ble_air_purifier.profiles import ProfileError
+from custom_components.govee_ble_air_purifier.discovery import (
+    DiscoveredPurifier,
+    PurifierDiscoveryService,
+)
+from custom_components.govee_ble_air_purifier.profiles import (
+    ProfileError,
+    get_profile_registry,
+)
+from custom_components.govee_ble_air_purifier.setup_validation import (
+    PurifierSetupValidator,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -44,25 +56,25 @@ def _prepare_bluetooth_test_environment(
             new_callable=AsyncMock,
             return_value=True,
         ),
-        patch.object(config_flow_module, "MANUAL_DISCOVERY_SCAN_DURATION", 0.0),
+        patch.object(discovery_module, "MANUAL_DISCOVERY_SCAN_DURATION", 0.0),
         patch.object(
-            config_flow_module,
+            discovery_module,
             "SELECTED_DEVICE_ADVERTISEMENT_TIMEOUT",
             1,
         ),
         patch.object(
-            config_flow_module,
+            discovery_module,
             "SELECTED_ADVERTISEMENT_CHECK_INTERVAL",
             0.0,
         ),
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_register_callback",
             return_value=MagicMock(),
             create=True,
         ),
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_ble_device_from_address",
             return_value=None,
             create=True,
@@ -85,8 +97,8 @@ async def test_invalid_profile_aborts_before_setup_scan(
             new=AsyncMock(side_effect=ProfileError("bad profile")),
         ),
         patch.object(
-            config_flow_module,
-            "_async_discover_purifiers",
+            PurifierDiscoveryService,
+            "async_discover_purifiers",
             new_callable=AsyncMock,
         ) as discover,
     ):
@@ -110,13 +122,13 @@ async def test_explicit_validation_waits_for_ready_and_always_shuts_down(
         async_shutdown=AsyncMock(),
     )
 
+    validator = PurifierSetupValidator(hass, get_profile_registry())
     with patch.object(
-        config_flow_module,
+        setup_validation_module,
         "GoveeDataUpdateCoordinator",
         return_value=coordinator,
     ):
-        await _async_validate_purifier(
-            hass,
+        await validator.async_validate(
             address="AA:BB:CC:DD:EE:FF",
             model="H7129",
             name="ihoment_H7129_TEST",
@@ -137,16 +149,16 @@ async def test_explicit_validation_failure_still_shuts_down(
         async_shutdown=AsyncMock(),
     )
 
+    validator = PurifierSetupValidator(hass, get_profile_registry())
     with (
         patch.object(
-            config_flow_module,
+            setup_validation_module,
             "GoveeDataUpdateCoordinator",
             return_value=coordinator,
         ),
         pytest.raises(RuntimeError, match="not ready"),
     ):
-        await _async_validate_purifier(
-            hass,
+        await validator.async_validate(
             address="AA:BB:CC:DD:EE:FF",
             model="H7124",
             name="GVH7124TEST",
@@ -213,37 +225,37 @@ async def test_user_flow_selects_discovered_purifier_without_address_entry(
             "address": discovery.address,
             "connectable": True,
         }
-        assert mode is config_flow_module.bluetooth.BluetoothScanningMode.ACTIVE
+        assert mode is discovery_module.bluetooth.BluetoothScanningMode.ACTIVE
         assert timeout == 1
         return fresh
 
     with (
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_request_active_scan",
             new_callable=AsyncMock,
             side_effect=active_scan,
             create=True,
         ) as request_active_scan,
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_discovered_service_info",
             side_effect=discoveries,
         ),
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow."
+            "custom_components.govee_ble_air_purifier.discovery."
             "bluetooth.async_process_advertisements",
             new_callable=AsyncMock,
             side_effect=process_advertisements,
         ) as process_advertisements,
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow."
+            "custom_components.govee_ble_air_purifier.discovery."
             "bluetooth.async_last_service_info",
             return_value=discovery,
         ),
-        patch(
-            "custom_components.govee_ble_air_purifier.config_flow."
-            "_async_validate_purifier",
+        patch.object(
+            PurifierSetupValidator,
+            "async_validate",
             new_callable=AsyncMock,
         ) as validate,
     ):
@@ -269,7 +281,6 @@ async def test_user_flow_selects_discovered_purifier_without_address_entry(
         CONF_MODEL: "H7129",
     }
     validate.assert_awaited_once_with(
-        hass,
         address=discovery.address,
         model="H7129",
         name=discovery.name,
@@ -284,7 +295,7 @@ async def test_user_flow_selects_discovered_purifier_without_address_entry(
     }
     assert (
         process_call.args[3]
-        is config_flow_module.bluetooth.BluetoothScanningMode.ACTIVE
+        is discovery_module.bluetooth.BluetoothScanningMode.ACTIVE
     )
     assert process_call.args[4] == 1
     assert call_order == [
@@ -307,13 +318,13 @@ async def test_user_flow_excludes_device_not_seen_during_active_scan(
 
     with (
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_request_active_scan",
             new_callable=AsyncMock,
             create=True,
         ) as request_active_scan,
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_discovered_service_info",
             return_value=(stale_discovery,),
         ),
@@ -340,13 +351,13 @@ async def test_user_flow_keeps_observing_when_active_scan_fails(
 
     with (
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_request_active_scan",
             new=AsyncMock(side_effect=failed_scan),
             create=True,
         ) as request_active_scan,
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_discovered_service_info",
             return_value=(discovery,),
         ),
@@ -372,13 +383,13 @@ async def test_user_flow_failed_scan_rejects_stale_cache(
 
     with (
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_request_active_scan",
             new=AsyncMock(side_effect=RuntimeError("scanner unavailable")),
             create=True,
         ),
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_discovered_service_info",
             return_value=(stale_discovery,),
         ),
@@ -415,18 +426,18 @@ async def test_user_flow_rejects_registration_cache_replay(
 
     with (
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_register_callback",
             side_effect=register_callback,
         ),
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_request_active_scan",
             new_callable=AsyncMock,
             create=True,
         ),
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_discovered_service_info",
             return_value=(stale_discovery,),
         ),
@@ -458,15 +469,15 @@ async def test_user_flow_waits_full_window_when_active_scan_returns_early(
     observer = hass.async_create_task(observe_during_window())
     started_at = time.monotonic()
     with (
-        patch.object(config_flow_module, "MANUAL_DISCOVERY_SCAN_DURATION", 0.05),
+        patch.object(discovery_module, "MANUAL_DISCOVERY_SCAN_DURATION", 0.05),
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_request_active_scan",
             new_callable=AsyncMock,
             create=True,
         ) as request_active_scan,
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_discovered_service_info",
             return_value=(discovery,),
         ),
@@ -493,13 +504,13 @@ async def test_each_user_flow_starts_a_new_active_scan(
 
     with (
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_request_active_scan",
             new=AsyncMock(side_effect=active_scan),
             create=True,
         ) as request_active_scan,
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_discovered_service_info",
             return_value=(discovery,),
         ),
@@ -536,7 +547,7 @@ async def test_user_flow_retains_valid_name_seen_during_scan(
         **__: object,
     ) -> MagicMock:
         assert match_dict == {"connectable": True}
-        assert mode is config_flow_module.bluetooth.BluetoothScanningMode.PASSIVE
+        assert mode is discovery_module.bluetooth.BluetoothScanningMode.PASSIVE
         callbacks.append(callback)
         return cancel_callback
 
@@ -548,18 +559,18 @@ async def test_user_flow_retains_valid_name_seen_during_scan(
 
     with (
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_register_callback",
             side_effect=register_callback,
         ),
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_request_active_scan",
             new=AsyncMock(side_effect=active_scan),
             create=True,
         ),
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_discovered_service_info",
             return_value=(nameless,),
         ),
@@ -601,12 +612,12 @@ async def test_user_flow_combines_stale_identity_with_fresh_nameless_sighting(
 
     with (
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_discovered_service_info",
             side_effect=discoveries,
         ),
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_request_active_scan",
             new=AsyncMock(side_effect=active_scan),
             create=True,
@@ -636,17 +647,17 @@ async def test_user_flow_uses_ble_device_name_for_fresh_nameless_sighting(
 
     with (
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_discovered_service_info",
             return_value=(nameless,),
         ),
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_ble_device_from_address",
             return_value=ble_device,
         ) as ble_device_from_address,
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_request_active_scan",
             new=AsyncMock(side_effect=active_scan),
             create=True,
@@ -679,12 +690,12 @@ async def test_user_flow_retains_identity_across_setup_flows(
 
     with (
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_discovered_service_info",
             side_effect=discoveries,
         ),
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_request_active_scan",
             new=AsyncMock(side_effect=active_scan),
             create=True,
@@ -715,12 +726,12 @@ async def test_user_flow_reports_fresh_devices_without_supported_name(
 
     with (
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_discovered_service_info",
             return_value=(nameless,),
         ),
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_request_active_scan",
             new=AsyncMock(side_effect=active_scan),
             create=True,
@@ -749,12 +760,12 @@ async def test_user_flow_does_not_infer_model_from_nameless_address(
 
     with (
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_discovered_service_info",
             return_value=(address_only,),
         ),
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_request_active_scan",
             new=AsyncMock(side_effect=active_scan),
             create=True,
@@ -779,29 +790,29 @@ async def test_user_flow_requires_fresh_selected_device_advertisement(
 
     with (
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_request_active_scan",
             new=AsyncMock(side_effect=active_scan),
             create=True,
         ),
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_discovered_service_info",
             return_value=(discovery,),
         ),
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_process_advertisements",
             new=AsyncMock(side_effect=TimeoutError),
         ) as process_advertisements,
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_last_service_info",
             return_value=discovery,
         ),
-        patch(
-            "custom_components.govee_ble_air_purifier.config_flow."
-            "_async_validate_purifier",
+        patch.object(
+            PurifierSetupValidator,
+            "async_validate",
             new_callable=AsyncMock,
         ) as validate,
     ):
@@ -831,24 +842,24 @@ async def test_user_flow_retains_valid_name_when_fresh_packet_is_nameless(
 
     with (
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_request_active_scan",
             new=AsyncMock(side_effect=active_scan),
             create=True,
         ),
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_discovered_service_info",
             return_value=(discovery,),
         ),
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_process_advertisements",
             new=AsyncMock(return_value=fresh_nameless),
         ),
-        patch(
-            "custom_components.govee_ble_air_purifier.config_flow."
-            "_async_validate_purifier",
+        patch.object(
+            PurifierSetupValidator,
+            "async_validate",
             new_callable=AsyncMock,
         ) as validate,
     ):
@@ -863,7 +874,6 @@ async def test_user_flow_retains_valid_name_when_fresh_packet_is_nameless(
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == discovery.name
     validate.assert_awaited_once_with(
-        hass,
         address=discovery.address,
         model="H7124",
         name=discovery.name,
@@ -892,29 +902,29 @@ async def test_user_flow_accepts_fresh_cache_when_callback_is_deduplicated(
 
     with (
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_request_active_scan",
             new=AsyncMock(side_effect=active_scan),
             create=True,
         ),
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_discovered_service_info",
             return_value=(discovery,),
         ),
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_process_advertisements",
             side_effect=no_callback,
         ),
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_last_service_info",
             side_effect=refreshed_cache,
         ),
-        patch(
-            "custom_components.govee_ble_air_purifier.config_flow."
-            "_async_validate_purifier",
+        patch.object(
+            PurifierSetupValidator,
+            "async_validate",
             new_callable=AsyncMock,
         ) as validate,
     ):
@@ -938,7 +948,7 @@ async def test_user_flow_aborts_when_no_supported_device_is_visible(
 ) -> None:
     """Manual setup never falls back to a typed Bluetooth address."""
     with patch(
-        "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+        "custom_components.govee_ble_air_purifier.discovery.bluetooth."
         "async_discovered_service_info",
         return_value=(),
     ):
@@ -967,13 +977,13 @@ async def test_user_flow_excludes_already_configured_purifier(
 
     with (
         patch.object(
-            config_flow_module.bluetooth,
+            discovery_module.bluetooth,
             "async_request_active_scan",
             new=AsyncMock(side_effect=active_scan),
             create=True,
         ),
         patch(
-            "custom_components.govee_ble_air_purifier.config_flow.bluetooth."
+            "custom_components.govee_ble_air_purifier.discovery.bluetooth."
             "async_discovered_service_info",
             return_value=(discovery,),
         ),
@@ -986,16 +996,23 @@ async def test_user_flow_excludes_already_configured_purifier(
     assert result["reason"] == "no_devices_found"
 
 
-def test_model_inference_accepts_only_supported_advertised_names() -> None:
+def test_discovery_service_accepts_only_supported_advertised_names(
+    hass: HomeAssistant,
+) -> None:
     """Model inference follows the two supported advertised-name families."""
-    assert _model_from_name("GVH7124ABCD") == "H7124"
-    assert _model_from_name("ihoment_H7129_ABCD") == "H7129"
-    assert _model_from_name("Govee H7124 1234") is None
-    assert _model_from_name("Generic Govee device") is None
+    service = PurifierDiscoveryService(hass, get_profile_registry())
+
+    assert service.model_from_name("GVH7124ABCD") == "H7124"
+    assert service.model_from_name("ihoment_H7129_ABCD") == "H7129"
+    assert service.model_from_name("Govee H7124 1234") is None
+    assert service.model_from_name("Generic Govee device") is None
 
 
-def test_discovery_options_rank_near_and_far_without_showing_addresses() -> None:
+def test_discovery_service_options_rank_near_and_far_without_addresses(
+    hass: HomeAssistant,
+) -> None:
     """The strongest device is Near and Bluetooth addresses stay hidden."""
+    service = PurifierDiscoveryService(hass, get_profile_registry())
     discoveries = (
         DiscoveredPurifier(
             address="11:11:11:11:11:11",
@@ -1010,7 +1027,7 @@ def test_discovery_options_rank_near_and_far_without_showing_addresses() -> None
             rssi=-82,
         ),
     )
-    assert _discovery_options(discoveries) == {
+    assert service.discovery_options(discoveries) == {
         "11:11:11:11:11:11": "GVH7124BEDROOM (Near)",
         "22:22:22:22:22:22": "ihoment_H7129_BASEMENT (Far)",
     }

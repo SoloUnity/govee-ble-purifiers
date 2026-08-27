@@ -457,21 +457,37 @@ cleanup before reconnecting.
 
 | Module | Responsibility |
 | --- | --- |
-| `config_flow.py` | Manual scan window, name/model classification, selection freshness, validation |
-| `profiles.py` / `model_profiles/` | Atomic profile loading, inheritance, strict validation, immutable device-specific data |
-| `bluetooth.py` | Home Assistant scanner/cache adapter, route diagnostics, GATT transport, connection cleanup |
+| `config_flow.py` | Setup form state, duplicate filtering, user selection, unique ID, and entry creation |
+| `discovery.py` | Manual scan window, identity/sighting cache merge, model classification, freshness, and ordered choices |
+| `setup_validation.py` | Temporary connect-and-initialize validation with unconditional cleanup |
+| `profiles/` / `model_profiles/` | Atomic profile loading, inheritance, strict validation, immutable device-specific data |
+| `bluetooth/` | Integration-neutral immutable settings, Home Assistant scanner/cache access, route diagnostics, GATT transport, connection cleanup |
+| `bluetooth_profile.py` | Exact adaptation from validated purifier profiles to Bluetooth runtime settings |
 | `channel.py` | Plaintext H7124 channel and per-connection H7129 negotiation/encryption |
 | `frame.py` / `crypto.py` | Frame validation, checksum, and cryptographic transforms |
-| `protocol.py` / `models.py` | Typed commands/events and registered frame, response-matcher, and state strategies |
-| `client.py` | Single connection owner, initialization, notifications, polling, command queue, recovery |
+| `protocol/` / `models.py` | Typed commands/events, profile-derived request rules, frame codecs, and response matching |
+| `state_reducer.py` | Synchronous cached-state authority, startup fan-mode assembly, command reconciliation, and state effects |
+| `recovery.py` | Deterministic recovery windows, circuit/backoff decisions, and recovery diagnostics |
+| `operations.py` | Command queue lifecycle, superseding, deadlines, reconciliation decisions, completion/failure, and bounded command evidence |
+| `transactions.py` | One-in-flight descriptor attempts, response matching, candidate-frame reduction, transaction wait arbitration, and bounded timeout evidence |
+| `client.py` | Single connection/session owner, initialization, notifications, polling and refresh policy, command use cases, callbacks, and asynchronous recovery scheduling |
 | `coordinator.py` | Cached push state and Home Assistant availability/error propagation |
 | `fan.py`, `light.py`, `sensor.py` | Entity mappings only; no direct Bluetooth I/O |
 | `diagnostics.py` | Redacted config-entry and runtime diagnostics |
 
 The dependency direction is deliberate: Home Assistant entities call the
 coordinator, the coordinator calls the reliable client, the client composes a
-protocol with a channel, and the channel uses the GATT transport. Protocol and
-models remain independent of Home Assistant and Bluetooth.
+protocol with a channel, and the channel uses the GATT transport. The
+integration maps each validated purifier profile into one immutable Bluetooth
+settings object shared by the scanner environment and transport. The Bluetooth
+package does not import purifier profiles, models, channels, protocol, client,
+coordinator, setup, or entity code. Models do not import profiles. The protocol
+package does not import Home Assistant, Bluetooth, or runtime orchestration.
+Profiles do not import transport, channel, protocol, runtime orchestration, or
+entity code. State reduction and recovery policy are synchronous and independent
+of Home Assistant and Bluetooth. Deterministic AST tests enforce these
+directions so lower layers cannot acquire coordinator, config-flow, or entity
+dependencies.
 
 ### Local development
 

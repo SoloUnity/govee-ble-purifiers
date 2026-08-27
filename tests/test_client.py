@@ -15,13 +15,15 @@ from custom_components.govee_ble_air_purifier.bluetooth import (
     BluetoothUnavailableError,
     GattTransportError,
 )
+from custom_components.govee_ble_air_purifier.bluetooth_profile import (
+    bluetooth_settings_from_profile,
+)
 from custom_components.govee_ble_air_purifier.client import (
     ReliablePurifierClient,
     _Operation,
 )
 from custom_components.govee_ble_air_purifier.frame import build_frame
 from custom_components.govee_ble_air_purifier.models import (
-    DeviceProfile,
     FanMode,
     Model,
     PurifierState,
@@ -29,10 +31,12 @@ from custom_components.govee_ble_air_purifier.models import (
     SetNightLightColor,
     SetPower,
 )
+from custom_components.govee_ble_air_purifier.profiles import DeviceProfile
 from custom_components.govee_ble_air_purifier.protocol import (
     GoveePurifierProtocol,
     RequestDescriptor,
 )
+from custom_components.govee_ble_air_purifier.recovery import BackoffDecision
 
 
 class FakeEnvironment:
@@ -117,10 +121,11 @@ class SilentChannel:
 
 def make_client(model: Model = Model.H7124) -> ReliablePurifierClient:
     profile = DeviceProfile.for_model(model)
+    settings = bluetooth_settings_from_profile(profile)
     environment = FakeEnvironment()
-    environment.profile = profile
+    environment.settings = settings
     transport = FakeTransport()
-    transport.profile = profile
+    transport.settings = settings
     return ReliablePurifierClient(
         environment=environment,  # type: ignore[arg-type]
         transport=transport,  # type: ignore[arg-type]
@@ -136,6 +141,21 @@ def _set_client_timings(
     **changes: float | int,
 ) -> None:
     client._timings = replace(client._timings, **changes)
+    client._recovery.timings = client._timings
+
+
+def _backoff_plan(
+    client: ReliablePurifierClient,
+    delay: float,
+) -> BackoffDecision:
+    """Create a deterministic policy decision for an async race test."""
+    _set_client_timings(client, backoff_initial=delay)
+    client._recovery.begin_sequence()
+    return client._recovery.plan_backoff(
+        now=asyncio.get_running_loop().time(),
+        recent_advertisement=False,
+        jitter_factor=1.0,
+    )
 
 
 def test_old_generation_callbacks_are_ignored() -> None:
@@ -155,16 +175,31 @@ def test_explicit_validation_budget_is_five_minutes() -> None:
     timings = DeviceProfile.for_model(Model.H7124).timings
     maximum_first_backoff = timings.backoff_initial * 1.2
     two_cycle_budget = (
-        2
-        * (
-            timings.fresh_advertisement_timeout
-            + timings.connection_attempt_timeout
-        )
+        2 * (timings.fresh_advertisement_timeout + timings.connection_attempt_timeout)
         + maximum_first_backoff
     )
 
     assert timings.startup_timeout >= two_cycle_budget
     assert timings.startup_timeout == 300.0
+
+
+def test_client_recovery_diagnostics_are_controller_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The client publishes the controller's existing diagnostics subtree."""
+    client = make_client()
+    now = 42.0
+    client._recovery.record_failure(
+        stage=client_module.ClientStatus.CONNECTING.value,
+        cycle=3,
+        stable_for=0.12356,
+        now=now,
+    )
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: now)
+
+    assert client.diagnostic_snapshot()["recovery"] == (
+        client._recovery.snapshot(now=now).as_dict()
+    )
 
 
 def test_command_recovery_budget_handles_slow_encrypted_reconnect() -> None:
@@ -345,11 +380,51 @@ async def test_connection_loop_retries_after_link_failure() -> None:
 
     assert cycles == 2
     assert availability == [False]
-    client._async_backoff.assert_awaited_once_with(
-        client._timings.backoff_initial
-    )
+    client._async_backoff.assert_awaited_once()
+    plan = client._async_backoff.await_args.args[0]
+    assert plan.requested_seconds == client._timings.backoff_initial
+    assert plan.effective_seconds == client._timings.backoff_initial
     assert client._transport.disconnects == 2  # type: ignore[attr-defined]
-    assert len(client._recovery_failure_times) == 1
+    recovery = client._recovery.snapshot(now=asyncio.get_running_loop().time())
+    assert recovery.failure_count_in_window == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_plans_recent_advertisement_backoff_with_bounded_jitter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live runner supplies current reachability and one bounded sample."""
+    client = make_client()
+    _set_client_timings(client, backoff_initial=60.0)
+    client._environment.recent_advertisement = True  # type: ignore[attr-defined]
+    jitter_calls: list[tuple[float, float]] = []
+
+    def jitter(low: float, high: float) -> float:
+        jitter_calls.append((low, high))
+        return 1.2
+
+    monkeypatch.setattr(client_module.random, "uniform", jitter)
+    cycles = 0
+
+    async def run_cycle() -> None:
+        nonlocal cycles
+        cycles += 1
+        if cycles == 1:
+            raise GattTransportError("weak but visible")
+        client._stopping.set()
+
+    client._connect_initialize_and_run = run_cycle  # type: ignore[method-assign]
+    client._async_backoff = AsyncMock()  # type: ignore[method-assign]
+
+    await client._run()
+
+    decision = client._async_backoff.await_args.args[0]
+    assert isinstance(decision, BackoffDecision)
+    assert decision.requested_seconds == 60.0
+    assert decision.effective_seconds == 8.0
+    assert decision.jittered_seconds == pytest.approx(9.6)
+    assert decision.planned_seconds == pytest.approx(9.6)
+    assert jitter_calls == [(0.8, 1.2)]
 
 
 @pytest.mark.asyncio
@@ -376,18 +451,6 @@ async def test_initial_connection_failures_remain_quiet_while_retrying() -> None
     assert availability == []
 
 
-def test_recent_advertisements_cap_recovery_backoff() -> None:
-    """A visible weak purifier is retried without reaching minute-long delays."""
-    client = make_client()
-    environment = client._environment
-    environment.recent_advertisement = True  # type: ignore[attr-defined]
-
-    assert client._recovery_backoff_delay(60.0) == 8.0
-
-    environment.recent_advertisement = False  # type: ignore[attr-defined]
-    assert client._recovery_backoff_delay(60.0) == 60.0
-
-
 def _arm_recovery_storm(
     client: ReliablePurifierClient,
     *,
@@ -395,98 +458,26 @@ def _arm_recovery_storm(
     final_stage: client_module.ClientStatus,
 ) -> None:
     """Record the minimum evidence that opens the recovery circuit."""
-    client._record_recovery_failure(
-        client_module.ClientStatus.CONNECTING,
+    client._recovery.record_failure(
+        stage=client_module.ClientStatus.CONNECTING.value,
+        cycle=client._connection_cycles,
         stable_for=0.0,
         now=now,
     )
-    client._record_advertisement_wake(now + 0.1)
-    client._record_recovery_failure(
-        client_module.ClientStatus.CONNECTING,
+    client._recovery.record_advertisement_wake(now=now + 0.1)
+    client._recovery.record_failure(
+        stage=client_module.ClientStatus.CONNECTING.value,
+        cycle=client._connection_cycles,
         stable_for=0.0,
         now=now + 0.2,
     )
-    client._record_advertisement_wake(now + 0.3)
-    client._record_recovery_failure(
-        final_stage,
+    client._recovery.record_advertisement_wake(now=now + 0.3)
+    client._recovery.record_failure(
+        stage=final_stage.value,
+        cycle=client._connection_cycles,
         stable_for=0.0,
         now=now + 0.4,
     )
-
-
-@pytest.mark.parametrize(
-    ("model", "final_stage"),
-    [
-        (Model.H7124, client_module.ClientStatus.INITIALIZING),
-        (Model.H7129, client_module.ClientStatus.NEGOTIATING),
-    ],
-)
-def test_recovery_circuit_opens_for_both_models_after_repeated_early_failures(
-    model: Model,
-    final_stage: client_module.ClientStatus,
-) -> None:
-    """Both models share the circuit while retaining their actual failure stage."""
-    client = make_client(model)
-    now = client_module.time.monotonic()
-    _arm_recovery_storm(client, now=now, final_stage=final_stage)
-
-    assert client._recovery_cooldown_floor(now + 0.5) == 5.0
-
-    client._record_recovery_failure(
-        final_stage,
-        stable_for=0.0,
-        now=now + 0.6,
-    )
-    assert client._recovery_cooldown_floor(now + 0.6) == 8.0
-
-    recovery = client.diagnostic_snapshot()["recovery"]
-    assert isinstance(recovery, dict)
-    assert recovery["failure_count_in_window"] == 4
-    assert recovery["advertisement_wake_count_in_window"] == 2
-    assert recovery["last_failure_stage"] == final_stage.value
-    assert recovery["circuit_breaker_active"] is True
-    assert recovery["current_circuit_floor_seconds"] == 8.0
-
-
-def test_recovery_circuit_requires_both_failures_and_advertisement_wakes() -> None:
-    """Ordinary failures cannot open the advertisement-loop circuit alone."""
-    client = make_client()
-    for offset in range(4):
-        client._record_recovery_failure(
-            client_module.ClientStatus.CONNECTING,
-            stable_for=0.0,
-            now=float(offset),
-        )
-
-    assert client._recovery_cooldown_floor(4.0) == 0.0
-
-
-def test_recovery_circuit_expires_and_resets_after_stable_ready() -> None:
-    """Old storms and a durable READY session restore normal fast recovery."""
-    client = make_client()
-    now = client_module.time.monotonic()
-    _arm_recovery_storm(
-        client,
-        now=now,
-        final_stage=client_module.ClientStatus.INITIALIZING,
-    )
-    assert client._recovery_cooldown_floor(now + 0.5) == 5.0
-    assert client._recovery_cooldown_floor(now + 121.0) == 0.0
-
-    _arm_recovery_storm(
-        client,
-        now=now + 200.0,
-        final_stage=client_module.ClientStatus.INITIALIZING,
-    )
-    client._record_recovery_failure(
-        client_module.ClientStatus.READY,
-        stable_for=client._timings.backoff_reset_after,
-        now=now + 201.0,
-    )
-
-    assert client._recovery_cooldown_floor(now + 201.0) == 0.0
-    assert len(client._recovery_failure_times) == 0
-    assert len(client._recovery_advertisement_wake_times) == 0
 
 
 @pytest.mark.asyncio
@@ -508,7 +499,7 @@ async def test_ready_session_resets_recovery_circuit_at_thirty_second_boundary(
     client._schedule_recovery_reset(4)
     await asyncio.sleep(0.02)
 
-    assert client._recovery_cooldown_floor(loop.time()) == 0.0
+    assert client._recovery.circuit_floor(now=loop.time()) == 0.0
     assert client._recovery_reset_handle is None
 
 
@@ -532,16 +523,17 @@ async def test_recovery_circuit_holds_advertisement_until_floor(
     )
     environment = client._environment
 
-    backoff = asyncio.create_task(client._async_backoff(0.001))
+    backoff = asyncio.create_task(client._async_backoff(_backoff_plan(client, 0.001)))
     await asyncio.sleep(0)
     environment.advertisement_event.set()  # type: ignore[attr-defined]
     await asyncio.sleep(0.005)
 
     assert not backoff.done()
     await asyncio.wait_for(backoff, timeout=0.1)
-    assert client._last_backoff_wake_reason == "fresh_advertisement"
-    assert client._last_backoff_elapsed_seconds is not None
-    assert client._last_backoff_elapsed_seconds >= 0.02
+    snapshot = client._recovery.snapshot(now=loop.time())
+    assert snapshot.last_backoff_wake_reason == "fresh_advertisement"
+    assert snapshot.last_backoff_elapsed_seconds is not None
+    assert snapshot.last_backoff_elapsed_seconds >= 0.02
 
 
 @pytest.mark.asyncio
@@ -562,7 +554,7 @@ async def test_recovery_circuit_holds_command_without_dropping_it(
     operation = _Operation(SetPower(True), future, loop.time() + 30.0)
     client._operations.append(operation)
 
-    backoff = asyncio.create_task(client._async_backoff(0.001))
+    backoff = asyncio.create_task(client._async_backoff(_backoff_plan(client, 0.001)))
     await asyncio.sleep(0)
     client._operation_event.set()
     await asyncio.sleep(0.005)
@@ -570,7 +562,8 @@ async def test_recovery_circuit_holds_command_without_dropping_it(
 
     await asyncio.wait_for(backoff, timeout=0.1)
 
-    assert client._last_backoff_wake_reason == "queued_command"
+    recovery = client._recovery.snapshot(now=loop.time())
+    assert recovery.last_backoff_wake_reason == "queued_command"
     assert not client._operation_event.is_set()
     assert client._operations[0] is operation
     assert not future.done()
@@ -591,12 +584,13 @@ async def test_recovery_circuit_shutdown_interrupts_immediately(
         final_stage=client_module.ClientStatus.INITIALIZING,
     )
 
-    backoff = asyncio.create_task(client._async_backoff(60.0))
+    backoff = asyncio.create_task(client._async_backoff(_backoff_plan(client, 60.0)))
     await asyncio.sleep(0)
     client._stopping.set()
     await asyncio.wait_for(backoff, timeout=0.1)
 
-    assert client._last_backoff_wake_reason == "shutdown"
+    recovery = client._recovery.snapshot(now=loop.time())
+    assert recovery.last_backoff_wake_reason == "shutdown"
 
 
 @pytest.mark.asyncio
@@ -609,7 +603,7 @@ async def test_new_advertisement_wakes_long_recovery_backoff(
     _set_client_timings(client, advertisement_settle_delay=0.0)
     environment = client._environment
 
-    backoff = asyncio.create_task(client._async_backoff(60.0))
+    backoff = asyncio.create_task(client._async_backoff(_backoff_plan(client, 60.0)))
     await asyncio.sleep(0)
     environment.advertisement_event.set()  # type: ignore[attr-defined]
 
@@ -624,7 +618,7 @@ async def test_queued_command_wakes_recovery_backoff(
     monkeypatch.setattr(client_module.random, "uniform", lambda *_: 1.0)
     client = make_client()
 
-    backoff = asyncio.create_task(client._async_backoff(60.0))
+    backoff = asyncio.create_task(client._async_backoff(_backoff_plan(client, 60.0)))
     await asyncio.sleep(0)
     client._operation_event.set()
 
@@ -642,7 +636,7 @@ async def test_command_interrupts_normal_advertisement_cooldown(
     _set_client_timings(client, advertisement_settle_delay=60.0)
     environment = client._environment
 
-    backoff = asyncio.create_task(client._async_backoff(60.0))
+    backoff = asyncio.create_task(client._async_backoff(_backoff_plan(client, 60.0)))
     await asyncio.sleep(0)
     environment.advertisement_event.set()  # type: ignore[attr-defined]
     await asyncio.sleep(0)
@@ -650,7 +644,8 @@ async def test_command_interrupts_normal_advertisement_cooldown(
 
     await asyncio.wait_for(backoff, timeout=0.1)
 
-    assert client._last_backoff_wake_reason == "queued_command"
+    recovery = client._recovery.snapshot(now=asyncio.get_running_loop().time())
+    assert recovery.last_backoff_wake_reason == "queued_command"
     assert not client._operation_event.is_set()
 
 
@@ -750,9 +745,7 @@ def test_h7129_manual_startup_pair_restores_mode(
     expected: FanMode,
 ) -> None:
     """H7129 manual state remains unknown until the matched second fragment."""
-    client = make_client()
-    client._profile = DeviceProfile.for_model(Model.H7129)
-    client._protocol = GoveePurifierProtocol(client._profile)
+    client = make_client(Model.H7129)
     client._session_generation = 3
     client.state = PurifierState(fan_mode=FanMode.TURBO)
 
@@ -791,9 +784,7 @@ def test_h7129_special_startup_modes_resolve_from_first_response(
     expected: FanMode,
 ) -> None:
     """H7129 special categories do not depend on selector-01 semantics."""
-    client = make_client()
-    client._profile = DeviceProfile.for_model(Model.H7129)
-    client._protocol = GoveePurifierProtocol(client._profile)
+    client = make_client(Model.H7129)
 
     client._process_plaintext_frame(
         build_frame(bytes((0xAA, 0x05, 0x00, mode_code))),
@@ -822,9 +813,7 @@ def test_unknown_startup_mode_values_remain_unknown(
     second: bytes | None,
 ) -> None:
     """Unproven startup combinations are never guessed."""
-    client = make_client()
-    client._profile = DeviceProfile.for_model(model)
-    client._protocol = GoveePurifierProtocol(client._profile)
+    client = make_client(model)
     client.state = PurifierState(fan_mode=FanMode.HIGH)
 
     client._process_plaintext_frame(
@@ -842,9 +831,7 @@ def test_unknown_startup_mode_values_remain_unknown(
 
 def test_unmatched_or_orphan_startup_mode_response_cannot_change_state() -> None:
     """Delayed duplicates and selector-01 without a current pair are inert."""
-    client = make_client()
-    client._profile = DeviceProfile.for_model(Model.H7129)
-    client._protocol = GoveePurifierProtocol(client._profile)
+    client = make_client(Model.H7129)
     client.state = PurifierState(fan_mode=FanMode.AUTO)
 
     client._process_plaintext_frame(build_frame(b"\xaa\x05\x00\x01"))
@@ -861,9 +848,7 @@ def test_unmatched_or_orphan_startup_mode_response_cannot_change_state() -> None
 
 def test_reconnect_and_physical_update_clear_h7129_partial_mode() -> None:
     """Connection changes and ee-05 supersede an incomplete startup pair."""
-    client = make_client()
-    client._profile = DeviceProfile.for_model(Model.H7129)
-    client._protocol = GoveePurifierProtocol(client._profile)
+    client = make_client(Model.H7129)
     client._session_generation = 4
 
     client._process_plaintext_frame(
@@ -872,7 +857,9 @@ def test_reconnect_and_physical_update_clear_h7129_partial_mode() -> None:
     )
     client._process_plaintext_frame(build_frame(b"\xee\x05\x07\x03"))
     assert client.state.fan_mode is FanMode.TURBO
-    assert not client._awaiting_h7129_manual_level
+    diagnostics = client.diagnostic_snapshot()["startup_fan_mode"]
+    assert isinstance(diagnostics, dict)
+    assert diagnostics["awaiting_h7129_manual_level"] is False
 
     client._process_plaintext_frame(
         build_frame(b"\xaa\x05\x00\x01"),
@@ -880,7 +867,9 @@ def test_reconnect_and_physical_update_clear_h7129_partial_mode() -> None:
     )
     client._on_disconnected(4, 7)
     assert client.state.fan_mode is None
-    assert not client._awaiting_h7129_manual_level
+    diagnostics = client.diagnostic_snapshot()["startup_fan_mode"]
+    assert isinstance(diagnostics, dict)
+    assert diagnostics["awaiting_h7129_manual_level"] is False
 
 
 def test_matched_mode_diagnostics_record_selector_01_and_03() -> None:
@@ -1017,14 +1006,10 @@ async def test_initialization_retries_essential_state_on_same_session() -> None:
 
     await client._async_run_initialization(descriptors)
 
-    assert calls[: len(descriptors)] == [
-        descriptor.name for descriptor in descriptors
-    ]
+    assert calls[: len(descriptors)] == [descriptor.name for descriptor in descriptors]
     assert calls[-1] == "device_state"
     assert device_state_calls == 2
-    wait_for_work.assert_awaited_once_with(
-        client._timings.initialization_retry_delay
-    )
+    wait_for_work.assert_awaited_once_with(client._timings.initialization_retry_delay)
     assert client.diagnostic_snapshot()["incomplete_initialization_requests"] == ()
     assert client._transport.disconnects == 0  # type: ignore[attr-defined]
 
@@ -1050,9 +1035,7 @@ async def test_initialization_recycles_after_three_silent_essential_batches(
         await client._async_run_initialization(essential)
 
     assert wait_for_work.await_count == 2
-    wait_for_work.assert_awaited_with(
-        client._timings.initialization_retry_delay
-    )
+    wait_for_work.assert_awaited_with(client._timings.initialization_retry_delay)
     assert len(channel.writes) == 9  # type: ignore[attr-defined]
     diagnostics = client.diagnostic_snapshot()
     assert diagnostics["essential_initialization_batches"] == 3
@@ -1170,9 +1153,7 @@ async def test_refresh_exhausts_secondary_request_and_preserves_connection() -> 
 @pytest.mark.asyncio
 async def test_h7129_refresh_restores_fan_mode_through_matched_responses() -> None:
     """The existing ee-aa sweep reuses startup fan-mode assembly."""
-    client = make_client()
-    client._profile = DeviceProfile.for_model(Model.H7129)
-    client._protocol = GoveePurifierProtocol(client._profile)
+    client = make_client(Model.H7129)
     descriptors = client._protocol.refresh_requests()
 
     async def execute(
@@ -1301,15 +1282,11 @@ async def test_startup_fan_state_suppresses_unnecessary_command_replay(
     model: Model,
 ) -> None:
     """Authoritative startup mode reconciles an ambiguous queued fan write."""
-    client = make_client()
-    client._profile = DeviceProfile.for_model(model)
-    client._protocol = GoveePurifierProtocol(client._profile)
+    client = make_client(model)
     client._session_generation = 6
     client._process_plaintext_frame(
         build_frame(
-            b"\xaa\x05\x00\x01\x03"
-            if model is Model.H7124
-            else b"\xaa\x05\x00\x01"
+            b"\xaa\x05\x00\x01\x03" if model is Model.H7124 else b"\xaa\x05\x00\x01"
         ),
         matched_request="mode_data_00",
     )
@@ -1362,8 +1339,7 @@ async def test_fan_failure_preserves_wire_diagnostics_across_reconnect() -> None
             )
             client._on_plaintext_frame(4, build_frame(bytes.fromhex("ee 05 01 03")))
         raise client_module.TransactionTimeoutError(
-            "received=1, matched_fragments=0, ignored=1, "
-            "ignored_sample=ee 05 01 03"
+            "received=1, matched_fragments=0, ignored=1, " "ignored_sample=ee 05 01 03"
         )
 
     client._async_execute_descriptor = fail_transaction  # type: ignore[method-assign]
@@ -1404,9 +1380,7 @@ async def test_fan_failure_preserves_wire_diagnostics_across_reconnect() -> None
 async def test_fan_echo_confirms_state_without_retry(model: Model) -> None:
     """The first exact fan echo completes the command and publishes its mode."""
 
-    client = make_client()
-    client._profile = DeviceProfile.for_model(model)
-    client._protocol = GoveePurifierProtocol(client._profile)
+    client = make_client(model)
     published: list[PurifierState] = []
     client._state_callback = published.append
     loop = asyncio.get_running_loop()
@@ -1417,7 +1391,11 @@ async def test_fan_echo_confirms_state_without_retry(model: Model) -> None:
         loop.time() + 30,
         created_at=loop.time(),
     )
-    client._awaiting_h7129_manual_level = True
+    if model is Model.H7129:
+        client._process_plaintext_frame(
+            build_frame(b"\xaa\x05\x00\x01"),
+            matched_request="mode_data_00",
+        )
     calls = 0
 
     async def acknowledge(
@@ -1442,7 +1420,9 @@ async def test_fan_echo_confirms_state_without_retry(model: Model) -> None:
     assert future.done()
     assert future.exception() is None
     assert client.state.fan_mode is FanMode.HIGH
-    assert not client._awaiting_h7129_manual_level
+    diagnostics = client.diagnostic_snapshot()["startup_fan_mode"]
+    assert isinstance(diagnostics, dict)
+    assert diagnostics["awaiting_h7129_manual_level"] is False
     assert published[-1].fan_mode is FanMode.HIGH
 
     client._process_plaintext_frame(build_frame(b"\xee\x05\x01\x01"))

@@ -1,4 +1,4 @@
-"""Home Assistant Bluetooth access and a small, protocol-agnostic GATT transport."""
+"""Small, protocol-agnostic GATT transport."""
 
 from __future__ import annotations
 
@@ -14,16 +14,20 @@ from bleak.backends.device import BLEDevice
 from bleak.backends.service import BleakGATTServiceCollection
 from bleak_retry_connector import (
     BleakClientWithServiceCache,
-    close_stale_connections_by_address,
     establish_connection,
     get_connected_devices,
 )
-from homeassistant.components import bluetooth
-from homeassistant.core import HomeAssistant
 
-from .profiles import DeviceProfile, Model
+from .cleanup import async_close_stale_connections
+from .errors import (
+    BluetoothUnavailableError,
+    GattTransportError,
+    exception_chain_detail,
+    exception_detail,
+)
+from .settings import BluetoothRuntimeSettings
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = logging.getLogger(__package__)
 
 RECENT_CONNECTION_FAILURE_LIMIT = 4
 
@@ -31,432 +35,21 @@ NotificationCallback = Callable[[bytes], None]
 DisconnectCallback = Callable[[int], None]
 
 
-def exception_detail(error: BaseException) -> str:
-    """Return a useful one-line exception description, including empty errors."""
-    message = str(error).strip()
-    return f"{type(error).__name__}: {message or repr(error)}"
-
-
-def exception_chain_detail(error: BaseException) -> str:
-    """Return the complete explicit/implicit exception chain on one line."""
-    details: list[str] = []
-    seen: set[int] = set()
-    current: BaseException | None = error
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        details.append(exception_detail(current))
-        if current.__cause__ is not None:
-            current = current.__cause__
-        elif not current.__suppress_context__:
-            current = current.__context__
-        else:
-            current = None
-    return " <- ".join(details)
-
-
-class BluetoothUnavailableError(ConnectionError):
-    """Raised when there is no usable Bluetooth route to the purifier."""
-
-
 class _ConnectionAttemptDeadlineExceeded(TimeoutError):
     """Raised when the integration's outer connection deadline expires."""
 
 
-class GattTransportError(ConnectionError):
-    """Raised when a GATT operation cannot be completed."""
-
-
-async def async_close_stale_connections(address: str, *, reason: str) -> None:
-    """Close local BlueZ connections for an address through HA's BLE library."""
-    _LOGGER.debug(
-        "Closing stale Bluetooth connections by address: address=%s reason=%s",
-        address,
-        reason,
-    )
-    await close_stale_connections_by_address(address)
-
-
-class HomeAssistantBluetoothEnvironment:
-    """Expose Home Assistant's shared scanner without owning a scanner.
-
-    A BLEDevice is deliberately looked up again for every connection attempt.
-    Home Assistant can then choose the currently best local adapter or proxy.
-    """
-
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        address: str,
-        profile: DeviceProfile | None = None,
-    ) -> None:
-        self._hass = hass
-        self.address = address
-        self.profile = profile or DeviceProfile.for_model(Model.H7124)
-        self._timings = self.profile.timings
-        self._advertisement_event = asyncio.Event()
-        self._cancel_advertisement: Callable[[], None] | None = None
-        self._last_callback_time: float | None = None
-        self._last_callback_advertisement_time: float | None = None
-        self._live_service_info: Any = None
-        self._fresh_after: float | None = None
-        self._fresh_advertisements = 0
-        self._last_selected_advertisement_time: float | None = None
-        self._last_route_selection: str | None = None
-
-    async def async_start(self) -> None:
-        """Listen passively for a fresh route to the configured address."""
-        if self._cancel_advertisement is not None:
-            return
-
-        callback_kwargs: dict[str, Any] = {}
-        if replay_type := getattr(bluetooth, "BluetoothCallbackReplay", None):
-            callback_kwargs["replay"] = replay_type.DISABLED
-        self._cancel_advertisement = bluetooth.async_register_callback(
-            self._hass,
-            self._advertisement_received,
-            {"address": self.address, "connectable": True},
-            bluetooth.BluetoothScanningMode.PASSIVE,
-            **callback_kwargs,
-        )
-
-    async def async_stop(self) -> None:
-        """Stop listening for advertisements."""
-        if self._cancel_advertisement is not None:
-            self._cancel_advertisement()
-            self._cancel_advertisement = None
-        self._advertisement_event.set()
-
-    def _advertisement_received(self, service_info: Any, *_: Any) -> None:
-        received_at = time.monotonic()
-        advertisement_time = getattr(service_info, "time", None)
-        self._last_callback_time = received_at
-        self._last_callback_advertisement_time = (
-            advertisement_time if isinstance(advertisement_time, int | float) else None
-        )
-        fresh_after = self._fresh_after
-        # Registration replay is synchronous and happens before a connection
-        # wait begins. Any callback received after this cutoff is therefore a
-        # live scanner delivery, even if the scanner timestamp is coarse.
-        is_live = fresh_after is not None and received_at >= fresh_after
-        _LOGGER.debug(
-            "Advertisement received for %s: name=%s source=%s rssi=%s "
-            "connectable=%s live_for_current_wait=%s",
-            self.address,
-            getattr(service_info, "name", None),
-            getattr(service_info, "source", None),
-            getattr(service_info, "rssi", None),
-            getattr(service_info, "connectable", None),
-            is_live,
-        )
-        if is_live:
-            self._live_service_info = service_info
-            self._fresh_advertisements += 1
-        # Recovery backoff also listens to this event. Signal every callback,
-        # not only callbacks belonging to an active route-selection wait.
-        self._advertisement_event.set()
-
-    def get_connectable_device(self) -> BLEDevice | None:
-        """Return the best currently reachable connectable route."""
-        device = bluetooth.async_ble_device_from_address(
-            self._hass, self.address, connectable=True
-        )
-        route = self.route_diagnostics()
-        _LOGGER.debug(
-            "Resolved Bluetooth route for %s: device=%s source=%s rssi=%s",
-            self.address,
-            device.name if device is not None else None,
-            route["source"],
-            route["rssi"],
-        )
-        return device
-
-    def route_diagnostics(self) -> dict[str, Any]:
-        """Return secret-free details for the best current HA Bluetooth route."""
-        try:
-            service_info = bluetooth.async_last_service_info(
-                self._hass,
-                self.address,
-                connectable=True,
-            )
-        except Exception as err:
-            # Diagnostics must never prevent an otherwise valid connection.
-            _LOGGER.debug(
-                "Unable to inspect the Home Assistant Bluetooth route for %s: %s",
-                self.address,
-                exception_detail(err),
-                exc_info=True,
-            )
-            return {
-                "present": None,
-                "name": None,
-                "source": None,
-                "rssi": None,
-                "tx_power": None,
-                "advertisement_age_seconds": None,
-                "callback_age_seconds": self._callback_age(),
-                "callback_advertisement_age_seconds": (
-                    self._callback_advertisement_age()
-                ),
-                "fresh_advertisements": self._fresh_advertisements,
-                "last_route_selection": self._last_route_selection,
-                "selected_advertisement_age_seconds": (
-                    self._selected_advertisement_age()
-                ),
-                "error": exception_detail(err),
-            }
-        if service_info is None:
-            return {
-                "present": False,
-                "name": None,
-                "source": None,
-                "rssi": None,
-                "tx_power": None,
-                "advertisement_age_seconds": None,
-                "callback_age_seconds": self._callback_age(),
-                "callback_advertisement_age_seconds": (
-                    self._callback_advertisement_age()
-                ),
-                "fresh_advertisements": self._fresh_advertisements,
-                "last_route_selection": self._last_route_selection,
-                "selected_advertisement_age_seconds": (
-                    self._selected_advertisement_age()
-                ),
-            }
-        advertisement_time = getattr(service_info, "time", None)
-        advertisement_age = (
-            max(0.0, time.monotonic() - advertisement_time)
-            if isinstance(advertisement_time, int | float)
-            else None
-        )
-        return {
-            "present": True,
-            "name": getattr(service_info, "name", None),
-            "source": getattr(service_info, "source", None),
-            "rssi": getattr(service_info, "rssi", None),
-            "tx_power": getattr(service_info, "tx_power", None),
-            "advertisement_age_seconds": (
-                round(advertisement_age, 3) if advertisement_age is not None else None
-            ),
-            "callback_age_seconds": self._callback_age(),
-            "callback_advertisement_age_seconds": (self._callback_advertisement_age()),
-            "fresh_advertisements": self._fresh_advertisements,
-            "last_route_selection": self._last_route_selection,
-            "selected_advertisement_age_seconds": (
-                self._selected_advertisement_age()
-            ),
-        }
-
-    def _selected_advertisement_age(self) -> float | None:
-        """Return the age of the advertisement used for the previous route."""
-        if self._last_selected_advertisement_time is None:
-            return None
-        return round(
-            max(0.0, time.monotonic() - self._last_selected_advertisement_time),
-            3,
-        )
-
-    def _callback_age(self) -> float | None:
-        """Return seconds since this integration directly saw an advertisement."""
-        if self._last_callback_time is None:
-            return None
-        return round(max(0.0, time.monotonic() - self._last_callback_time), 3)
-
-    def _callback_advertisement_age(self) -> float | None:
-        """Return the age encoded by the last callback's service information."""
-        if self._last_callback_advertisement_time is None:
-            return None
-        return round(
-            max(0.0, time.monotonic() - self._last_callback_advertisement_time),
-            3,
-        )
-
-    def _usable_service_info(self, started_at: float) -> tuple[Any, str] | None:
-        """Return a recent first route or evidence newer than the previous route."""
-        if self._live_service_info is not None:
-            return self._live_service_info, "live_callback"
-
-        service_info = bluetooth.async_last_service_info(
-            self._hass,
-            self.address,
-            connectable=True,
-        )
-        advertisement_time = (
-            getattr(service_info, "time", None) if service_info is not None else None
-        )
-        if service_info is None or not isinstance(advertisement_time, int | float):
-            return None
-        if (
-            advertisement_time
-            < started_at - self._timings.recent_cached_advertisement_max_age
-        ):
-            return None
-
-        previous_time = self._last_selected_advertisement_time
-        if previous_time is None:
-            return service_info, "recent_cache"
-        if advertisement_time > previous_time:
-            return service_info, "newer_cache"
-        return None
-
-    def _record_selected_route(self, service_info: Any, source: str) -> None:
-        """Remember the route evidence so a retry cannot reuse the same packet."""
-        advertisement_time = getattr(service_info, "time", None)
-        if isinstance(advertisement_time, int | float):
-            previous_time = self._last_selected_advertisement_time
-            self._last_selected_advertisement_time = (
-                advertisement_time
-                if previous_time is None
-                else max(previous_time, advertisement_time)
-            )
-        self._last_route_selection = source
-
-    def reachability_diagnostics(self) -> str | None:
-        """Return Home Assistant's human-readable connection route diagnosis."""
-        diagnose = getattr(bluetooth, "async_address_reachability_diagnostics", None)
-        intent_type = getattr(bluetooth, "BluetoothReachabilityIntent", None)
-        if diagnose is None or intent_type is None:
-            return None
-        try:
-            return str(diagnose(self._hass, self.address, intent_type.CONNECTION))
-        except Exception as err:
-            _LOGGER.debug(
-                "Unable to obtain Bluetooth reachability diagnostics for %s: %s",
-                self.address,
-                exception_detail(err),
-                exc_info=True,
-            )
-            return f"unavailable: {exception_detail(err)}"
-
-    def address_is_present(self) -> bool:
-        """Return whether a connectable scanner can currently see the address."""
-        return bluetooth.async_address_present(
-            self._hass, self.address, connectable=True
-        )
-
-    def has_recent_advertisement(self, max_age: float) -> bool:
-        """Return whether HA has recent connectable evidence for this address."""
-        try:
-            service_info = bluetooth.async_last_service_info(
-                self._hass,
-                self.address,
-                connectable=True,
-            )
-        except Exception as err:
-            _LOGGER.debug(
-                "Unable to inspect advertisement recency for %s: %s",
-                self.address,
-                exception_detail(err),
-                exc_info=True,
-            )
-            return False
-        advertisement_time = (
-            getattr(service_info, "time", None)
-            if service_info is not None
-            else None
-        )
-        return (
-            isinstance(advertisement_time, int | float)
-            and max(0.0, time.monotonic() - advertisement_time) <= max_age
-        )
-
-    async def async_wait_for_advertisement_after(self, cutoff: float) -> None:
-        """Wait until this integration receives a connectable advertisement."""
-        while self._last_callback_time is None or self._last_callback_time <= cutoff:
-            self._advertisement_event.clear()
-            # Close the callback/check/clear race before blocking.
-            if (
-                self._last_callback_time is not None
-                and self._last_callback_time > cutoff
-            ):
-                return
-            await self._advertisement_event.wait()
-
-    async def async_wait_for_fresh_device(self, timeout: float) -> BLEDevice | None:
-        """Resolve a recent route, or wait for evidence newer than the last route."""
-        started_at = time.monotonic()
-        deadline = started_at + timeout
-        self._fresh_after = started_at
-        self._live_service_info = None
-        self._advertisement_event.clear()
-        _LOGGER.debug(
-            "Waiting for a recent or new connectable advertisement for %s: "
-            "timeout=%.1fs recent_cache_limit=%.1fs previous_age=%s",
-            self.address,
-            timeout,
-            self._timings.recent_cached_advertisement_max_age,
-            self._selected_advertisement_age(),
-        )
-
-        try:
-            while (remaining := deadline - time.monotonic()) > 0:
-                route_candidate = self._usable_service_info(started_at)
-                if route_candidate is not None:
-                    service_info, selection_source = route_candidate
-                    advertisement_time = getattr(service_info, "time", None)
-                    device = self.get_connectable_device()
-                    if device is None:
-                        device = getattr(service_info, "device", None)
-                    if device is not None:
-                        self._record_selected_route(service_info, selection_source)
-                        _LOGGER.debug(
-                            "Bluetooth route selected for %s after %.3fs: "
-                            "selection=%s source=%s rssi=%s "
-                            "advertisement_age=%s",
-                            self.address,
-                            time.monotonic() - started_at,
-                            selection_source,
-                            getattr(service_info, "source", None),
-                            getattr(service_info, "rssi", None),
-                            (
-                                round(
-                                    max(0.0, time.monotonic() - advertisement_time),
-                                    3,
-                                )
-                                if isinstance(advertisement_time, int | float)
-                                else None
-                            ),
-                        )
-                        return device
-
-                self._advertisement_event.clear()
-                # Close the check/clear race before blocking again.
-                if self._usable_service_info(started_at) is not None:
-                    continue
-
-                try:
-                    async with asyncio.timeout(
-                        min(self._timings.advertisement_check_interval, remaining)
-                    ):
-                        await self._advertisement_event.wait()
-                except TimeoutError:
-                    pass
-        finally:
-            self._fresh_after = None
-
-        if time.monotonic() >= deadline:
-            _LOGGER.debug(
-                "No recent or new connectable advertisement for %s within %.1f "
-                "seconds; route=%s reachability=%s",
-                self.address,
-                timeout,
-                self.route_diagnostics(),
-                self.reachability_diagnostics(),
-            )
-        return None
-
-
 class GattTransport:
-    """Own one active GATT connection and transport opaque 20-byte frames."""
+    """Own one active GATT connection and transport opaque bytes."""
 
     def __init__(
         self,
         *,
         name: str,
-        profile: DeviceProfile | None = None,
+        settings: BluetoothRuntimeSettings,
     ) -> None:
         self.name = name
-        self.profile = profile or DeviceProfile.for_model(Model.H7124)
-        self._timings = self.profile.timings
+        self.settings = settings
         self._client: BleakClientWithServiceCache | None = None
         self._connecting_client: BleakClientWithServiceCache | None = None
         self._connecting_address: str | None = None
@@ -582,7 +175,8 @@ class GattTransport:
                 self._last_gatt_operation_timed_out = True
                 task.cancel()
                 await asyncio.wait(
-                    (task,), timeout=self._timings.gatt_operation_cancel_timeout
+                    (task,),
+                    timeout=self.settings.gatt_operations.operation_cancel_timeout,
                 )
                 elapsed = max(0.0, time.monotonic() - started)
                 detail = (
@@ -598,7 +192,8 @@ class GattTransport:
             if not task.done():
                 task.cancel()
                 await asyncio.wait(
-                    (task,), timeout=self._timings.gatt_operation_cancel_timeout
+                    (task,),
+                    timeout=self.settings.gatt_operations.operation_cancel_timeout,
                 )
             raise
         except Exception as err:
@@ -684,16 +279,12 @@ class GattTransport:
                 diagnostics["partial_client_connected_error"] = exception_detail(err)
             try:
                 services = client.services
-                diagnostics["service_count"] = len(
-                    getattr(services, "services", {})
-                )
+                diagnostics["service_count"] = len(getattr(services, "services", {}))
             except Exception as err:  # noqa: BLE001
                 diagnostics["service_error"] = exception_detail(err)
 
         try:
-            async with asyncio.timeout(
-                self._timings.connection_diagnostic_timeout
-            ):
+            async with asyncio.timeout(self.settings.connection.diagnostic_timeout):
                 connected_devices = await get_connected_devices(device)
             diagnostics["bluez_connection_count"] = len(connected_devices)
         except Exception as err:  # noqa: BLE001
@@ -718,7 +309,7 @@ class GattTransport:
             client.is_connected,
         )
         try:
-            async with asyncio.timeout(self._timings.connection_abort_timeout):
+            async with asyncio.timeout(self.settings.connection.abort_timeout):
                 await client.disconnect()
         except Exception as err:
             _LOGGER.debug(
@@ -756,14 +347,12 @@ class GattTransport:
         self._last_address_cleanup_remaining = None
         started = time.monotonic()
         try:
-            async with asyncio.timeout(
-                self._timings.stale_connection_cleanup_timeout
-            ):
+            async with asyncio.timeout(self.settings.cleanup.stale_connection_timeout):
                 await async_close_stale_connections(address, reason=reason)
                 if device is not None:
                     deadline = (
                         time.monotonic()
-                        + self._timings.stale_connection_cleanup_timeout
+                        + self.settings.cleanup.stale_connection_timeout
                     )
                     while True:
                         connected_devices = await get_connected_devices(device)
@@ -777,7 +366,7 @@ class GattTransport:
                                 f"for {address}"
                             )
                         await asyncio.sleep(
-                            self._timings.stale_connection_check_interval
+                            self.settings.cleanup.stale_connection_check_interval
                         )
         except Exception as err:
             self._address_cleanup_failures += 1
@@ -846,8 +435,8 @@ class GattTransport:
             device.address,
             generation,
             self._connection_attempts,
-            self._timings.connect_attempts,
-            self._timings.connection_attempt_timeout,
+            self.settings.connection.attempts,
+            self.settings.connection.attempt_timeout,
         )
 
         def create_tracked_client(
@@ -867,14 +456,14 @@ class GattTransport:
                     disconnected_callback=lambda connected_client: (
                         self._disconnected_from_bleak(connected_client, generation)
                     ),
-                    max_attempts=self._timings.connect_attempts,
+                    max_attempts=self.settings.connection.attempts,
                 ),
                 name=f"govee-connect-{device.address}",
             )
             try:
                 done, _ = await asyncio.wait(
                     (connection_task,),
-                    timeout=self._timings.connection_attempt_timeout,
+                    timeout=self.settings.connection.attempt_timeout,
                 )
                 if not done:
                     self._last_connection_timeout_diagnostics = (
@@ -896,7 +485,7 @@ class GattTransport:
             detail = (
                 f"attempt={self._connection_attempts}; "
                 f"stage={self._connection_stage}; elapsed={self._elapsed():.3f}s; "
-                f"deadline={self._timings.connection_attempt_timeout:.1f}s; "
+                f"deadline={self.settings.connection.attempt_timeout:.1f}s; "
                 f"pre_return_disconnects={self._pre_return_disconnects}; "
                 "cause=TimeoutError: connection attempt deadline exceeded"
             )
@@ -1010,12 +599,12 @@ class GattTransport:
         return generation
 
     def _resolve_characteristics(self, services: BleakGATTServiceCollection) -> None:
-        service = services.get_service(self.profile.bluetooth.service_uuid)
+        service = services.get_service(self.settings.endpoints.service_uuid)
         notify_characteristic = services.get_characteristic(
-            self.profile.bluetooth.notify_uuid
+            self.settings.endpoints.notify_uuid
         )
         command_characteristic = services.get_characteristic(
-            self.profile.bluetooth.write_uuid
+            self.settings.endpoints.write_uuid
         )
         if (
             service is None
@@ -1067,12 +656,12 @@ class GattTransport:
         _LOGGER.debug(
             "Subscribing to purifier notifications: generation=%d characteristic=%s",
             generation,
-            self.profile.bluetooth.notify_uuid,
+            self.settings.endpoints.notify_uuid,
         )
         try:
             await self._async_gatt_operation(
                 "start_notify",
-                self._timings.notification_subscribe_timeout,
+                self.settings.gatt_operations.notification_subscribe_timeout,
                 lambda: client.start_notify(
                     self._notify_characteristic, notification_received
                 ),
@@ -1096,10 +685,8 @@ class GattTransport:
         )
 
     async def async_write(self, data: bytes) -> None:
-        """Write one frame using ATT Write Command (without response)."""
-        if len(data) != 20:
-            raise ValueError(f"Expected a 20-byte frame, got {len(data)} bytes")
-
+        """Write opaque bytes using ATT Write Command (without response)."""
+        data = bytes(data)
         async with self._write_lock:
             client = self._require_client()
             generation = self._generation
@@ -1107,7 +694,7 @@ class GattTransport:
             try:
                 await self._async_gatt_operation(
                     "write_gatt_char",
-                    self._timings.gatt_write_timeout,
+                    self.settings.gatt_operations.write_timeout,
                     lambda: client.write_gatt_char(
                         self._command_characteristic, data, response=False
                     ),
@@ -1154,7 +741,7 @@ class GattTransport:
             if client.is_connected:
                 await self._async_gatt_operation(
                     "disconnect",
-                    self._timings.gatt_disconnect_timeout,
+                    self.settings.gatt_operations.disconnect_timeout,
                     client.disconnect,
                 )
         except Exception as err:

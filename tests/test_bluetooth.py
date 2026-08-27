@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from custom_components.govee_ble_air_purifier import bluetooth as bluetooth_module
+from custom_components.govee_ble_air_purifier import bluetooth as bluetooth_package
 from custom_components.govee_ble_air_purifier.bluetooth import (
     BluetoothUnavailableError,
     GattTransport,
@@ -16,13 +16,63 @@ from custom_components.govee_ble_air_purifier.bluetooth import (
     HomeAssistantBluetoothEnvironment,
     exception_chain_detail,
 )
+from custom_components.govee_ble_air_purifier.bluetooth import cleanup as cleanup_module
+from custom_components.govee_ble_air_purifier.bluetooth import (
+    environment as environment_module,
+)
+from custom_components.govee_ble_air_purifier.bluetooth import (
+    transport as transport_module,
+)
+from custom_components.govee_ble_air_purifier.bluetooth_profile import (
+    bluetooth_settings_from_profile,
+)
+from custom_components.govee_ble_air_purifier.profiles import DeviceProfile, Model
+
+_DEFAULT_SETTINGS = bluetooth_settings_from_profile(
+    DeviceProfile.for_model(Model.H7124)
+)
+
+
+def _transport() -> GattTransport:
+    return GattTransport(name="Bedroom purifier", settings=_DEFAULT_SETTINGS)
+
+
+def _environment(hass: object, address: str) -> HomeAssistantBluetoothEnvironment:
+    return HomeAssistantBluetoothEnvironment(  # type: ignore[arg-type]
+        hass, address, _DEFAULT_SETTINGS
+    )
 
 
 def _set_transport_timings(
     transport: GattTransport,
     **changes: float | int,
 ) -> None:
-    transport._timings = replace(transport._timings, **changes)
+    settings = transport.settings
+    connection_changes: dict[str, float | int] = {}
+    operation_changes: dict[str, float | int] = {}
+    cleanup_changes: dict[str, float | int] = {}
+    field_map = {
+        "connection_attempt_timeout": (connection_changes, "attempt_timeout"),
+        "notification_subscribe_timeout": (
+            operation_changes,
+            "notification_subscribe_timeout",
+        ),
+        "gatt_write_timeout": (operation_changes, "write_timeout"),
+        "gatt_disconnect_timeout": (operation_changes, "disconnect_timeout"),
+        "stale_connection_cleanup_timeout": (
+            cleanup_changes,
+            "stale_connection_timeout",
+        ),
+    }
+    for field, value in changes.items():
+        target, mapped_field = field_map[field]
+        target[mapped_field] = value
+    transport.settings = replace(
+        settings,
+        connection=replace(settings.connection, **connection_changes),
+        gatt_operations=replace(settings.gatt_operations, **operation_changes),
+        cleanup=replace(settings.cleanup, **cleanup_changes),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -36,9 +86,43 @@ def _no_real_bluez_connections(monkeypatch: pytest.MonkeyPatch) -> None:
         return []
 
     monkeypatch.setattr(
-        bluetooth_module, "close_stale_connections_by_address", close_address
+        cleanup_module, "close_stale_connections_by_address", close_address
     )
-    monkeypatch.setattr(bluetooth_module, "get_connected_devices", no_connected_devices)
+    monkeypatch.setattr(transport_module, "get_connected_devices", no_connected_devices)
+
+
+def test_package_facade_preserves_public_imports() -> None:
+    """The package keeps the integration's established Bluetooth imports stable."""
+    assert bluetooth_package.GattTransport is transport_module.GattTransport
+    assert (
+        bluetooth_package.HomeAssistantBluetoothEnvironment
+        is environment_module.HomeAssistantBluetoothEnvironment
+    )
+    assert (
+        bluetooth_package.async_close_stale_connections
+        is cleanup_module.async_close_stale_connections
+    )
+
+
+@pytest.mark.asyncio
+async def test_stale_cleanup_wrapper_forwards_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Standalone cleanup forwards the exact target address to the connector."""
+    addresses: list[str] = []
+
+    async def close_address(address: str) -> None:
+        addresses.append(address)
+
+    monkeypatch.setattr(
+        cleanup_module, "close_stale_connections_by_address", close_address
+    )
+
+    await cleanup_module.async_close_stale_connections(
+        "AA:BB:CC:DD:EE:FF", reason="test"
+    )
+
+    assert addresses == ["AA:BB:CC:DD:EE:FF"]
 
 
 def test_exception_chain_detail_preserves_nested_causes() -> None:
@@ -70,7 +154,7 @@ async def test_notification_subscription_timeout_is_bounded_and_observed(
                 cancelled.set()
                 raise
 
-    transport = GattTransport(name="Bedroom purifier")
+    transport = _transport()
     _set_transport_timings(transport, notification_subscribe_timeout=0.01)
     transport._client = HangingClient()  # type: ignore[assignment]
     transport._notify_characteristic = object()
@@ -86,6 +170,30 @@ async def test_notification_subscription_timeout_is_bounded_and_observed(
     assert diagnostics["last_gatt_operation_timed_out"] is True
     assert diagnostics["gatt_operation_timeouts"] == 1
     assert diagnostics["pending_gatt_operation_tasks"] == 0
+
+
+@pytest.mark.asyncio
+async def test_transport_writes_arbitrary_opaque_bytes() -> None:
+    """GATT transport does not impose purifier application-frame semantics."""
+    writes: list[tuple[object, bytes, bool]] = []
+
+    class ConnectedClient:
+        is_connected = True
+
+        async def write_gatt_char(
+            self, characteristic: object, data: bytes, *, response: bool
+        ) -> None:
+            writes.append((characteristic, data, response))
+
+    transport = _transport()
+    characteristic = object()
+    transport._client = ConnectedClient()  # type: ignore[assignment]
+    transport._command_characteristic = characteristic
+
+    await transport.async_write(b"\x01\x02\x03")
+
+    assert writes == [(characteristic, b"\x01\x02\x03", False)]
+    assert transport.diagnostic_snapshot()["wire_tx_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -105,7 +213,7 @@ async def test_write_timeout_is_bounded_and_observed(
                 cancelled.set()
                 raise
 
-    transport = GattTransport(name="Bedroom purifier")
+    transport = _transport()
     _set_transport_timings(transport, gatt_write_timeout=0.01)
     transport._client = HangingClient()  # type: ignore[assignment]
     transport._command_characteristic = object()
@@ -139,7 +247,7 @@ async def test_disconnect_timeout_cannot_block_cleanup(
                 cancelled.set()
                 raise
 
-    transport = GattTransport(name="Bedroom purifier")
+    transport = _transport()
     _set_transport_timings(transport, gatt_disconnect_timeout=0.01)
     transport._client = HangingClient()  # type: ignore[assignment]
 
@@ -166,11 +274,11 @@ async def test_connect_error_preserves_underlying_bleak_detail(
         raise RuntimeError("adapter route unavailable")
 
     monkeypatch.setattr(
-        bluetooth_module,
+        transport_module,
         "establish_connection",
         fail_connection,
     )
-    transport = GattTransport(name="Bedroom purifier")
+    transport = _transport()
     device = SimpleNamespace(
         address="AA:BB:CC:DD:EE:FF",
         name="GVH7124TEST",
@@ -205,11 +313,11 @@ async def test_connect_error_records_disconnect_before_connector_returns(
         raise TimeoutError
 
     monkeypatch.setattr(
-        bluetooth_module,
+        transport_module,
         "establish_connection",
         disconnect_then_timeout,
     )
-    transport = GattTransport(name="Bedroom purifier")
+    transport = _transport()
     device = SimpleNamespace(
         address="AA:BB:CC:DD:EE:FF",
         name="ihoment_H7129_TEST",
@@ -258,13 +366,13 @@ async def test_connection_deadline_cleans_partial_client_and_records_attempts(
     async def no_connected_devices(_: object) -> list[object]:
         return []
 
-    monkeypatch.setattr(bluetooth_module, "BleakClientWithServiceCache", FakeClient)
-    monkeypatch.setattr(bluetooth_module, "establish_connection", hang_connection)
+    monkeypatch.setattr(transport_module, "BleakClientWithServiceCache", FakeClient)
+    monkeypatch.setattr(transport_module, "establish_connection", hang_connection)
     monkeypatch.setattr(
-        bluetooth_module, "close_stale_connections_by_address", close_address
+        cleanup_module, "close_stale_connections_by_address", close_address
     )
-    monkeypatch.setattr(bluetooth_module, "get_connected_devices", no_connected_devices)
-    transport = GattTransport(name="Bedroom purifier")
+    monkeypatch.setattr(transport_module, "get_connected_devices", no_connected_devices)
+    transport = _transport()
     _set_transport_timings(transport, connection_attempt_timeout=0.01)
     device = SimpleNamespace(
         address="AA:BB:CC:DD:EE:FF",
@@ -312,6 +420,7 @@ async def test_connection_deadline_inspects_live_partial_client_before_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Timeout evidence distinguishes a connected client from stalled discovery."""
+
     class ConnectedClient:
         def __init__(self, *_: object, **__: object) -> None:
             self.is_connected = True
@@ -333,13 +442,13 @@ async def test_connection_deadline_inspects_live_partial_client_before_cleanup(
         return [device] if clients and clients[0].is_connected else []
 
     monkeypatch.setattr(
-        bluetooth_module, "BleakClientWithServiceCache", ConnectedClient
+        transport_module, "BleakClientWithServiceCache", ConnectedClient
     )
-    monkeypatch.setattr(bluetooth_module, "establish_connection", hang_connection)
+    monkeypatch.setattr(transport_module, "establish_connection", hang_connection)
     monkeypatch.setattr(
-        bluetooth_module, "get_connected_devices", connected_while_client_is_live
+        transport_module, "get_connected_devices", connected_while_client_is_live
     )
-    transport = GattTransport(name="Bedroom purifier")
+    transport = _transport()
     _set_transport_timings(transport, connection_attempt_timeout=0.01)
     device = SimpleNamespace(
         address="AA:BB:CC:DD:EE:FF",
@@ -350,17 +459,13 @@ async def test_connection_deadline_inspects_live_partial_client_before_cleanup(
     with pytest.raises(BluetoothUnavailableError) as raised:
         await transport.async_connect(device)  # type: ignore[arg-type]
 
-    diagnostics = transport.diagnostic_snapshot()[
-        "last_connection_timeout_diagnostics"
-    ]
+    diagnostics = transport.diagnostic_snapshot()["last_connection_timeout_diagnostics"]
     assert isinstance(diagnostics, dict)
     assert diagnostics["partial_client_present"] is True
     assert diagnostics["partial_client_connected"] is True
     assert diagnostics["service_count"] == 1
     assert diagnostics["bluez_connection_count"] == 1
-    assert diagnostics["device_path"] == (
-        "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF"
-    )
+    assert diagnostics["device_path"] == ("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF")
     assert diagnostics["adapter"] == "hci0"
     assert diagnostics["cleanup"]["success"] is True
     assert diagnostics["cleanup"]["remaining_connections"] == 0
@@ -385,11 +490,11 @@ async def test_surviving_bluez_connection_blocks_new_attempt(
         connector_called = True
 
     monkeypatch.setattr(
-        bluetooth_module, "close_stale_connections_by_address", close_address
+        cleanup_module, "close_stale_connections_by_address", close_address
     )
-    monkeypatch.setattr(bluetooth_module, "get_connected_devices", still_connected)
-    monkeypatch.setattr(bluetooth_module, "establish_connection", unexpected_connector)
-    transport = GattTransport(name="Bedroom purifier")
+    monkeypatch.setattr(transport_module, "get_connected_devices", still_connected)
+    monkeypatch.setattr(transport_module, "establish_connection", unexpected_connector)
+    transport = _transport()
     _set_transport_timings(
         transport,
         stale_connection_cleanup_timeout=0.01,
@@ -417,9 +522,9 @@ async def test_stale_cleanup_never_disconnects_healthy_owned_client(
     """Defensive cleanup cannot tear down the transport's ready connection."""
     close_address = AsyncMock()
     monkeypatch.setattr(
-        bluetooth_module, "close_stale_connections_by_address", close_address
+        cleanup_module, "close_stale_connections_by_address", close_address
     )
-    transport = GattTransport(name="Bedroom purifier")
+    transport = _transport()
     transport._client = SimpleNamespace(is_connected=True)  # type: ignore[assignment]
 
     cleaned = await transport.async_cleanup_stale_connection(reason="test")
@@ -440,11 +545,11 @@ def test_route_diagnostics_reports_advertisement_age(
         time=time.monotonic() - 2.0,
     )
     monkeypatch.setattr(
-        bluetooth_module.bluetooth,
+        environment_module.bluetooth,
         "async_last_service_info",
         lambda *_args, **_kwargs: service_info,
     )
-    environment = HomeAssistantBluetoothEnvironment(
+    environment = _environment(
         SimpleNamespace(),  # type: ignore[arg-type]
         "AA:BB:CC:DD:EE:FF",
     )
@@ -464,11 +569,11 @@ def test_recent_advertisement_uses_timestamp_not_presence_history(
     """Backoff remains short only while connectable evidence is actually recent."""
     service_info = SimpleNamespace(time=time.monotonic() - 2.0)
     monkeypatch.setattr(
-        bluetooth_module.bluetooth,
+        environment_module.bluetooth,
         "async_last_service_info",
         lambda *_args, **_kwargs: service_info,
     )
-    environment = HomeAssistantBluetoothEnvironment(
+    environment = _environment(
         SimpleNamespace(),  # type: ignore[arg-type]
         "AA:BB:CC:DD:EE:FF",
     )
@@ -482,7 +587,7 @@ def test_recent_advertisement_uses_timestamp_not_presence_history(
 @pytest.mark.asyncio
 async def test_recovery_wait_is_woken_by_connectable_advertisement() -> None:
     """Backoff can react to a callback outside a route-selection wait."""
-    environment = HomeAssistantBluetoothEnvironment(
+    environment = _environment(
         SimpleNamespace(),  # type: ignore[arg-type]
         "AA:BB:CC:DD:EE:FF",
     )
@@ -518,17 +623,17 @@ async def test_callback_registration_disables_cached_replay_when_supported(
         return lambda: None
 
     monkeypatch.setattr(
-        bluetooth_module.bluetooth,
+        environment_module.bluetooth,
         "BluetoothCallbackReplay",
         SimpleNamespace(DISABLED="disabled"),
         raising=False,
     )
     monkeypatch.setattr(
-        bluetooth_module.bluetooth,
+        environment_module.bluetooth,
         "async_register_callback",
         register,
     )
-    environment = HomeAssistantBluetoothEnvironment(
+    environment = _environment(
         SimpleNamespace(),  # type: ignore[arg-type]
         "AA:BB:CC:DD:EE:FF",
     )
@@ -555,22 +660,22 @@ async def test_wait_for_fresh_device_accepts_recent_cached_route(
     )
     clear_history = Mock()
     monkeypatch.setattr(
-        bluetooth_module.bluetooth,
+        environment_module.bluetooth,
         "async_last_service_info",
         lambda *_args, **_kwargs: recent_info,
     )
     monkeypatch.setattr(
-        bluetooth_module.bluetooth,
+        environment_module.bluetooth,
         "async_ble_device_from_address",
         lambda *_args, **_kwargs: device,
     )
     monkeypatch.setattr(
-        bluetooth_module.bluetooth,
+        environment_module.bluetooth,
         "async_clear_advertisement_history",
         clear_history,
         raising=False,
     )
-    environment = HomeAssistantBluetoothEnvironment(
+    environment = _environment(
         SimpleNamespace(),  # type: ignore[arg-type]
         device.address,
     )
@@ -580,9 +685,7 @@ async def test_wait_for_fresh_device_accepts_recent_cached_route(
     clear_history.assert_not_called()
     route = environment.route_diagnostics()
     assert route["last_route_selection"] == "recent_cache"
-    assert route["selected_advertisement_age_seconds"] == pytest.approx(
-        0.376, abs=0.05
-    )
+    assert route["selected_advertisement_age_seconds"] == pytest.approx(0.376, abs=0.05)
     assert route["fresh_advertisements"] == 0
 
 
@@ -603,16 +706,16 @@ async def test_wait_for_fresh_device_rejects_stale_cache_and_uses_live_route(
     )
     current_info = stale_info
     monkeypatch.setattr(
-        bluetooth_module.bluetooth,
+        environment_module.bluetooth,
         "async_last_service_info",
         lambda *_args, **_kwargs: current_info,
     )
     monkeypatch.setattr(
-        bluetooth_module.bluetooth,
+        environment_module.bluetooth,
         "async_ble_device_from_address",
         lambda *_args, **_kwargs: device,
     )
-    environment = HomeAssistantBluetoothEnvironment(
+    environment = _environment(
         SimpleNamespace(),  # type: ignore[arg-type]
         device.address,
     )
@@ -654,16 +757,16 @@ async def test_retry_requires_advertisement_newer_than_selected_route(
         time=first_time,
     )
     monkeypatch.setattr(
-        bluetooth_module.bluetooth,
+        environment_module.bluetooth,
         "async_last_service_info",
         lambda *_args, **_kwargs: current_info,
     )
     monkeypatch.setattr(
-        bluetooth_module.bluetooth,
+        environment_module.bluetooth,
         "async_ble_device_from_address",
         lambda *_args, **_kwargs: device,
     )
-    environment = HomeAssistantBluetoothEnvironment(
+    environment = _environment(
         SimpleNamespace(),  # type: ignore[arg-type]
         device.address,
     )
@@ -694,13 +797,13 @@ def test_reachability_diagnostics_uses_connection_intent(
     calls: list[tuple[object, str, object]] = []
     connection_intent = object()
     monkeypatch.setattr(
-        bluetooth_module.bluetooth,
+        environment_module.bluetooth,
         "BluetoothReachabilityIntent",
         SimpleNamespace(CONNECTION=connection_intent),
         raising=False,
     )
     monkeypatch.setattr(
-        bluetooth_module.bluetooth,
+        environment_module.bluetooth,
         "async_address_reachability_diagnostics",
         lambda hass, address, intent: (
             calls.append((hass, address, intent)) or "one connectable route"
@@ -708,7 +811,7 @@ def test_reachability_diagnostics_uses_connection_intent(
         raising=False,
     )
     hass = SimpleNamespace()
-    environment = HomeAssistantBluetoothEnvironment(
+    environment = _environment(
         hass,  # type: ignore[arg-type]
         "AA:BB:CC:DD:EE:FF",
     )

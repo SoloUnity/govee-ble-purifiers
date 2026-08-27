@@ -10,14 +10,20 @@ from pathlib import Path
 
 import pytest
 
+from custom_components.govee_ble_air_purifier import models as model_types
+from custom_components.govee_ble_air_purifier import profiles as profiles_module
 from custom_components.govee_ble_air_purifier.bluetooth import (
     GattTransport,
     HomeAssistantBluetoothEnvironment,
+)
+from custom_components.govee_ble_air_purifier.bluetooth_profile import (
+    bluetooth_settings_from_profile,
 )
 from custom_components.govee_ble_air_purifier.client import ReliablePurifierClient
 from custom_components.govee_ble_air_purifier.frame import build_frame
 from custom_components.govee_ble_air_purifier.models import FanMode, SetFanMode
 from custom_components.govee_ble_air_purifier.profiles import (
+    DeviceProfile,
     DuplicateProfileKeyError,
     Model,
     ProfileError,
@@ -81,14 +87,26 @@ def test_registry_is_cached_and_values_are_immutable() -> None:
         profile.protocol.request_catalog["changed"] = object()  # type: ignore[index]
 
 
+def test_profile_facade_preserves_model_identity_and_compatibility_loader() -> None:
+    """Package extraction retains one enum identity and the legacy loader API."""
+    registry = get_profile_registry()
+
+    assert profiles_module.Model is model_types.Model
+    assert profiles_module.SecurityMode is model_types.SecurityMode
+    assert profiles_module.FanMode is model_types.FanMode
+    assert profiles_module.DeviceProfile is DeviceProfile
+    assert DeviceProfile.for_model(Model.H7129) is registry.for_model(Model.H7129)
+
+
 def test_runtime_layers_share_the_exact_resolved_profile_instance() -> None:
     profile = load_profile_registry().for_model(Model.H7129)
+    settings = bluetooth_settings_from_profile(profile)
     environment = HomeAssistantBluetoothEnvironment(
         object(),  # type: ignore[arg-type]
         "AA:BB:CC:DD:EE:FF",
-        profile,
+        settings,
     )
-    transport = GattTransport(name="purifier", profile=profile)
+    transport = GattTransport(name="purifier", settings=settings)
     protocol = GoveePurifierProtocol(profile)
     client = ReliablePurifierClient(
         environment=environment,
@@ -99,8 +117,9 @@ def test_runtime_layers_share_the_exact_resolved_profile_instance() -> None:
         availability_callback=lambda _available, _error: None,
     )
 
-    assert environment.profile is profile
-    assert transport.profile is profile
+    assert environment.settings is settings
+    assert transport.settings is settings
+    assert environment.settings is transport.settings
     assert protocol.profile is profile
     assert client._profile is profile
 
@@ -198,16 +217,12 @@ def test_duplicate_json_keys_are_rejected(tmp_path: Path) -> None:
         ),
         (
             "default",
-            lambda raw: raw["protocol"]["commands"]["power"].update(
-                prefix="33 02"
-            ),
+            lambda raw: raw["protocol"]["commands"]["power"].update(prefix="33 02"),
             "unsafe command template",
         ),
         (
             "default",
-            lambda raw: raw["protocol"].update(
-                periodic_request="not_in_catalog"
-            ),
+            lambda raw: raw["protocol"].update(periodic_request="not_in_catalog"),
             "unresolved",
         ),
         (

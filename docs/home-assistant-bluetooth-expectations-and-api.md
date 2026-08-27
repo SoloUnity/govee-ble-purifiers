@@ -785,8 +785,10 @@ The Govee purifier integration applies the general model as follows:
   all four model-profile JSON files atomically off the event loop. It resolves
   inheritance, performs structural and semantic validation, and publishes one
   immutable process-cached registry. Runtime setup passes the same exact
-  profile instance through the coordinator, scanner environment, GATT
-  transport, application channel, protocol, and reliable client.
+  profile instance through the coordinator, application channel, protocol, and
+  reliable client. An integration-side adapter copies every Bluetooth-owned
+  profile value into one immutable settings instance shared by the scanner
+  environment and GATT transport.
 - `default` and `default-encrypted` are complete non-discoverable baselines.
   Only `h7124 -> default` and `h7129 -> default-encrypted` are valid exact
   lineages. Discovery uses exact profiles' explicit case-insensitive name
@@ -795,15 +797,48 @@ The Govee purifier integration applies the general model as follows:
 - Profile data owns model identity, GATT UUIDs, channel-strategy selection,
   non-secret negotiation policy, registered protocol/request/matcher choices,
   capabilities, and the effective retry/timing values described below. Python
-  owns scanner/route mechanics, connection generations, cleanup/cancellation,
-  encryption/key material, matcher and command implementations, state
-  authority, scheduling, and hard safety ceilings.
+  owns the exact profile-to-Bluetooth-settings adaptation, scanner/route
+  mechanics, connection generations, cleanup/cancellation, encryption/key
+  material, matcher and command implementations, scheduling, and hard safety
+  ceilings. A synchronous state reducer owns cached-state authority, matched
+  startup fan-mode assembly, confirmed-command application, reconciliation
+  checks, and pure state effects. A synchronous recovery controller owns the
+  rolling failure and advertisement-wake windows, stable reset, circuit floors,
+  backoff cap/jitter planning, and recovery diagnostic evidence. A
+  command-operation controller owns pending/active lifecycle, superseding,
+  deadlines, state-satisfaction reconciliation decisions, completion/failure,
+  cross-reconnect preservation, and bounded command evidence. A transaction
+  executor owns one-in-flight descriptor attempts, per-attempt response
+  deadlines, matcher progression, candidate-frame reduction, disconnect and
+  refresh-preemption arbitration, matched frames, and bounded timeout evidence;
+  it receives application-channel sends and session-specific effects through
+  explicit hooks. The reliable client owns connection/session scheduling,
+  initialization and refresh policy, polling cadence, command use cases,
+  Bluetooth recovery, callbacks, and the asynchronous runner around those
+  decisions. The internal Bluetooth package depends only on its immutable
+  runtime settings and transports opaque bytes;
+  application frame size is enforced by the purifier channel before any GATT
+  write.
+- The dependency direction is executable policy. Models do not import profiles.
+  The Bluetooth package does not import purifier profiles, models, channel,
+  protocol, runtime orchestration, setup, or entity modules. Protocol does not
+  import Home Assistant, Bluetooth, or runtime orchestration. Profiles do not
+  import Bluetooth, channel, protocol, runtime orchestration, setup, or entity
+  modules. State reduction and recovery policy remain synchronous and independent
+  of Home Assistant and Bluetooth. Lower layers do not import the coordinator,
+  config flow, or entities. Deterministic AST tests enforce these boundaries.
 - A schema, artifact, inheritance, semantic-validation, or exact-selection
   failure is a permanent setup/config-flow error before address cleanup or
   connection work. It never enters Bluetooth recovery and never falls back to a
   plaintext or encrypted baseline. Existing `H7124`/`H7129` config-entry data is
   resolved without migration or mutation.
 - Home Assistant owns scanning and selects local-adapter or proxy routes.
+- `discovery.py` owns setup identity retention, fresh address sightings,
+  cache/timestamp merging, the complete scan window, ordered choices, and
+  selected-address freshness. `setup_validation.py` owns the temporary
+  connect-and-initialize lifecycle. The config flow owns only form state,
+  configured-device filtering, selection orchestration, unique IDs, and entry
+  creation.
 - Callback replay is disabled for connection wake-up waits.
 - The first connection accepts a cached connectable advertisement no more than
   five seconds old; a retry requires evidence newer than its previous route.

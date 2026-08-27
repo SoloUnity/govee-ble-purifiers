@@ -7,7 +7,6 @@ import pytest
 from custom_components.govee_ble_air_purifier.frame import FrameError, build_frame
 from custom_components.govee_ble_air_purifier.models import (
     AirQualityEvent,
-    DeviceProfile,
     DeviceStateEvent,
     FanMode,
     FanModeEvent,
@@ -27,6 +26,7 @@ from custom_components.govee_ble_air_purifier.models import (
     SetPower,
     StartupFanModeEvent,
 )
+from custom_components.govee_ble_air_purifier.profiles import DeviceProfile
 from custom_components.govee_ble_air_purifier.protocol import (
     GoveePurifierProtocol,
     MatchResult,

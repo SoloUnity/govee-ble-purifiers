@@ -8,7 +8,11 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .bluetooth import GattTransport, HomeAssistantBluetoothEnvironment
+from .bluetooth import (
+    BluetoothRuntimeSettings,
+    GattTransport,
+    HomeAssistantBluetoothEnvironment,
+)
 from .client import PurifierClientError, ReliablePurifierClient
 from .models import (
     FanMode,
@@ -35,10 +39,12 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
         *,
         address: str,
         profile: DeviceProfile,
+        bluetooth_settings: BluetoothRuntimeSettings,
         name: str | None = None,
     ) -> None:
         self.address = address
         self.profile = profile
+        self.bluetooth_settings = bluetooth_settings
         self.model = profile.model
         self.name = name or profile.identity.display_name
 
@@ -52,8 +58,10 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
         self._shutdown = False
         self._client_available = False
 
-        environment = HomeAssistantBluetoothEnvironment(hass, address, profile)
-        transport = GattTransport(name=self.name, profile=profile)
+        environment = HomeAssistantBluetoothEnvironment(
+            hass, address, bluetooth_settings
+        )
+        transport = GattTransport(name=self.name, settings=bluetooth_settings)
         protocol = GoveePurifierProtocol(self.profile)
         self.client = ReliablePurifierClient(
             environment=environment,

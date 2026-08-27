@@ -12,13 +12,14 @@ from custom_components.govee_ble_air_purifier.channel import (
     ChannelNotReadyError,
     H7129SessionChannel,
     NegotiationError,
+    PlaintextChannel,
 )
 from custom_components.govee_ble_air_purifier.crypto import (
     COMMUNICATION_KEY,
     decrypt_frame,
     encrypt_frame,
 )
-from custom_components.govee_ble_air_purifier.frame import build_frame
+from custom_components.govee_ble_air_purifier.frame import FrameLengthError, build_frame
 from custom_components.govee_ble_air_purifier.profiles import DeviceProfile, Model
 
 
@@ -144,6 +145,7 @@ async def test_h7129_disconnect_aborts_negotiation_without_more_sends(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Invalidating a dropped connection interrupts the open phase immediately."""
+
     class SilentTransport:
         callback: Callable[[bytes], None] | None = None
         writes: list[bytes] = []
@@ -234,6 +236,7 @@ async def test_h7129_reconnects_only_after_phase_retry_budget_is_exhausted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A silent phase transmits three identical requests before it fails."""
+
     class SilentTransport:
         writes: list[bytes]
 
@@ -258,3 +261,62 @@ async def test_h7129_reconnects_only_after_phase_retry_budget_is_exhausted(
 
     assert len(transport.writes) == 3
     assert len(set(transport.writes)) == 1
+
+
+@pytest.mark.asyncio
+async def test_plaintext_channel_rejects_profile_size_before_transport_write() -> None:
+    """Application frame-size policy is enforced above opaque GATT transport."""
+    profile = DeviceProfile.for_model(Model.H7124)
+    profile = replace(
+        profile,
+        protocol=replace(profile.protocol, frame_size=profile.protocol.frame_size + 1),
+    )
+
+    class RecordingTransport:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+
+        async def async_subscribe(self, _: Callable[[bytes], None]) -> None:
+            return
+
+        async def async_write(self, data: bytes) -> None:
+            self.writes.append(data)
+
+    transport = RecordingTransport()
+    channel = PlaintextChannel(transport, lambda _: None, profile)
+    await channel.async_establish()
+
+    with pytest.raises(FrameLengthError, match="profile expects 21"):
+        await channel.async_send(build_frame(b"\xaa\x01"))
+
+    assert transport.writes == []
+
+
+@pytest.mark.asyncio
+async def test_encrypted_negotiation_rejects_profile_size_before_transport_write() -> (
+    None
+):
+    """Negotiation frames cross the same application-channel size boundary."""
+    profile = DeviceProfile.for_model(Model.H7129)
+    profile = replace(
+        profile,
+        protocol=replace(profile.protocol, frame_size=profile.protocol.frame_size + 1),
+    )
+
+    class RecordingTransport:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+
+        async def async_subscribe(self, _: Callable[[bytes], None]) -> None:
+            return
+
+        async def async_write(self, data: bytes) -> None:
+            self.writes.append(data)
+
+    transport = RecordingTransport()
+    channel = H7129SessionChannel(transport, lambda _: None, profile)
+
+    with pytest.raises(NegotiationError, match="profile expects 21"):
+        await channel.async_establish()
+
+    assert transport.writes == []
