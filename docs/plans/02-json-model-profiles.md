@@ -66,7 +66,13 @@ Add:
 
 ```text
 custom_components/govee_ble_air_purifier/
-├── profiles.py
+├── profiles/
+│   ├── __init__.py
+│   ├── artifacts.py
+│   ├── errors.py
+│   ├── parsing.py
+│   ├── registry.py
+│   └── types.py
 └── model_profiles/
     ├── schema.json
     ├── default.json

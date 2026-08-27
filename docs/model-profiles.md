@@ -71,7 +71,9 @@ or the reverse.
 
 ## Validation and safety ceilings
 
-The draft 2020-12 schema rejects unknown fields and constrains the JSON shape.
+The bundled draft 2020-12 schema closes every object
+(`additionalProperties: false`) and is loaded atomically with the profiles. The
+strict decoder rejects unknown fields and constrains the JSON shape.
 Semantic validation additionally checks inheritance, UUIDs, lowercase hex,
 20-byte checksums, matcher requirements, request references and ordering,
 capability types, prefix ambiguity, security/negotiation consistency, Custom

@@ -1,5 +1,8 @@
 # Phase 1 — Fan UI Model
 
+**Status:** Implemented in the working tree; release status remains governed by
+the integration manifest and README release notes.
+
 ## Goal
 
 Change only the Home Assistant fan presentation and entity-level command mapping.
