@@ -115,8 +115,8 @@ class SilentChannel:
         self.ready = False
 
 
-def make_client() -> ReliablePurifierClient:
-    profile = DeviceProfile.for_model(Model.H7124)
+def make_client(model: Model = Model.H7124) -> ReliablePurifierClient:
+    profile = DeviceProfile.for_model(model)
     return ReliablePurifierClient(
         environment=FakeEnvironment(),  # type: ignore[arg-type]
         transport=FakeTransport(),  # type: ignore[arg-type]
@@ -330,6 +330,7 @@ async def test_connection_loop_retries_after_link_failure() -> None:
     assert availability == [False]
     client._async_backoff.assert_awaited_once_with(client_module.BACKOFF_MIN)
     assert client._transport.disconnects == 2  # type: ignore[attr-defined]
+    assert len(client._recovery_failure_times) == 1
 
 
 @pytest.mark.asyncio
@@ -368,6 +369,214 @@ def test_recent_advertisements_cap_recovery_backoff() -> None:
     assert client._recovery_backoff_delay(60.0) == 60.0
 
 
+def _arm_recovery_storm(
+    client: ReliablePurifierClient,
+    *,
+    now: float,
+    final_stage: client_module.ClientStatus,
+) -> None:
+    """Record the minimum evidence that opens the recovery circuit."""
+    client._record_recovery_failure(
+        client_module.ClientStatus.CONNECTING,
+        stable_for=0.0,
+        now=now,
+    )
+    client._record_advertisement_wake(now + 0.1)
+    client._record_recovery_failure(
+        client_module.ClientStatus.CONNECTING,
+        stable_for=0.0,
+        now=now + 0.2,
+    )
+    client._record_advertisement_wake(now + 0.3)
+    client._record_recovery_failure(
+        final_stage,
+        stable_for=0.0,
+        now=now + 0.4,
+    )
+
+
+@pytest.mark.parametrize(
+    ("model", "final_stage"),
+    [
+        (Model.H7124, client_module.ClientStatus.INITIALIZING),
+        (Model.H7129, client_module.ClientStatus.NEGOTIATING),
+    ],
+)
+def test_recovery_circuit_opens_for_both_models_after_repeated_early_failures(
+    model: Model,
+    final_stage: client_module.ClientStatus,
+) -> None:
+    """Both models share the circuit while retaining their actual failure stage."""
+    client = make_client(model)
+    now = client_module.time.monotonic()
+    _arm_recovery_storm(client, now=now, final_stage=final_stage)
+
+    assert client._recovery_cooldown_floor(now + 0.5) == 5.0
+
+    client._record_recovery_failure(
+        final_stage,
+        stable_for=0.0,
+        now=now + 0.6,
+    )
+    assert client._recovery_cooldown_floor(now + 0.6) == 8.0
+
+    recovery = client.diagnostic_snapshot()["recovery"]
+    assert isinstance(recovery, dict)
+    assert recovery["failure_count_in_window"] == 4
+    assert recovery["advertisement_wake_count_in_window"] == 2
+    assert recovery["last_failure_stage"] == final_stage.value
+    assert recovery["circuit_breaker_active"] is True
+    assert recovery["current_circuit_floor_seconds"] == 8.0
+
+
+def test_recovery_circuit_requires_both_failures_and_advertisement_wakes() -> None:
+    """Ordinary failures cannot open the advertisement-loop circuit alone."""
+    client = make_client()
+    for offset in range(4):
+        client._record_recovery_failure(
+            client_module.ClientStatus.CONNECTING,
+            stable_for=0.0,
+            now=float(offset),
+        )
+
+    assert client._recovery_cooldown_floor(4.0) == 0.0
+
+
+def test_recovery_circuit_expires_and_resets_after_stable_ready() -> None:
+    """Old storms and a durable READY session restore normal fast recovery."""
+    client = make_client()
+    now = client_module.time.monotonic()
+    _arm_recovery_storm(
+        client,
+        now=now,
+        final_stage=client_module.ClientStatus.INITIALIZING,
+    )
+    assert client._recovery_cooldown_floor(now + 0.5) == 5.0
+    assert client._recovery_cooldown_floor(now + 121.0) == 0.0
+
+    _arm_recovery_storm(
+        client,
+        now=now + 200.0,
+        final_stage=client_module.ClientStatus.INITIALIZING,
+    )
+    client._record_recovery_failure(
+        client_module.ClientStatus.READY,
+        stable_for=client_module.BACKOFF_RESET_AFTER,
+        now=now + 201.0,
+    )
+
+    assert client._recovery_cooldown_floor(now + 201.0) == 0.0
+    assert len(client._recovery_failure_times) == 0
+    assert len(client._recovery_advertisement_wake_times) == 0
+
+
+@pytest.mark.asyncio
+async def test_ready_session_resets_recovery_circuit_at_thirty_second_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A still-current READY session clears its circuit without disconnecting."""
+    monkeypatch.setattr(client_module, "BACKOFF_RESET_AFTER", 0.01)
+    client = make_client()
+    loop = asyncio.get_running_loop()
+    _arm_recovery_storm(
+        client,
+        now=loop.time(),
+        final_stage=client_module.ClientStatus.INITIALIZING,
+    )
+    client.status = client_module.ClientStatus.READY
+    client._session_generation = 4
+
+    client._schedule_recovery_reset(4)
+    await asyncio.sleep(0.02)
+
+    assert client._recovery_cooldown_floor(loop.time()) == 0.0
+    assert client._recovery_reset_handle is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_circuit_holds_advertisement_until_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh advertisement is evidence, not a circuit-breaker bypass."""
+    monkeypatch.setattr(client_module.random, "uniform", lambda *_: 1.0)
+    monkeypatch.setattr(client_module, "ADVERTISEMENT_RECOVERY_COOLDOWN", 0.0)
+    monkeypatch.setattr(client_module, "RECOVERY_STORM_INITIAL_FLOOR", 0.03)
+    client = make_client()
+    loop = asyncio.get_running_loop()
+    _arm_recovery_storm(
+        client,
+        now=loop.time(),
+        final_stage=client_module.ClientStatus.INITIALIZING,
+    )
+    environment = client._environment
+
+    backoff = asyncio.create_task(client._async_backoff(0.001))
+    await asyncio.sleep(0)
+    environment.advertisement_event.set()  # type: ignore[attr-defined]
+    await asyncio.sleep(0.005)
+
+    assert not backoff.done()
+    await asyncio.wait_for(backoff, timeout=0.1)
+    assert client._last_backoff_wake_reason == "fresh_advertisement"
+    assert client._last_backoff_elapsed_seconds is not None
+    assert client._last_backoff_elapsed_seconds >= 0.02
+
+
+@pytest.mark.asyncio
+async def test_recovery_circuit_holds_command_without_dropping_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A command respects the floor while remaining queued for recovery."""
+    monkeypatch.setattr(client_module.random, "uniform", lambda *_: 1.0)
+    monkeypatch.setattr(client_module, "RECOVERY_STORM_INITIAL_FLOOR", 0.03)
+    client = make_client()
+    loop = asyncio.get_running_loop()
+    _arm_recovery_storm(
+        client,
+        now=loop.time(),
+        final_stage=client_module.ClientStatus.INITIALIZING,
+    )
+    future: asyncio.Future[None] = loop.create_future()
+    operation = _Operation(SetPower(True), future, loop.time() + 30.0)
+    client._operations.append(operation)
+
+    backoff = asyncio.create_task(client._async_backoff(0.001))
+    await asyncio.sleep(0)
+    client._operation_event.set()
+    await asyncio.sleep(0.005)
+    assert not backoff.done()
+
+    await asyncio.wait_for(backoff, timeout=0.1)
+
+    assert client._last_backoff_wake_reason == "queued_command"
+    assert not client._operation_event.is_set()
+    assert client._operations[0] is operation
+    assert not future.done()
+
+
+@pytest.mark.asyncio
+async def test_recovery_circuit_shutdown_interrupts_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shutdown never waits behind an active recovery circuit floor."""
+    monkeypatch.setattr(client_module.random, "uniform", lambda *_: 1.0)
+    monkeypatch.setattr(client_module, "RECOVERY_STORM_INITIAL_FLOOR", 60.0)
+    client = make_client()
+    loop = asyncio.get_running_loop()
+    _arm_recovery_storm(
+        client,
+        now=loop.time(),
+        final_stage=client_module.ClientStatus.INITIALIZING,
+    )
+
+    backoff = asyncio.create_task(client._async_backoff(60.0))
+    await asyncio.sleep(0)
+    client._stopping.set()
+    await asyncio.wait_for(backoff, timeout=0.1)
+
+    assert client._last_backoff_wake_reason == "shutdown"
+
+
 @pytest.mark.asyncio
 async def test_new_advertisement_wakes_long_recovery_backoff(
     monkeypatch: pytest.MonkeyPatch,
@@ -398,6 +607,28 @@ async def test_queued_command_wakes_recovery_backoff(
     client._operation_event.set()
 
     await asyncio.wait_for(backoff, timeout=0.1)
+    assert not client._operation_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_command_interrupts_normal_advertisement_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The circuit does not weaken normal command-priority recovery."""
+    monkeypatch.setattr(client_module.random, "uniform", lambda *_: 1.0)
+    monkeypatch.setattr(client_module, "ADVERTISEMENT_RECOVERY_COOLDOWN", 60.0)
+    client = make_client()
+    environment = client._environment
+
+    backoff = asyncio.create_task(client._async_backoff(60.0))
+    await asyncio.sleep(0)
+    environment.advertisement_event.set()  # type: ignore[attr-defined]
+    await asyncio.sleep(0)
+    client._operation_event.set()
+
+    await asyncio.wait_for(backoff, timeout=0.1)
+
+    assert client._last_backoff_wake_reason == "queued_command"
     assert not client._operation_event.is_set()
 
 

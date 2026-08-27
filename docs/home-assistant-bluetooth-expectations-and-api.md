@@ -838,8 +838,17 @@ The Govee purifier integration applies the general model as follows:
   60 seconds, but the base delay is capped at eight seconds while Home Assistant
   retains a connectable advertisement no more than ten seconds old. The
   resulting ceiling after jitter is approximately 6.4 to 9.6 seconds. A newly
-  received connectable advertisement or queued command wakes an existing wait;
-  advertisement-triggered recovery retains a one-second settling cooldown.
+  received connectable advertisement or queued command normally wakes an
+  existing wait; advertisement-triggered recovery retains a one-second settling
+  cooldown.
+- One per-client recovery circuit covers both H7124 and H7129 without merging
+  their model-specific stages. It opens only when three unstable cycle failures
+  and two advertisement-triggered wakes occur inside a rolling two-minute
+  window. The third failure enforces a five-second minimum wait after disconnect
+  and address cleanup; the fourth and later failures enforce eight seconds.
+  Fresh advertisements and queued commands remain wake evidence but cannot
+  bypass an active floor. Shutdown always interrupts immediately. A READY
+  session lasting at least 30 seconds, shutdown, or unload clears the circuit.
 - Before the first successful initialization, transient failures do not publish
   coordinator update errors. After a device has been ready, link loss makes its
   entities unavailable without logging an error for each retry cycle. Recovery
@@ -904,11 +913,14 @@ The Govee purifier integration applies the general model as follows:
 - Diagnostics retain recent connection failures, Home Assistant reachability,
   essential initialization batch/attempt counts, and GATT operation deadline,
   timeout, cancellation, and elapsed-time information. They also expose command
-  queue/attempt state and refresh preemption/resume state. An unconfirmed
-  command carries its bounded send timeline and response evidence across the
-  recovery reconnect, and fan controls correlate observed `3a 05` command
-  echoes and `ee 05` physical updates with their role, decoded mode, connection
-  generation, transaction phase, and timing.
+  queue/attempt state, refresh preemption/resume state, recovery failure and
+  advertisement-wake counts, the last failure stage and stable duration, cycle
+  and cleanup outcome, requested/effective/jittered/planned backoff timing,
+  current circuit floor, elapsed wait, and wake reason. An unconfirmed command
+  carries its bounded send timeline and response evidence across the recovery
+  reconnect, and fan controls correlate observed `3a 05` command echoes and
+  `ee 05` physical updates with their role, decoded mode, connection generation,
+  transaction phase, and timing.
   Startup fan diagnostics additionally retain the last mode code, manual-level
   and raw selector-01 values, Auto parameter, pair-assembly status, resolution
   reason, and connection generation without exposing H7129 session secrets.

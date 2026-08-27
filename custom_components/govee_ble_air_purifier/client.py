@@ -68,6 +68,12 @@ BACKOFF_MAX = 60.0
 RECENT_ADVERTISEMENT_BACKOFF_MAX = 8.0
 ADVERTISEMENT_RECOVERY_COOLDOWN = 1.0
 BACKOFF_RESET_AFTER = 30.0
+RECOVERY_STORM_WINDOW = 120.0
+RECOVERY_STORM_FAILURE_THRESHOLD = 3
+RECOVERY_STORM_ADVERTISEMENT_THRESHOLD = 2
+RECOVERY_STORM_INITIAL_FLOOR = 5.0
+RECOVERY_STORM_MAX_FLOOR = 8.0
+RECOVERY_EVENT_HISTORY_LIMIT = 32
 
 StateCallback = Callable[[PurifierState], None]
 AvailabilityCallback = Callable[[bool, Exception | None], None]
@@ -159,7 +165,26 @@ class ReliablePurifierClient:
         self._refresh_failure_summaries: dict[str, str] = {}
         self._next_poll_due = 0.0
         self._ready_since: float | None = None
+        self._recovery_reset_handle: asyncio.TimerHandle | None = None
         self._connection_cycles = 0
+        self._recovery_failure_times: deque[float] = deque(
+            maxlen=RECOVERY_EVENT_HISTORY_LIMIT
+        )
+        self._recovery_advertisement_wake_times: deque[float] = deque(
+            maxlen=RECOVERY_EVENT_HISTORY_LIMIT
+        )
+        self._last_recovery_failure_stage: str | None = None
+        self._last_recovery_failure_cycle: int | None = None
+        self._last_recovery_failure_stable_seconds = 0.0
+        self._last_cycle_duration_seconds: float | None = None
+        self._last_cycle_cleanup_succeeded: bool | None = None
+        self._last_backoff_requested_seconds: float | None = None
+        self._last_backoff_effective_seconds: float | None = None
+        self._last_backoff_jittered_seconds: float | None = None
+        self._last_backoff_floor_seconds = 0.0
+        self._last_backoff_planned_seconds: float | None = None
+        self._last_backoff_elapsed_seconds: float | None = None
+        self._last_backoff_wake_reason: str | None = None
         self._plaintext_rx_count = 0
         self._active_request: str | None = None
         self._last_error: str | None = None
@@ -185,12 +210,53 @@ class ReliablePurifierClient:
 
     def diagnostic_snapshot(self) -> dict[str, object]:
         """Return secret-free runtime evidence for Home Assistant diagnostics."""
+        current_recovery_floor = self._recovery_cooldown_floor(time.monotonic())
         return {
             "status": self.status.value,
             "is_ready": self.is_ready,
             "has_ever_been_ready": self._has_ever_been_ready,
             "session_generation": self._session_generation,
             "connection_cycles": self._connection_cycles,
+            "recovery": {
+                "failure_count_in_window": len(self._recovery_failure_times),
+                "advertisement_wake_count_in_window": len(
+                    self._recovery_advertisement_wake_times
+                ),
+                "window_seconds": RECOVERY_STORM_WINDOW,
+                "failure_threshold": RECOVERY_STORM_FAILURE_THRESHOLD,
+                "advertisement_wake_threshold": (
+                    RECOVERY_STORM_ADVERTISEMENT_THRESHOLD
+                ),
+                "stable_reset_seconds": BACKOFF_RESET_AFTER,
+                "circuit_breaker_active": current_recovery_floor > 0,
+                "current_circuit_floor_seconds": current_recovery_floor,
+                "last_failure_stage": self._last_recovery_failure_stage,
+                "last_failure_cycle": self._last_recovery_failure_cycle,
+                "last_failure_stable_seconds": (
+                    self._last_recovery_failure_stable_seconds
+                ),
+                "last_cycle_duration_seconds": self._last_cycle_duration_seconds,
+                "last_cycle_cleanup_succeeded": (
+                    self._last_cycle_cleanup_succeeded
+                ),
+                "last_backoff_requested_seconds": (
+                    self._last_backoff_requested_seconds
+                ),
+                "last_backoff_effective_seconds": (
+                    self._last_backoff_effective_seconds
+                ),
+                "last_backoff_jittered_seconds": (
+                    self._last_backoff_jittered_seconds
+                ),
+                "last_backoff_floor_seconds": self._last_backoff_floor_seconds,
+                "last_backoff_planned_seconds": (
+                    self._last_backoff_planned_seconds
+                ),
+                "last_backoff_elapsed_seconds": (
+                    self._last_backoff_elapsed_seconds
+                ),
+                "last_backoff_wake_reason": self._last_backoff_wake_reason,
+            },
             "plaintext_rx_count": self._plaintext_rx_count,
             "active_request": self._active_request,
             "last_error": self._last_error,
@@ -317,6 +383,8 @@ class ReliablePurifierClient:
                 PurifierClientError("Purifier client stopped")
             )
         self._fail_all_operations(PurifierClientError("Purifier client stopped"))
+        self._cancel_recovery_reset()
+        self._reset_recovery_storm()
         self.status = ClientStatus.STOPPED
 
     async def async_execute(self, command: ProtocolCommand) -> None:
@@ -358,26 +426,41 @@ class ReliablePurifierClient:
 
     async def _run(self) -> None:
         backoff = BACKOFF_MIN
+        loop = asyncio.get_running_loop()
         while not self._stopping.is_set():
+            cycle_started = loop.time()
             try:
                 await self._connect_initialize_and_run()
             except asyncio.CancelledError:
                 raise
             except Exception as err:
                 self._last_error = f"{type(err).__name__}: {err}"
-                _LOGGER.debug(
-                    "Purifier connection cycle %d failed at status=%s "
-                    "session_generation=%d: %s",
-                    self._connection_cycles,
-                    self.status.value,
-                    self._session_generation,
-                    self._last_error,
-                    exc_info=True,
-                )
+                failed_stage = self.status
                 stable_for = (
-                    asyncio.get_running_loop().time() - self._ready_since
+                    loop.time() - self._ready_since
                     if self._ready_since is not None
                     else 0.0
+                )
+                self._record_recovery_failure(
+                    failed_stage,
+                    stable_for=stable_for,
+                    now=loop.time(),
+                )
+                recovery_floor = self._recovery_cooldown_floor(loop.time())
+                _LOGGER.debug(
+                    "Purifier connection cycle %d failed at status=%s "
+                    "session_generation=%d stable_for=%.3fs "
+                    "failure_count=%d advertisement_wakes=%d "
+                    "recovery_floor=%.1fs: %s",
+                    self._connection_cycles,
+                    failed_stage.value,
+                    self._session_generation,
+                    stable_for,
+                    len(self._recovery_failure_times),
+                    len(self._recovery_advertisement_wake_times),
+                    recovery_floor,
+                    self._last_error,
+                    exc_info=True,
                 )
                 if stable_for >= BACKOFF_RESET_AFTER:
                     backoff = BACKOFF_MIN
@@ -390,20 +473,29 @@ class ReliablePurifierClient:
                         self._connection_cycles,
                     )
             finally:
+                self._cancel_recovery_reset()
                 self._ready_since = None
                 channel = self._channel
                 self._channel = None
                 if channel is not None:
                     channel.invalidate()
                 await self._transport.async_disconnect()
-                await self._transport.async_cleanup_stale_connection(
-                    reason="connection_cycle_end"
+                self._last_cycle_cleanup_succeeded = (
+                    await self._transport.async_cleanup_stale_connection(
+                        reason="connection_cycle_end"
+                    )
+                )
+                self._last_cycle_duration_seconds = round(
+                    max(0.0, loop.time() - cycle_started), 3
                 )
 
             if self._stopping.is_set():
                 break
             self.status = ClientStatus.BACKOFF
-            await self._async_backoff(self._recovery_backoff_delay(backoff))
+            self._last_backoff_requested_seconds = backoff
+            effective_backoff = self._recovery_backoff_delay(backoff)
+            self._last_backoff_effective_seconds = effective_backoff
+            await self._async_backoff(effective_backoff)
             backoff = min(BACKOFF_MAX, backoff * 2)
 
     async def _connect_initialize_and_run(self) -> None:
@@ -510,6 +602,7 @@ class ReliablePurifierClient:
         self._has_ever_been_ready = True
         loop = asyncio.get_running_loop()
         self._ready_since = loop.time()
+        self._schedule_recovery_reset(session_generation)
         initial_poll_delay = (
             H7124_INITIAL_POLL_DELAY
             if self._profile.model is Model.H7124
@@ -1454,6 +1547,95 @@ class ReliablePurifierClient:
         )
         self._availability_callback(available, error)
 
+    def _trim_recovery_window(self, now: float) -> None:
+        """Discard failure-storm evidence outside the bounded time window."""
+        cutoff = now - RECOVERY_STORM_WINDOW
+        while (
+            self._recovery_failure_times
+            and self._recovery_failure_times[0] < cutoff
+        ):
+            self._recovery_failure_times.popleft()
+        while (
+            self._recovery_advertisement_wake_times
+            and self._recovery_advertisement_wake_times[0] < cutoff
+        ):
+            self._recovery_advertisement_wake_times.popleft()
+
+    def _reset_recovery_storm(self) -> None:
+        """Forget consecutive unstable-cycle evidence after stable operation."""
+        self._recovery_failure_times.clear()
+        self._recovery_advertisement_wake_times.clear()
+
+    def _cancel_recovery_reset(self) -> None:
+        """Cancel the stable-session reset callback for the previous cycle."""
+        handle = self._recovery_reset_handle
+        self._recovery_reset_handle = None
+        if handle is not None:
+            handle.cancel()
+
+    def _schedule_recovery_reset(self, session_generation: int) -> None:
+        """Clear circuit evidence once this READY session is durably healthy."""
+        self._cancel_recovery_reset()
+        loop = asyncio.get_running_loop()
+
+        def reset_if_current() -> None:
+            self._recovery_reset_handle = None
+            if (
+                self.status is not ClientStatus.READY
+                or session_generation != self._session_generation
+            ):
+                return
+            self._reset_recovery_storm()
+            _LOGGER.debug(
+                "Bluetooth recovery circuit reset after stable READY session: "
+                "session_generation=%d stable_for=%.1fs",
+                session_generation,
+                BACKOFF_RESET_AFTER,
+            )
+
+        self._recovery_reset_handle = loop.call_later(
+            BACKOFF_RESET_AFTER,
+            reset_if_current,
+        )
+
+    def _record_recovery_failure(
+        self,
+        stage: ClientStatus,
+        *,
+        stable_for: float,
+        now: float,
+    ) -> None:
+        """Record one cycle that failed before becoming durably healthy."""
+        self._last_recovery_failure_stage = stage.value
+        self._last_recovery_failure_cycle = self._connection_cycles
+        self._last_recovery_failure_stable_seconds = round(
+            max(0.0, stable_for), 3
+        )
+        if stable_for >= BACKOFF_RESET_AFTER:
+            self._reset_recovery_storm()
+            return
+        self._trim_recovery_window(now)
+        self._recovery_failure_times.append(now)
+
+    def _record_advertisement_wake(self, now: float) -> None:
+        """Record a fresh advertisement that ended a scheduled recovery wait."""
+        self._trim_recovery_window(now)
+        self._recovery_advertisement_wake_times.append(now)
+
+    def _recovery_cooldown_floor(self, now: float) -> float:
+        """Return the circuit-breaker floor for repeated unstable recovery."""
+        self._trim_recovery_window(now)
+        failures = len(self._recovery_failure_times)
+        advertisement_wakes = len(self._recovery_advertisement_wake_times)
+        if (
+            failures < RECOVERY_STORM_FAILURE_THRESHOLD
+            or advertisement_wakes < RECOVERY_STORM_ADVERTISEMENT_THRESHOLD
+        ):
+            return 0.0
+        if failures == RECOVERY_STORM_FAILURE_THRESHOLD:
+            return RECOVERY_STORM_INITIAL_FLOOR
+        return RECOVERY_STORM_MAX_FLOOR
+
     def _recovery_backoff_delay(self, requested: float) -> float:
         """Cap recovery delay while Home Assistant still sees advertisements."""
         recent = self._environment.has_recent_advertisement(
@@ -1540,10 +1722,18 @@ class ReliablePurifierClient:
         started = loop.time()
         advertisement_cutoff = time.monotonic()
         jittered_delay = delay * random.uniform(0.8, 1.2)
+        recovery_floor = self._recovery_cooldown_floor(started)
+        planned_delay = max(jittered_delay, recovery_floor)
+        self._last_backoff_jittered_seconds = round(jittered_delay, 3)
+        self._last_backoff_floor_seconds = recovery_floor
+        self._last_backoff_planned_seconds = round(planned_delay, 3)
         _LOGGER.debug(
-            "Bluetooth recovery backoff: base=%.1fs jittered=%.3fs next_max=%.1fs",
+            "Bluetooth recovery backoff: base=%.1fs jittered=%.3fs "
+            "circuit_floor=%.1fs planned=%.3fs next_max=%.1fs",
             delay,
             jittered_delay,
+            recovery_floor,
+            planned_delay,
             BACKOFF_MAX,
         )
         stop_task = asyncio.create_task(self._stopping.wait())
@@ -1557,9 +1747,10 @@ class ReliablePurifierClient:
         try:
             done, _ = await asyncio.wait(
                 tasks,
-                timeout=jittered_delay,
+                timeout=planned_delay,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            advertisement_triggered = advertisement_task in done
             if not done:
                 reason = "scheduled_delay"
             elif stop_task in done and stop_task.result():
@@ -1572,27 +1763,54 @@ class ReliablePurifierClient:
                 self._operation_event.clear()
             else:
                 reason = "fresh_advertisement"
-                cooldown = max(
-                    0.0,
-                    ADVERTISEMENT_RECOVERY_COOLDOWN - (loop.time() - started),
+
+            minimum_wait = recovery_floor
+            if reason == "fresh_advertisement":
+                minimum_wait = max(
+                    minimum_wait,
+                    ADVERTISEMENT_RECOVERY_COOLDOWN,
                 )
-                if cooldown:
-                    # Give BlueZ a brief settling period after the advertisement,
-                    # but never hold a shutdown or user command behind it.
-                    done, _ = await asyncio.wait(
-                        (stop_task, operation_task),
-                        timeout=cooldown,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if stop_task in done and stop_task.result():
-                        reason = "shutdown"
-                    elif operation_task in done and operation_task.result():
-                        reason = "queued_command"
-                        self._operation_event.clear()
+            remaining_floor = max(
+                0.0,
+                minimum_wait - (loop.time() - started),
+            )
+            if reason != "shutdown" and remaining_floor:
+                # Once the circuit opens, advertisements and commands remain
+                # useful wake evidence but cannot force BlueZ into another
+                # immediate connection attempt. Shutdown always wins.
+                floor_tasks = (
+                    (stop_task,)
+                    if recovery_floor > 0
+                    else (stop_task, operation_task)
+                )
+                done, _ = await asyncio.wait(
+                    floor_tasks,
+                    timeout=remaining_floor,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if stop_task in done and stop_task.result():
+                    reason = "shutdown"
+                elif operation_task in done and operation_task.result():
+                    reason = "queued_command"
+                    self._operation_event.clear()
+
+            if reason != "shutdown" and self._operation_event.is_set():
+                reason = "queued_command"
+                self._operation_event.clear()
+            if advertisement_triggered and reason != "shutdown":
+                self._record_advertisement_wake(loop.time())
+
+            elapsed = max(0.0, loop.time() - started)
+            self._last_backoff_elapsed_seconds = round(elapsed, 3)
+            self._last_backoff_wake_reason = reason
             _LOGGER.debug(
-                "Bluetooth recovery backoff ended: reason=%s elapsed=%.3fs",
+                "Bluetooth recovery backoff ended: reason=%s elapsed=%.3fs "
+                "circuit_floor=%.1fs failure_count=%d advertisement_wakes=%d",
                 reason,
-                loop.time() - started,
+                elapsed,
+                recovery_floor,
+                len(self._recovery_failure_times),
+                len(self._recovery_advertisement_wake_times),
             )
         finally:
             for task in tasks:

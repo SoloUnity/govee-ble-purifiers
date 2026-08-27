@@ -213,10 +213,17 @@ the Govee app is treated as a transient disconnect:
   delay is capped at eight seconds while Home Assistant still has an
   advertisement no more than ten seconds old, producing an approximately
   6.4-to-9.6-second jittered wait at the ceiling; and
-- a newly received connectable advertisement or queued user command wakes the
-  current backoff early. Advertisement-triggered recovery keeps a one-second
-  settling cooldown so repeated negotiation failures cannot create a tight
-  connection loop.
+- during normal recovery, a newly received connectable advertisement or queued
+  user command wakes the current backoff early. Advertisement-triggered recovery
+  keeps a one-second settling cooldown;
+- a per-purifier circuit breaker covers both H7124 and H7129. It opens only after
+  three unstable cycles and two advertisement-triggered wakes occur within two
+  minutes. The third failure gets a minimum five-second post-cleanup delay and
+  later failures get eight seconds. Advertisements and queued commands cannot
+  bypass that active floor, but shutdown remains immediate; and
+- the circuit resets after the purifier remains ready for 30 seconds. H7129
+  negotiation failures retain their `e7-01`/`e7-02` detail, while H7124 records
+  its applicable connection, subscription, or initialization stage.
 
 The first runtime connection attempt can accept a cached connectable
 advertisement no more than five seconds old. After a failed route, retry requires
@@ -382,6 +389,8 @@ details can include:
 - the active/last GATT operation, its deadline, elapsed time, timeout count, and
   any cancellation task still being observed;
 - partial-client and stale-connection cleanup results;
+- recovery failure and advertisement-wake counts, failure stage, cycle and
+  backoff timing, active circuit floor, wake reason, and cleanup outcome;
 - essential initialization batch and wire-attempt counts;
 - request name, retry count, received and matched frames; and
 - a bounded sample of ignored application frames.
@@ -406,9 +415,9 @@ addresses and device-specific metadata should be redacted before sharing logs.
 
 Home Assistant config-entry diagnostics expose redacted entry data, cached
 purifier state, connection status, route evidence, transport counters, current
-stage, cleanup statistics, recent bounded failures, and startup fan-mode
-fragments (including the selector-01 value), resolution, and connection
-generation.
+stage, cleanup statistics, recent bounded failures, recovery-circuit state and
+timing, and startup fan-mode fragments (including the selector-01 value),
+resolution, and connection generation.
 
 ## Removal and updates
 
