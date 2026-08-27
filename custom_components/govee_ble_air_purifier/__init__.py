@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from homeassistant.config_entries import ConfigEntry
@@ -11,6 +10,7 @@ from homeassistant.core import Event, HomeAssistant
 from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
 
 from .bluetooth import BluetoothUnavailableError, async_close_stale_connections
+from .bluetooth.ownership import ADDRESS_OWNERSHIP
 from .bluetooth_profile import bluetooth_settings_from_profile
 from .const import CONF_MODEL, PLATFORMS
 from .coordinator import GoveeDataUpdateCoordinator
@@ -26,11 +26,16 @@ async def _async_cleanup_address(
     *,
     reason: str,
     timeout: float,
+    cancellation_timeout: float,
 ) -> None:
     """Best-effort bounded cleanup when no runtime transport may be available."""
     try:
-        async with asyncio.timeout(timeout):
-            await async_close_stale_connections(address, reason=reason)
+        result = await ADDRESS_OWNERSHIP.async_run_standalone_cleanup(
+            address,
+            lambda: async_close_stale_connections(address, reason=reason),
+            timeout=timeout,
+            cancellation_timeout=cancellation_timeout,
+        )
     except Exception as err:  # noqa: BLE001
         _LOGGER.debug(
             "Best-effort stale Bluetooth cleanup failed for %s: reason=%s "
@@ -39,6 +44,18 @@ async def _async_cleanup_address(
             reason,
             err,
             exc_info=True,
+        )
+        return
+    if not result["success"]:
+        _LOGGER.debug(
+            "Best-effort stale Bluetooth cleanup deferred or incomplete for %s: "
+            "reason=%s acquired=%s retained=%s cause=%s ownership=%s",
+            address,
+            reason,
+            result["acquired"],
+            result["retained"],
+            result["error"],
+            result["ownership"],
         )
 
 
@@ -60,6 +77,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: GoveeConfigEntry) -> boo
         address,
         reason="entry_setup",
         timeout=bluetooth_settings.cleanup.stale_connection_timeout,
+        cancellation_timeout=(
+            bluetooth_settings.gatt_operations.operation_cancel_timeout
+        ),
     )
 
     coordinator = GoveeDataUpdateCoordinator(
@@ -109,15 +129,17 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     try:
         registry = await async_get_profile_registry(hass)
         profile = registry.for_model(entry.data[CONF_MODEL])
-        timeout = bluetooth_settings_from_profile(
-            profile
-        ).cleanup.stale_connection_timeout
+        settings = bluetooth_settings_from_profile(profile)
+        timeout = settings.cleanup.stale_connection_timeout
+        cancellation_timeout = settings.gatt_operations.operation_cancel_timeout
     except (ProfileError, KeyError, ValueError):
         # Removal must remain bounded even when the artifact that prevented
         # setup is itself invalid. This is a safety fallback, not profile data.
         timeout = 5.0
+        cancellation_timeout = 1.0
     await _async_cleanup_address(
         address,
         reason="entry_removed",
         timeout=timeout,
+        cancellation_timeout=cancellation_timeout,
     )

@@ -1,5 +1,8 @@
 """Tests for integration lifecycle cleanup."""
 
+import asyncio
+import logging
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -8,9 +11,13 @@ from homeassistant.const import CONF_ADDRESS, EVENT_HOMEASSISTANT_STOP
 from homeassistant.exceptions import ConfigEntryError
 
 from custom_components.govee_ble_air_purifier import (
+    _async_cleanup_address,
     async_remove_entry,
     async_setup_entry,
     async_unload_entry,
+)
+from custom_components.govee_ble_air_purifier.bluetooth.ownership import (
+    ADDRESS_OWNERSHIP,
 )
 from custom_components.govee_ble_air_purifier.const import CONF_MODEL, PLATFORMS
 from custom_components.govee_ble_air_purifier.models import Model
@@ -176,3 +183,79 @@ async def test_remove_entry_closes_stale_connection() -> None:
         await async_remove_entry(hass, entry)  # type: ignore[arg-type]
 
     cleanup.assert_awaited_once_with(address, reason="entry_removed")
+
+
+async def test_standalone_cleanup_defers_to_existing_address_owner() -> None:
+    """Setup/removal cleanup cannot race an existing runtime owner."""
+    address = "AA:BB:CC:DD:EF:11"
+    token = ADDRESS_OWNERSHIP.claim(address)
+    assert token is not None
+
+    with patch(
+        "custom_components.govee_ble_air_purifier.async_close_stale_connections",
+        new_callable=AsyncMock,
+    ) as cleanup:
+        await _async_cleanup_address(
+            address,
+            reason="entry_setup",
+            timeout=0.01,
+            cancellation_timeout=0.01,
+        )
+
+    cleanup.assert_not_awaited()
+    assert ADDRESS_OWNERSHIP.is_current(token)
+    ADDRESS_OWNERSHIP.request_release(token)
+    ADDRESS_OWNERSHIP.finish_cleanup(token)
+
+
+async def test_resistant_standalone_cleanup_is_bounded_and_retained(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A resistant top-level cleanup retains quarantine and observes failure."""
+    address = "AA:BB:CC:DD:EF:12"
+    release = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+
+    async def resistant_cleanup(_: str, *, reason: str) -> None:
+        assert reason == "entry_removed"
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release.wait()
+        raise RuntimeError("late standalone cleanup failure")
+
+    caplog.set_level(
+        logging.DEBUG,
+        logger="custom_components.govee_ble_air_purifier.bluetooth",
+    )
+    with patch(
+        "custom_components.govee_ble_air_purifier.async_close_stale_connections",
+        side_effect=resistant_cleanup,
+    ):
+        started = time.monotonic()
+        await _async_cleanup_address(
+            address,
+            reason="entry_removed",
+            timeout=0.01,
+            cancellation_timeout=0.01,
+        )
+        assert time.monotonic() - started < 0.1
+
+    await cancellation_seen.wait()
+    assert ADDRESS_OWNERSHIP.is_owned(address)
+    assert ADDRESS_OWNERSHIP.claim(address) is None
+
+    release.set()
+    for _ in range(100):
+        if not ADDRESS_OWNERSHIP.is_owned(address):
+            break
+        await asyncio.sleep(0)
+
+    assert not ADDRESS_OWNERSHIP.is_owned(address)
+    await asyncio.sleep(0)
+    assert "late standalone cleanup failure" in caplog.text
+    replacement_token = ADDRESS_OWNERSHIP.claim(address)
+    assert replacement_token is not None
+    ADDRESS_OWNERSHIP.request_release(replacement_token)
+    ADDRESS_OWNERSHIP.finish_cleanup(replacement_token)

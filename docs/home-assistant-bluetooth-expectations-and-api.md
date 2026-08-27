@@ -451,6 +451,16 @@ Disconnect is cleanup rather than a reason to block recovery indefinitely. Use a
 short, best-effort deadline, clear ownership before awaiting the backend, and
 continue the state machine even when the backend does not acknowledge cleanup.
 
+Apply the same supervision to the connector call itself. An integration-owned
+connection deadline should be followed only by bounded diagnostic and
+cancellation-observation tails; directly awaiting a cancelled connector can
+otherwise make the nominal deadline ineffective when a backend suppresses or
+delays `CancelledError`. Retain an unresponsive connector task and its partial
+client/address ownership until it actually terminates. During that quarantine,
+do not start a replacement connector for the peripheral. Observe every late
+exception, and disconnect plus address-clean any client returned after its owner
+has timed out or been cancelled rather than adopting it into a newer generation.
+
 ## 9. Recommended connection state machine
 
 ```text
@@ -510,6 +520,17 @@ A robust policy should:
 - use capped exponential backoff with jitter; and
 - retain a short failure history so the final setup error describes more than
   the last cancellation.
+
+If cancellation does not complete within its bounded observation tail, cleanup
+that could race the still-running connector must be deferred and new connection
+slots must remain blocked. Advertisement wakeups may continue to drive bounded
+outer recovery cycles, but they must not create overlap. Once the retained task
+finishes, its result is observed, any late client is cleaned with bounded
+best-effort operations, and normal route re-resolution may resume.
+
+Continued advertising with unusable GATT is a distinct recoverable state from a
+missing peripheral. Advertisement presence and RSSI show that a broadcast was
+received; neither proves bidirectional connection-channel health.
 
 Do not equate `in_progress=1` in reachability diagnostics with slot exhaustion.
 It may represent the integration's own connection attempt. Likewise, a fresh
@@ -654,6 +675,14 @@ Store the coordinator or client in `ConfigEntry.runtime_data`. On unload:
 Cleanup must be idempotent because setup failure, reload, removal, and Home
 Assistant shutdown can reach it through different paths.
 
+An unload deadline cannot force a non-cooperative Bluetooth backend coroutine to
+terminate. In that exceptional case, unload should return after bounded
+cancellation observation while a process-level, address-scoped supervisor keeps
+the backend task and ownership token. It must observe the eventual result, clean
+any late client, and prevent a reloaded coordinator from starting another owner
+for that address until all retained connector, disconnect, and address-cleanup
+work is genuinely quiescent.
+
 ## 15. Command recovery
 
 Control commands need bounded end-to-end deadlines. A poor signal must not
@@ -747,7 +776,9 @@ Unit tests should cover at least:
 - later background recovery restoring that peripheral without a reload;
 - explicit Add Device validation retaining its bounded readiness wait;
 - `ConfigEntryNotReady` for failure to establish the recovery runtime; and
-- unload leaving no client, callback, or task behind.
+- unload releasing normal clients, callbacks, and tasks, while a deliberately
+  cancellation-resistant backend is retained by address quarantine until it
+  actually terminates.
 
 CI should run the Python test suite, Ruff or equivalent linting, JSON validation,
 Hassfest, and HACS validation for a custom integration.
@@ -873,10 +904,38 @@ The Govee purifier integration applies the general model as follows:
   45-second shared deadline. This lets weak links retry immediately without a
   complete address cleanup, advertisement wait, and outer backoff between every
   low-level failure.
+- The 45-second connector deadline is enforced outside the connector library.
+  Timeout diagnostics, cancellation observation, partial-client disconnect, and
+  address cleanup each have separate bounded tails. If connector cancellation
+  remains pending, the task and partial ownership are retained in quarantine;
+  no later advertisement wake or recovery cycle may start another connector or
+  client for that purifier until late cleanup completes.
+- Connector ownership and quarantine are process-level and keyed by normalized
+  purifier address, not by one `GattTransport` instance. An explicit ownership
+  token guards every transition, retained backend task, and late cleanup, so a
+  reload cannot overlap the old connector and a stale callback cannot clean a
+  newer healthy owner.
+- Every late connector exception is consumed. A connector that returns a client
+  after timeout or owner cancellation is never promoted to a current generation;
+  the client is disconnected with bounded best effort and address cleanup runs
+  before quarantine is released.
+- Address-level close and verification calls use the same hard outer deadlines,
+  bounded cancellation observation, and retained-task supervision. If either
+  call suppresses cancellation, shutdown and setup validation remain bounded but
+  address quarantine stays active; cleanup is not reported as synchronously
+  complete and replacement ownership remains blocked until the call ends.
+- Top-level defensive cleanup before config-entry setup and after entry removal
+  also claims the process-wide address supervisor before calling the backend.
+  It defers when a runtime, validator, connector, or retained cleanup already
+  owns the address. Its backend task has a hard deadline and bounded
+  cancellation-observation tail; a cancellation-resistant tail remains observed
+  in quarantine and blocks later claims until actual completion.
 - Notification subscription has a 15-second deadline, application writes have a
   10-second deadline, and disconnect cleanup has a five-second deadline. A
   timed-out backend task is cancelled and observed until it finishes.
-- A partially connecting client is explicitly disconnected on timeout.
+- A partially connecting client is explicitly disconnected on timeout once its
+  connector is quiescent; cleanup is deferred rather than raced when connector
+  cancellation is still pending.
 - Local BlueZ connections for the purifier address are closed and verified
   before a new outer cycle, after the connector cycle ultimately fails, during
   shutdown, and on removal.
@@ -898,6 +957,10 @@ The Govee purifier integration applies the general model as follows:
   received connectable advertisement or queued command normally wakes an
   existing wait; advertisement-triggered recovery retains a one-second settling
   cooldown.
+- An advertising-present but GATT-unusable purifier continues through repeated
+  bounded recovery/backoff cycles. Advertising and RSSI permit another attempt
+  only after connector quarantine is quiescent; they never prove GATT
+  reachability or authorize overlapping connection slots.
 - One per-client recovery circuit covers both H7124 and H7129 without merging
   their model-specific stages. It opens only when three unstable cycle failures
   and two advertisement-triggered wakes occur inside a rolling two-minute
@@ -978,6 +1041,9 @@ The Govee purifier integration applies the general model as follows:
   reconnect, and fan controls correlate observed `3a 05` command echoes and
   `ee 05` physical updates with their role, decoded mode, connection generation,
   transaction phase, and timing.
+  Connector diagnostics additionally report pending/quarantined work,
+  cancellation-requested and elapsed state, and the outcome and elapsed cleanup
+  of a late result without exposing application data or session material.
   Startup fan diagnostics additionally retain the last mode code, manual-level
   and raw selector-01 values, Auto parameter, pair-assembly status, resolution
   reason, and connection generation without exposing H7129 session secrets.

@@ -25,6 +25,7 @@ from .errors import (
     exception_chain_detail,
     exception_detail,
 )
+from .ownership import ADDRESS_OWNERSHIP, AddressOwnershipToken
 from .settings import BluetoothRuntimeSettings
 
 _LOGGER = logging.getLogger(__package__)
@@ -91,6 +92,14 @@ class GattTransport:
         self._last_gatt_operation_timed_out = False
         self._last_gatt_operation_error: str | None = None
         self._gatt_operation_timeouts = 0
+        self._connector_task: asyncio.Task[BleakClientWithServiceCache] | None = None
+        self._connector_cleanup_task: asyncio.Task[None] | None = None
+        self._connector_started_at: float | None = None
+        self._connector_detached = False
+        self._ownership_token: AddressOwnershipToken | None = None
+        self._last_connector_late_state: str | None = None
+        self._last_connector_late_error: str | None = None
+        self._last_connector_late_cleanup_elapsed: float | None = None
 
     @property
     def generation(self) -> int:
@@ -104,6 +113,10 @@ class GattTransport:
 
     def diagnostic_snapshot(self) -> dict[str, Any]:
         """Return counters and current transport state without frame contents."""
+        ownership = ADDRESS_OWNERSHIP.snapshot(
+            token=self._ownership_token,
+            address=(self._last_device.address if self._last_device else None),
+        )
         return {
             "generation": self._generation,
             "is_connected": self.is_connected,
@@ -142,7 +155,177 @@ class GattTransport:
             "last_gatt_operation_error": self._last_gatt_operation_error,
             "gatt_operation_timeouts": self._gatt_operation_timeouts,
             "pending_gatt_operation_tasks": len(self._gatt_operation_tasks),
+            "connector_pending": self._connector_work_pending(),
+            "connector_cancellation_requested": (
+                bool(ownership and ownership["cancellation_requested"])
+            ),
+            "connector_pending_elapsed_seconds": (
+                round(self._elapsed(self._connector_started_at), 3)
+                if self._connector_work_pending()
+                else None
+            ),
+            "last_connector_late_state": self._last_connector_late_state,
+            "last_connector_late_error": self._last_connector_late_error,
+            "last_connector_late_cleanup_elapsed_seconds": (
+                self._last_connector_late_cleanup_elapsed
+            ),
+            "address_ownership": ownership,
         }
+
+    def _connector_work_pending(self) -> bool:
+        """Return whether old connector ownership is still quarantined."""
+        connector = self._connector_task
+        cleanup = self._connector_cleanup_task
+        return bool(
+            (
+                connector is not None
+                and (not connector.done() or self._connector_detached)
+            )
+            or (cleanup is not None and not cleanup.done())
+        )
+
+    def _observe_connector_cleanup_task(self, task: asyncio.Task[None]) -> None:
+        """Observe late cleanup and release quarantine only after it finishes."""
+        if self._connector_cleanup_task is task:
+            self._connector_cleanup_task = None
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception as err:  # noqa: BLE001
+            self._last_connector_late_error = exception_detail(err)
+            _LOGGER.debug(
+                "Late connector cleanup failed for %s: %s",
+                self.name,
+                self._last_connector_late_error,
+                exc_info=True,
+            )
+
+    def _observe_connector_task(
+        self, task: asyncio.Task[BleakClientWithServiceCache]
+    ) -> None:
+        """Consume every connector outcome and clean a detached late success."""
+        if not self._connector_detached or self._connector_task is not task:
+            if not task.cancelled():
+                with suppress(Exception):
+                    task.exception()
+            return
+
+        cleanup_task = asyncio.create_task(
+            self._async_cleanup_late_connector(task),
+            name=f"govee-connect-late-cleanup-{self.name}",
+        )
+        self._connector_cleanup_task = cleanup_task
+        token = self._ownership_token
+        if token is not None:
+            ADDRESS_OWNERSHIP.mark_late_cleanup(token)
+            ADDRESS_OWNERSHIP.track_task(token, cleanup_task)
+        cleanup_task.add_done_callback(self._observe_connector_cleanup_task)
+
+    async def _async_cleanup_late_connector(
+        self, task: asyncio.Task[BleakClientWithServiceCache]
+    ) -> None:
+        """Dispose of a connector outcome that arrived after its owner returned."""
+        started = time.monotonic()
+        client = self._connecting_client
+        token = self._ownership_token
+        try:
+            if not ADDRESS_OWNERSHIP.is_current(token):
+                return
+            if task.cancelled():
+                self._last_connector_late_state = "cancelled"
+            else:
+                try:
+                    client = task.result()
+                except Exception as err:  # noqa: BLE001
+                    self._last_connector_late_state = "failed"
+                    self._last_connector_late_error = exception_detail(err)
+                    client = self._connecting_client
+                else:
+                    self._last_connector_late_state = "returned_client"
+
+            if self._connector_task is task:
+                self._connector_task = None
+            self._connector_detached = False
+
+            if client is not None:
+                self._connecting_client = client
+                try:
+                    await self._async_gatt_operation(
+                        "late_connector_disconnect",
+                        self.settings.connection.abort_timeout,
+                        client.disconnect,
+                    )
+                except Exception as err:  # noqa: BLE001
+                    self._last_connector_late_error = exception_detail(err)
+
+            await self.async_cleanup_stale_connection(
+                reason="late_connector", _release_ownership=False
+            )
+        finally:
+            self._last_connector_late_cleanup_elapsed = round(
+                max(0.0, time.monotonic() - started), 3
+            )
+            _LOGGER.debug(
+                "Late connector outcome cleaned for %s: state=%s elapsed=%.3fs "
+                "error=%s",
+                self.name,
+                self._last_connector_late_state,
+                self._last_connector_late_cleanup_elapsed,
+                self._last_connector_late_error,
+            )
+            if token is not None:
+                ADDRESS_OWNERSHIP.request_release(token)
+                ADDRESS_OWNERSHIP.finish_cleanup(token)
+            if self._ownership_token is token:
+                self._ownership_token = None
+
+    def _release_connector_task(
+        self, task: asyncio.Task[BleakClientWithServiceCache]
+    ) -> None:
+        """Release connector ownership after a synchronously observed outcome."""
+        if self._connector_task is task:
+            self._connector_task = None
+        self._connector_detached = False
+
+    async def _async_cancel_connector(
+        self, task: asyncio.Task[BleakClientWithServiceCache]
+    ) -> bool:
+        """Request connector cancellation and observe it for a bounded tail."""
+        if task.done():
+            return True
+        self._connector_detached = True
+        token = self._ownership_token
+        if token is not None:
+            ADDRESS_OWNERSHIP.mark_cancellation_requested(token)
+        task.cancel()
+        done, _ = await asyncio.wait(
+            (task,),
+            timeout=self.settings.gatt_operations.operation_cancel_timeout,
+        )
+        if done:
+            # The done callback owns cleanup after the cancellation transition.
+            await asyncio.sleep(0)
+            cleanup_task = self._connector_cleanup_task
+            if cleanup_task is not None and not cleanup_task.done():
+                await asyncio.wait(
+                    (cleanup_task,),
+                    timeout=(
+                        self.settings.connection.abort_timeout
+                        + self.settings.cleanup.stale_connection_timeout
+                        + 2
+                        * self.settings.gatt_operations.operation_cancel_timeout
+                    ),
+                )
+            return False
+        _LOGGER.debug(
+            "Bluetooth connector remains pending for %s after cancellation: "
+            "generation=%d elapsed=%.3fs",
+            self.name,
+            self._generation,
+            self._elapsed(self._connector_started_at),
+        )
+        return False
 
     def _observe_gatt_operation_task(self, task: asyncio.Task[Any]) -> None:
         """Retain and observe a backend task until cancellation really finishes."""
@@ -151,6 +334,14 @@ class GattTransport:
             return
         with suppress(Exception):
             task.exception()
+
+    def _track_owned_task(self, task: asyncio.Task[Any]) -> None:
+        """Retain backend work in both transport and address ownership scopes."""
+        self._gatt_operation_tasks.add(task)
+        task.add_done_callback(self._observe_gatt_operation_task)
+        token = self._ownership_token
+        if token is not None:
+            ADDRESS_OWNERSHIP.track_task(token, task)
 
     async def _async_gatt_operation(
         self,
@@ -166,8 +357,7 @@ class GattTransport:
         self._last_gatt_operation_timed_out = False
         self._last_gatt_operation_error = None
         task = asyncio.create_task(action(), name=f"govee-gatt-{operation}")
-        self._gatt_operation_tasks.add(task)
-        task.add_done_callback(self._observe_gatt_operation_task)
+        self._track_owned_task(task)
         try:
             done, _ = await asyncio.wait((task,), timeout=timeout)
             if not done:
@@ -283,10 +473,31 @@ class GattTransport:
             except Exception as err:  # noqa: BLE001
                 diagnostics["service_error"] = exception_detail(err)
 
+        diagnostic_task = asyncio.create_task(
+            get_connected_devices(device),
+            name=f"govee-connect-diagnostics-{device.address}",
+        )
+        self._track_owned_task(diagnostic_task)
         try:
-            async with asyncio.timeout(self.settings.connection.diagnostic_timeout):
-                connected_devices = await get_connected_devices(device)
-            diagnostics["bluez_connection_count"] = len(connected_devices)
+            done, _ = await asyncio.wait(
+                (diagnostic_task,),
+                timeout=self.settings.connection.diagnostic_timeout,
+            )
+            if done:
+                diagnostics["bluez_connection_count"] = len(
+                    diagnostic_task.result()
+                )
+            else:
+                diagnostic_task.cancel()
+                await asyncio.wait(
+                    (diagnostic_task,),
+                    timeout=(
+                        self.settings.gatt_operations.operation_cancel_timeout
+                    ),
+                )
+                diagnostics["bluez_connection_error"] = (
+                    "TimeoutError: connection diagnostics deadline exceeded"
+                )
         except Exception as err:  # noqa: BLE001
             diagnostics["bluez_connection_error"] = exception_detail(err)
 
@@ -309,8 +520,11 @@ class GattTransport:
             client.is_connected,
         )
         try:
-            async with asyncio.timeout(self.settings.connection.abort_timeout):
-                await client.disconnect()
+            await self._async_gatt_operation(
+                "abort_connecting_client",
+                self.settings.connection.abort_timeout,
+                client.disconnect,
+            )
         except Exception as err:
             _LOGGER.debug(
                 "Incomplete Bluetooth connection cleanup failed for %s at %s: %s",
@@ -322,8 +536,67 @@ class GattTransport:
         finally:
             self._set_stage("connection_aborted")
 
-    async def async_cleanup_stale_connection(self, *, reason: str) -> bool:
+    async def _async_cleanup_backend_operation(
+        self,
+        operation: str,
+        timeout: float,
+        action: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        """Run address cleanup work with a hard deadline and retained tail."""
+        task = asyncio.create_task(action(), name=f"govee-cleanup-{operation}")
+        self._track_owned_task(task)
+        try:
+            done, _ = await asyncio.wait((task,), timeout=timeout)
+            if done:
+                return task.result()
+            task.cancel()
+            await asyncio.wait(
+                (task,),
+                timeout=self.settings.gatt_operations.operation_cancel_timeout,
+            )
+            raise TimeoutError(f"{operation} cleanup deadline exceeded")
+        except asyncio.CancelledError:
+            if not task.done():
+                task.cancel()
+                await asyncio.wait(
+                    (task,),
+                    timeout=self.settings.gatt_operations.operation_cancel_timeout,
+                )
+            raise
+
+    def _release_address_ownership(self, token: AddressOwnershipToken) -> None:
+        """Request release; resistant tracked tasks keep quarantine alive."""
+        ADDRESS_OWNERSHIP.request_release(token)
+        ADDRESS_OWNERSHIP.finish_cleanup(token)
+        if self._ownership_token is token:
+            self._ownership_token = None
+
+    async def async_cleanup_stale_connection(
+        self, *, reason: str, _release_ownership: bool = True
+    ) -> bool:
         """Close and verify local BlueZ state without touching a healthy client."""
+        cleanup_task = self._connector_cleanup_task
+        if (
+            self._connector_work_pending()
+            and asyncio.current_task() is not cleanup_task
+        ):
+            self._last_address_cleanup_reason = reason
+            self._last_address_cleanup_error = "connector quarantine is still active"
+            self._last_address_cleanup_remaining = None
+            _LOGGER.debug(
+                "Deferring stale Bluetooth cleanup for %s: reason=%s "
+                "connector_pending=True cancellation_requested=%s elapsed=%.3fs",
+                self.name,
+                reason,
+                bool(
+                    (ownership := ADDRESS_OWNERSHIP.snapshot(
+                        token=self._ownership_token
+                    ))
+                    and ownership["cancellation_requested"]
+                ),
+                self._elapsed(self._connector_started_at),
+            )
+            return False
         if self.is_connected:
             self._last_address_cleanup_reason = reason
             self._last_address_cleanup_error = "owned client is still connected"
@@ -341,33 +614,54 @@ class GattTransport:
         if address is None:
             return True
 
+        token = self._ownership_token
+        if not ADDRESS_OWNERSHIP.is_current(token):
+            if ADDRESS_OWNERSHIP.is_owned(address):
+                self._last_address_cleanup_reason = reason
+                self._last_address_cleanup_error = (
+                    "another transport owns address quarantine"
+                )
+                return False
+            token = ADDRESS_OWNERSHIP.claim(address)
+            if token is None:
+                return False
+            self._ownership_token = token
+
         self._address_cleanup_attempts += 1
         self._last_address_cleanup_reason = reason
         self._last_address_cleanup_error = None
         self._last_address_cleanup_remaining = None
         started = time.monotonic()
         try:
-            async with asyncio.timeout(self.settings.cleanup.stale_connection_timeout):
-                await async_close_stale_connections(address, reason=reason)
-                if device is not None:
-                    deadline = (
-                        time.monotonic()
-                        + self.settings.cleanup.stale_connection_timeout
+            deadline = time.monotonic() + self.settings.cleanup.stale_connection_timeout
+            await self._async_cleanup_backend_operation(
+                "close_stale_connections",
+                max(0.0, deadline - time.monotonic()),
+                lambda: async_close_stale_connections(address, reason=reason),
+            )
+            if device is not None:
+                while True:
+                    remaining_time = max(0.0, deadline - time.monotonic())
+                    connected_devices = await self._async_cleanup_backend_operation(
+                        "get_connected_devices",
+                        remaining_time,
+                        lambda: get_connected_devices(device),
                     )
-                    while True:
-                        connected_devices = await get_connected_devices(device)
-                        remaining = len(connected_devices)
-                        self._last_address_cleanup_remaining = remaining
-                        if remaining == 0:
-                            break
-                        if time.monotonic() >= deadline:
-                            raise BluetoothUnavailableError(
-                                f"BlueZ still reports {remaining} connection(s) "
-                                f"for {address}"
-                            )
-                        await asyncio.sleep(
-                            self.settings.cleanup.stale_connection_check_interval
+                    remaining = len(connected_devices)
+                    self._last_address_cleanup_remaining = remaining
+                    if remaining == 0:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise BluetoothUnavailableError(
+                            f"BlueZ still reports {remaining} connection(s) "
+                            f"for {address}"
                         )
+                    await asyncio.sleep(
+                        min(
+                            self.settings.cleanup.stale_connection_check_interval,
+                            max(0.0, deadline - time.monotonic()),
+                        )
+                    )
         except Exception as err:
             self._address_cleanup_failures += 1
             self._last_address_cleanup_error = exception_detail(err)
@@ -386,6 +680,9 @@ class GattTransport:
                 exc_info=True,
             )
             return False
+        finally:
+            if _release_ownership and token is not None:
+                self._release_address_ownership(token)
 
         self._address_cleanup_successes += 1
         self._last_address_cleanup_elapsed = round(
@@ -408,10 +705,42 @@ class GattTransport:
 
     async def async_connect(self, device: BLEDevice) -> int:
         """Create and connect a fresh Bleak client."""
+        if self._connector_work_pending():
+            ownership = ADDRESS_OWNERSHIP.snapshot(token=self._ownership_token)
+            raise BluetoothUnavailableError(
+                f"Refusing to connect to {self.name} while an earlier connector "
+                "is quarantined; cancellation_requested="
+                f"{bool(ownership and ownership['cancellation_requested'])}; "
+                f"elapsed={self._elapsed(self._connector_started_at):.3f}s"
+            )
         await self.async_disconnect()
+        previous_token = self._ownership_token
+        if ADDRESS_OWNERSHIP.is_current(previous_token):
+            await self.async_cleanup_stale_connection(reason="before_reconnect")
+        if ADDRESS_OWNERSHIP.is_owned(device.address):
+            ownership = ADDRESS_OWNERSHIP.snapshot(address=device.address)
+            raise BluetoothUnavailableError(
+                f"Refusing to connect to {self.name} while address-scoped "
+                f"Bluetooth ownership remains active; ownership={ownership}"
+            )
+        token = ADDRESS_OWNERSHIP.claim(device.address)
+        if token is None:
+            raise BluetoothUnavailableError(
+                f"Refusing to connect to {self.name} while address-scoped "
+                "Bluetooth ownership remains active"
+            )
+        self._ownership_token = token
         self._last_device = device
-        await self._async_abort_connecting_client()
-        if not await self.async_cleanup_stale_connection(reason="before_connection"):
+        try:
+            await self._async_abort_connecting_client()
+            cleanup_succeeded = await self.async_cleanup_stale_connection(
+                reason="before_connection", _release_ownership=False
+            )
+        except BaseException:
+            self._release_address_ownership(token)
+            raise
+        if not cleanup_succeeded:
+            self._release_address_ownership(token)
             raise BluetoothUnavailableError(
                 f"Refusing to connect to {self.name} at {device.address} while "
                 "a stale local Bluetooth connection may remain; "
@@ -460,6 +789,13 @@ class GattTransport:
                 ),
                 name=f"govee-connect-{device.address}",
             )
+            self._connector_task = connection_task
+            self._connector_started_at = time.monotonic()
+            self._connector_detached = False
+            self._last_connector_late_state = None
+            self._last_connector_late_error = None
+            ADDRESS_OWNERSHIP.track_task(token, connection_task)
+            connection_task.add_done_callback(self._observe_connector_task)
             try:
                 done, _ = await asyncio.wait(
                     (connection_task,),
@@ -474,10 +810,9 @@ class GattTransport:
                     )
                 return connection_task.result()
             finally:
-                if not connection_task.done():
-                    connection_task.cancel()
-                with suppress(asyncio.CancelledError, Exception):
-                    await connection_task
+                acknowledged = await self._async_cancel_connector(connection_task)
+                if acknowledged:
+                    self._release_connector_task(connection_task)
 
         try:
             client = await establish_with_diagnostics()
@@ -489,13 +824,26 @@ class GattTransport:
                 f"pre_return_disconnects={self._pre_return_disconnects}; "
                 "cause=TimeoutError: connection attempt deadline exceeded"
             )
-            await self._async_abort_connecting_client()
-            cleanup_ok = await self.async_cleanup_stale_connection(
-                reason="connection_timeout"
-            )
+            quarantined = self._connector_work_pending()
+            late_cleanup_completed = not ADDRESS_OWNERSHIP.is_current(token)
+            if quarantined:
+                cleanup_ok = False
+                self._last_address_cleanup_error = (
+                    "connector quarantine is still active"
+                )
+                self._last_address_cleanup_remaining = None
+                self._last_address_cleanup_elapsed = None
+            elif late_cleanup_completed:
+                cleanup_ok = self._last_address_cleanup_error is None
+            else:
+                await self._async_abort_connecting_client()
+                cleanup_ok = await self.async_cleanup_stale_connection(
+                    reason="connection_timeout"
+                )
             timeout_diagnostics = self._last_connection_timeout_diagnostics or {}
             timeout_diagnostics["cleanup"] = {
                 "success": cleanup_ok,
+                "deferred_for_connector": quarantined,
                 "remaining_connections": self._last_address_cleanup_remaining,
                 "elapsed_seconds": self._last_address_cleanup_elapsed,
                 "error": self._last_address_cleanup_error,
@@ -523,8 +871,11 @@ class GattTransport:
                 f"generation={generation}; cause={detail}"
             ) from err
         except asyncio.CancelledError:
-            await self._async_abort_connecting_client()
-            await self.async_cleanup_stale_connection(reason="connection_cancelled")
+            if not self._connector_work_pending():
+                await self._async_abort_connecting_client()
+                await self.async_cleanup_stale_connection(
+                    reason="connection_cancelled"
+                )
             raise
         except Exception as err:
             detail = self._failure_summary(err)

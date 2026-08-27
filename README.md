@@ -241,6 +241,17 @@ the selected route before full cleanup, fresh-advertisement admission, and outer
 backoff. Individual validation cycles remain debug-only while that window is
 active; only the final failure is returned to the setup flow.
 
+The 45-second connector limit is an integration-owned deadline, not merely the
+connector library's internal timeout. After it expires, diagnostics and
+cancellation are observed only for their separate short bounded tails. If the
+backend delays cancellation, that old connector is quarantined: advertising can
+continue to drive bounded recovery cycles, but no replacement connector or
+client is started for the purifier until the old task has actually finished.
+Every late exception is consumed, and a client returned late is disconnected and
+address-cleaned rather than adopted by a newer connection generation. Quarantine
+is process-wide for the normalized Bluetooth address, so a reload or replacement
+coordinator cannot bypass an older transport that still owns backend work.
+
 Previously configured entries do not wait for a first connection while Home
 Assistant is starting. Their entities load immediately as unavailable and the
 same connection owner recovers in the background. This prevents an unplugged or
@@ -364,7 +375,9 @@ Fresh advertising proves only that attempting a connection is reasonable. It
 does not prove service discovery will complete. Check the logged route, RSSI,
 advertisement age, proxy slots, connection stage, and stale-connection cleanup
 result. A purifier at roughly -75 dBm or weaker may advertise successfully while
-GATT remains unreliable.
+GATT remains unreliable. Advertising-present/GATT-unusable is therefore distinct
+from a missing or powered-off purifier; RSSI and continued advertisements do not
+prove that a connection can be established.
 
 Add Device validation retries for up to five minutes. Intermediate connection
 failures are retained in debug diagnostics instead of appearing as coordinator
@@ -449,7 +462,14 @@ During an integration reload, Home Assistant shutdown, or update, the owner task
 is cancelled, outstanding commands fail cleanly, the active client is
 disconnected, H7129 session state is erased, and stale address-level cleanup is
 attempted. After a host crash or power loss, the next setup performs defensive
-cleanup before reconnecting.
+cleanup before reconnecting. If a Bluetooth backend ignores cancellation,
+unload remains bounded: the process-level address supervisor retains and
+observes that task, blocks a replacement owner, and performs late client cleanup
+when it finally ends. Cleanup is therefore deferred rather than synchronously
+complete in that exceptional case. Defensive cleanup before entry setup and
+after entry removal uses the same address ownership and hard-deadline
+supervision; it defers without touching Bluetooth when a runtime, validator, or
+retained cleanup task already owns that purifier address.
 
 ## Developer guide
 

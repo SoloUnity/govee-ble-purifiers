@@ -23,6 +23,9 @@ from custom_components.govee_ble_air_purifier.bluetooth import (
 from custom_components.govee_ble_air_purifier.bluetooth import (
     transport as transport_module,
 )
+from custom_components.govee_ble_air_purifier.bluetooth.ownership import (
+    ADDRESS_OWNERSHIP,
+)
 from custom_components.govee_ble_air_purifier.bluetooth_profile import (
     bluetooth_settings_from_profile,
 )
@@ -43,6 +46,25 @@ def _environment(hass: object, address: str) -> HomeAssistantBluetoothEnvironmen
     )
 
 
+async def _wait_for_connector_quiescence(transport: GattTransport) -> None:
+    for _ in range(100):
+        diagnostics = transport.diagnostic_snapshot()
+        if not diagnostics["connector_pending"] and not diagnostics[
+            "address_ownership"
+        ]:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("connector ownership did not become quiescent")
+
+
+async def _wait_for_address_quiescence(address: str) -> None:
+    for _ in range(100):
+        if not ADDRESS_OWNERSHIP.is_owned(address):
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("address ownership did not become quiescent")
+
+
 def _set_transport_timings(
     transport: GattTransport,
     **changes: float | int,
@@ -53,12 +75,18 @@ def _set_transport_timings(
     cleanup_changes: dict[str, float | int] = {}
     field_map = {
         "connection_attempt_timeout": (connection_changes, "attempt_timeout"),
+        "connection_abort_timeout": (connection_changes, "abort_timeout"),
+        "connection_diagnostic_timeout": (connection_changes, "diagnostic_timeout"),
         "notification_subscribe_timeout": (
             operation_changes,
             "notification_subscribe_timeout",
         ),
         "gatt_write_timeout": (operation_changes, "write_timeout"),
         "gatt_disconnect_timeout": (operation_changes, "disconnect_timeout"),
+        "gatt_operation_cancel_timeout": (
+            operation_changes,
+            "operation_cancel_timeout",
+        ),
         "stale_connection_cleanup_timeout": (
             cleanup_changes,
             "stale_connection_timeout",
@@ -403,6 +431,7 @@ async def test_connection_deadline_cleans_partial_client_and_records_attempts(
         "adapter": None,
         "cleanup": {
             "success": True,
+            "deferred_for_connector": False,
             "remaining_connections": 0,
             "elapsed_seconds": pytest.approx(0, abs=0.01),
             "error": None,
@@ -470,6 +499,469 @@ async def test_connection_deadline_inspects_live_partial_client_before_cleanup(
     assert diagnostics["cleanup"]["success"] is True
     assert diagnostics["cleanup"]["remaining_connections"] == 0
     assert "timeout_diagnostics=" in str(raised.value)
+
+
+class _CancellationSuppressingClient:
+    """Small connector client used to exercise late ownership cleanup."""
+
+    def __init__(self, *_: object, **__: object) -> None:
+        self.is_connected = True
+        self.services = SimpleNamespace(services={})
+        self.disconnect_calls = 0
+
+    async def disconnect(self) -> None:
+        self.disconnect_calls += 1
+        self.is_connected = False
+
+
+@pytest.mark.asyncio
+async def test_connector_deadline_quarantines_cancellation_suppressing_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hard deadline returns and no replacement starts before quiescence."""
+    started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release = asyncio.Event()
+    clients: list[_CancellationSuppressingClient] = []
+    establish_calls = 0
+
+    async def delayed_connection(
+        client_class: object, device: object, *_: object, **__: object
+    ) -> _CancellationSuppressingClient:
+        nonlocal establish_calls
+        establish_calls += 1
+        client = client_class(device)  # type: ignore[operator]
+        clients.append(client)
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release.wait()
+        return client
+
+    monkeypatch.setattr(
+        transport_module,
+        "BleakClientWithServiceCache",
+        _CancellationSuppressingClient,
+    )
+    monkeypatch.setattr(transport_module, "establish_connection", delayed_connection)
+    transport = _transport()
+    _set_transport_timings(
+        transport,
+        connection_attempt_timeout=0.01,
+        connection_diagnostic_timeout=0.01,
+        gatt_operation_cancel_timeout=0.01,
+        connection_abort_timeout=0.01,
+        stale_connection_cleanup_timeout=0.01,
+    )
+    device = SimpleNamespace(address="AA:BB:CC:DD:EE:FF", name="GVH7124TEST")
+
+    before = time.monotonic()
+    with pytest.raises(BluetoothUnavailableError, match="deadline exceeded"):
+        await transport.async_connect(device)  # type: ignore[arg-type]
+    elapsed = time.monotonic() - before
+
+    assert elapsed < 0.1
+    await asyncio.wait_for(started.wait(), 0.1)
+    await asyncio.wait_for(cancellation_seen.wait(), 0.1)
+    assert establish_calls == 1
+    diagnostics = transport.diagnostic_snapshot()
+    assert diagnostics["connector_pending"] is True
+    assert diagnostics["connector_cancellation_requested"] is True
+    assert diagnostics["last_connection_timeout_diagnostics"]["cleanup"] == {
+        "success": False,
+        "deferred_for_connector": True,
+        "remaining_connections": None,
+        "elapsed_seconds": None,
+        "error": "connector quarantine is still active",
+    }
+
+    with pytest.raises(BluetoothUnavailableError, match="quarantined"):
+        await transport.async_connect(device)  # type: ignore[arg-type]
+    assert establish_calls == 1
+
+    release.set()
+    await _wait_for_connector_quiescence(transport)
+    assert transport.diagnostic_snapshot()["connector_pending"] is False
+    assert clients[0].disconnect_calls == 1
+    assert transport.diagnostic_snapshot()["last_connector_late_state"] == (
+        "returned_client"
+    )
+
+
+@pytest.mark.asyncio
+async def test_late_connector_exception_is_observed_and_releases_quarantine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A detached connector failure is consumed and permits a later cycle."""
+    release = asyncio.Event()
+    calls = 0
+
+    async def delayed_failure(*_: object, **__: object) -> None:
+        nonlocal calls
+        calls += 1
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+        raise RuntimeError("late adapter failure")
+
+    monkeypatch.setattr(transport_module, "establish_connection", delayed_failure)
+    transport = _transport()
+    _set_transport_timings(
+        transport,
+        connection_attempt_timeout=0.01,
+        connection_diagnostic_timeout=0.01,
+        gatt_operation_cancel_timeout=0.01,
+        stale_connection_cleanup_timeout=0.01,
+    )
+    device = SimpleNamespace(address="AA:BB:CC:DD:EE:FF", name="GVH7124TEST")
+
+    with pytest.raises(BluetoothUnavailableError, match="deadline exceeded"):
+        await transport.async_connect(device)  # type: ignore[arg-type]
+    release.set()
+    await _wait_for_connector_quiescence(transport)
+
+    diagnostics = transport.diagnostic_snapshot()
+    assert diagnostics["connector_pending"] is False
+    assert diagnostics["last_connector_late_state"] == "failed"
+    assert diagnostics["last_connector_late_error"] == (
+        "RuntimeError: late adapter failure"
+    )
+    assert calls == 1
+
+    with pytest.raises(BluetoothUnavailableError, match="late adapter failure"):
+        await transport.async_connect(device)  # type: ignore[arg-type]
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_connect_owner_cancellation_is_bounded_while_connector_quarantined(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Owner cancellation does not await a connector that delays cancellation."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_connection(*_: object, **__: object) -> None:
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+
+    monkeypatch.setattr(transport_module, "establish_connection", delayed_connection)
+    transport = _transport()
+    _set_transport_timings(
+        transport,
+        gatt_operation_cancel_timeout=0.01,
+        stale_connection_cleanup_timeout=0.01,
+    )
+    device = SimpleNamespace(address="AA:BB:CC:DD:EE:FF", name="GVH7124TEST")
+    owner = asyncio.create_task(transport.async_connect(device))  # type: ignore[arg-type]
+    await asyncio.wait_for(started.wait(), 0.1)
+
+    owner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(owner, 0.1)
+    assert transport.diagnostic_snapshot()["connector_pending"] is True
+    assert not await transport.async_cleanup_stale_connection(reason="shutdown")
+
+    release.set()
+    await _wait_for_connector_quiescence(transport)
+    assert transport.diagnostic_snapshot()["connector_pending"] is False
+
+
+@pytest.mark.asyncio
+async def test_address_quarantine_survives_transport_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reloaded transport cannot overlap an old resistant connector."""
+    release = asyncio.Event()
+    calls = 0
+
+    async def connector(*_: object, **__: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+            return
+        raise RuntimeError("new cycle reached connector")
+
+    monkeypatch.setattr(transport_module, "establish_connection", connector)
+    old_transport = _transport()
+    new_transport = _transport()
+    for transport in (old_transport, new_transport):
+        _set_transport_timings(
+            transport,
+            connection_attempt_timeout=0.01,
+            connection_diagnostic_timeout=0.01,
+            gatt_operation_cancel_timeout=0.01,
+            stale_connection_cleanup_timeout=0.01,
+        )
+    device = SimpleNamespace(address="AA:BB:CC:DD:EE:01", name="GVH7124TEST")
+
+    with pytest.raises(BluetoothUnavailableError, match="deadline exceeded"):
+        await old_transport.async_connect(device)  # type: ignore[arg-type]
+    with pytest.raises(BluetoothUnavailableError, match="address-scoped"):
+        await new_transport.async_connect(device)  # type: ignore[arg-type]
+    assert calls == 1
+
+    release.set()
+    await _wait_for_connector_quiescence(old_transport)
+    with pytest.raises(BluetoothUnavailableError, match="new cycle reached"):
+        await new_transport.async_connect(device)  # type: ignore[arg-type]
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_stale_cleanup_token_cannot_disconnect_new_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale late-cleanup callback cannot mutate a replacement owner."""
+    address = "AA:BB:CC:DD:EE:02"
+    old_transport = _transport()
+    old_token = ADDRESS_OWNERSHIP.claim(address)
+    assert old_token is not None
+    old_transport._ownership_token = old_token
+    ADDRESS_OWNERSHIP.request_release(old_token)
+    ADDRESS_OWNERSHIP.finish_cleanup(old_token)
+    new_token = ADDRESS_OWNERSHIP.claim(address)
+    assert new_token is not None
+
+    class HealthyClient:
+        is_connected = True
+        disconnect_calls = 0
+
+        async def disconnect(self) -> None:
+            self.disconnect_calls += 1
+
+    stale_client = HealthyClient()
+
+    async def return_stale_client() -> HealthyClient:
+        return stale_client
+
+    task = asyncio.create_task(return_stale_client())
+    await task
+    await old_transport._async_cleanup_late_connector(task)  # type: ignore[arg-type]
+
+    assert stale_client.disconnect_calls == 0
+    assert ADDRESS_OWNERSHIP.is_current(new_token)
+    ADDRESS_OWNERSHIP.request_release(new_token)
+    ADDRESS_OWNERSHIP.finish_cleanup(new_token)
+
+
+@pytest.mark.asyncio
+async def test_repeated_owner_cancellation_preserves_late_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second cancellation cannot bypass the detached ownership transition."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    clients: list[_CancellationSuppressingClient] = []
+
+    async def connector(
+        client_class: object, device: object, *_: object, **__: object
+    ) -> _CancellationSuppressingClient:
+        client = client_class(device)  # type: ignore[operator]
+        clients.append(client)
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+        return client
+
+    monkeypatch.setattr(
+        transport_module,
+        "BleakClientWithServiceCache",
+        _CancellationSuppressingClient,
+    )
+    monkeypatch.setattr(transport_module, "establish_connection", connector)
+    transport = _transport()
+    _set_transport_timings(
+        transport,
+        gatt_operation_cancel_timeout=0.05,
+        connection_abort_timeout=0.01,
+        stale_connection_cleanup_timeout=0.01,
+    )
+    device = SimpleNamespace(address="AA:BB:CC:DD:EE:03", name="GVH7124TEST")
+    owner = asyncio.create_task(transport.async_connect(device))  # type: ignore[arg-type]
+    await started.wait()
+
+    owner.cancel()
+    await asyncio.sleep(0)
+    owner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(owner, 0.1)
+    assert transport.diagnostic_snapshot()["connector_pending"] is True
+
+    release.set()
+    await _wait_for_connector_quiescence(transport)
+    assert clients[0].disconnect_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_late_failure_directly_disconnects_tracked_partial_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late connector exception still directly closes its tracked client."""
+    release = asyncio.Event()
+    clients: list[_CancellationSuppressingClient] = []
+
+    async def connector(
+        client_class: object, device: object, *_: object, **__: object
+    ) -> None:
+        clients.append(client_class(device))  # type: ignore[operator]
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+        raise RuntimeError("late failure after connect")
+
+    monkeypatch.setattr(
+        transport_module,
+        "BleakClientWithServiceCache",
+        _CancellationSuppressingClient,
+    )
+    monkeypatch.setattr(transport_module, "establish_connection", connector)
+    transport = _transport()
+    _set_transport_timings(
+        transport,
+        connection_attempt_timeout=0.01,
+        connection_diagnostic_timeout=0.01,
+        gatt_operation_cancel_timeout=0.01,
+        connection_abort_timeout=0.01,
+        stale_connection_cleanup_timeout=0.01,
+    )
+    device = SimpleNamespace(address="AA:BB:CC:DD:EE:04", name="GVH7124TEST")
+
+    with pytest.raises(BluetoothUnavailableError, match="deadline exceeded"):
+        await transport.async_connect(device)  # type: ignore[arg-type]
+    release.set()
+    await _wait_for_connector_quiescence(transport)
+
+    assert clients[0].disconnect_calls == 1
+    assert transport.diagnostic_snapshot()["last_connector_late_state"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_resistant_late_disconnect_retains_address_quarantine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Late disconnect work must quiesce before another connector can start."""
+    connector_release = asyncio.Event()
+    disconnect_release = asyncio.Event()
+    disconnect_cancelled = asyncio.Event()
+    calls = 0
+
+    class ResistantDisconnectClient(_CancellationSuppressingClient):
+        async def disconnect(self) -> None:
+            self.disconnect_calls += 1
+            try:
+                await disconnect_release.wait()
+            except asyncio.CancelledError:
+                disconnect_cancelled.set()
+                await disconnect_release.wait()
+            self.is_connected = False
+
+    async def connector(
+        client_class: object, device: object, *_: object, **__: object
+    ) -> ResistantDisconnectClient:
+        nonlocal calls
+        calls += 1
+        client = client_class(device)  # type: ignore[operator]
+        try:
+            await connector_release.wait()
+        except asyncio.CancelledError:
+            await connector_release.wait()
+        return client
+
+    monkeypatch.setattr(
+        transport_module, "BleakClientWithServiceCache", ResistantDisconnectClient
+    )
+    monkeypatch.setattr(transport_module, "establish_connection", connector)
+    old_transport = _transport()
+    new_transport = _transport()
+    for transport in (old_transport, new_transport):
+        _set_transport_timings(
+            transport,
+            connection_attempt_timeout=0.01,
+            connection_diagnostic_timeout=0.01,
+            gatt_operation_cancel_timeout=0.01,
+            connection_abort_timeout=0.01,
+            stale_connection_cleanup_timeout=0.01,
+        )
+    device = SimpleNamespace(address="AA:BB:CC:DD:EE:05", name="GVH7124TEST")
+
+    with pytest.raises(BluetoothUnavailableError, match="deadline exceeded"):
+        await old_transport.async_connect(device)  # type: ignore[arg-type]
+    connector_release.set()
+    await asyncio.wait_for(disconnect_cancelled.wait(), 0.1)
+    with pytest.raises(BluetoothUnavailableError, match="address-scoped"):
+        await new_transport.async_connect(device)  # type: ignore[arg-type]
+    assert calls == 1
+
+    disconnect_release.set()
+    await _wait_for_connector_quiescence(old_transport)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resistant_operation", ["close", "inspect"])
+async def test_resistant_address_cleanup_is_bounded_and_quarantined(
+    monkeypatch: pytest.MonkeyPatch, resistant_operation: str
+) -> None:
+    """Cancellation-resistant address cleanup stays retained after return."""
+    release = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+
+    async def resistant() -> list[object] | None:
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release.wait()
+        return []
+
+    async def close_address(_: str) -> None:
+        if resistant_operation == "close":
+            await resistant()
+
+    async def inspect(_: object) -> list[object]:
+        if resistant_operation == "inspect":
+            result = await resistant()
+            return result or []
+        return []
+
+    monkeypatch.setattr(
+        cleanup_module, "close_stale_connections_by_address", close_address
+    )
+    monkeypatch.setattr(transport_module, "get_connected_devices", inspect)
+    transport = _transport()
+    _set_transport_timings(
+        transport,
+        stale_connection_cleanup_timeout=0.01,
+        gatt_operation_cancel_timeout=0.01,
+    )
+    address = f"AA:BB:CC:DD:EF:{'06' if resistant_operation == 'close' else '07'}"
+    transport._last_device = SimpleNamespace(address=address)
+
+    started = time.monotonic()
+    assert not await transport.async_cleanup_stale_connection(reason="shutdown")
+    assert time.monotonic() - started < 0.1
+    await cancellation_seen.wait()
+    assert ADDRESS_OWNERSHIP.is_owned(address)
+
+    replacement = _transport()
+    with pytest.raises(BluetoothUnavailableError, match="address-scoped"):
+        await replacement.async_connect(transport._last_device)  # type: ignore[arg-type]
+
+    release.set()
+    await _wait_for_address_quiescence(address)
 
 
 @pytest.mark.asyncio

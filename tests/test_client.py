@@ -13,7 +13,15 @@ import pytest
 from custom_components.govee_ble_air_purifier import client as client_module
 from custom_components.govee_ble_air_purifier.bluetooth import (
     BluetoothUnavailableError,
+    GattTransport,
     GattTransportError,
+)
+from custom_components.govee_ble_air_purifier.bluetooth import cleanup as cleanup_module
+from custom_components.govee_ble_air_purifier.bluetooth import (
+    transport as transport_module,
+)
+from custom_components.govee_ble_air_purifier.bluetooth.ownership import (
+    ADDRESS_OWNERSHIP,
 )
 from custom_components.govee_ble_air_purifier.bluetooth_profile import (
     bluetooth_settings_from_profile,
@@ -45,6 +53,7 @@ class FakeEnvironment:
     def __init__(self) -> None:
         self.recent_advertisement = False
         self.advertisement_event = asyncio.Event()
+        self.stop_calls = 0
 
     async def async_start(self) -> None:
         return
@@ -68,7 +77,7 @@ class FakeEnvironment:
         )
 
     async def async_stop(self) -> None:
-        return
+        self.stop_calls += 1
 
 
 class FakeTransport:
@@ -279,6 +288,139 @@ async def test_start_returns_while_initial_recovery_is_pending() -> None:
     assert not client._first_ready.done()
 
     await client.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_client_shutdown_is_bounded_by_retained_address_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Client shutdown returns while resistant cleanup remains quarantined."""
+    client = make_client()
+    settings = bluetooth_settings_from_profile(
+        DeviceProfile.for_model(Model.H7124)
+    )
+    settings = replace(
+        settings,
+        cleanup=replace(settings.cleanup, stale_connection_timeout=0.01),
+        gatt_operations=replace(
+            settings.gatt_operations, operation_cancel_timeout=0.01
+        ),
+    )
+    transport = GattTransport(name="Shutdown purifier", settings=settings)
+    address = "AA:BB:CC:DD:EF:08"
+    transport._last_device = SimpleNamespace(address=address)  # type: ignore[assignment]
+    client._transport = transport
+    release = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+
+    async def resistant_close(_: str) -> None:
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release.wait()
+
+    monkeypatch.setattr(
+        cleanup_module, "close_stale_connections_by_address", resistant_close
+    )
+
+    await asyncio.wait_for(client.async_shutdown(), timeout=0.1)
+    await cancellation_seen.wait()
+    assert ADDRESS_OWNERSHIP.is_owned(address)
+
+    release.set()
+    for _ in range(100):
+        if not ADDRESS_OWNERSHIP.is_owned(address):
+            break
+        await asyncio.sleep(0)
+    assert not ADDRESS_OWNERSHIP.is_owned(address)
+
+
+@pytest.mark.asyncio
+async def test_real_runner_shutdown_detaches_resistant_connector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real runner shutdown composes with detached address quarantine."""
+    client = make_client()
+    environment = client._environment
+    settings = bluetooth_settings_from_profile(
+        DeviceProfile.for_model(Model.H7124)
+    )
+    settings = replace(
+        settings,
+        connection=replace(
+            settings.connection,
+            abort_timeout=0.01,
+            diagnostic_timeout=0.01,
+        ),
+        cleanup=replace(settings.cleanup, stale_connection_timeout=0.01),
+        gatt_operations=replace(
+            settings.gatt_operations, operation_cancel_timeout=0.01
+        ),
+    )
+    transport = GattTransport(name="Runner purifier", settings=settings)
+    client._transport = transport
+    release = asyncio.Event()
+    connector_started = asyncio.Event()
+    clients: list[object] = []
+
+    class LateClient:
+        def __init__(self, *_: object, **__: object) -> None:
+            self.is_connected = True
+            self.services = SimpleNamespace(services={})
+            self.disconnect_calls = 0
+            clients.append(self)
+
+        async def disconnect(self) -> None:
+            self.disconnect_calls += 1
+            self.is_connected = False
+
+    async def resistant_connector(
+        client_class: object, device: object, *_: object, **__: object
+    ) -> LateClient:
+        connected_client = client_class(device)  # type: ignore[operator]
+        connector_started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+        return connected_client
+
+    async def close_address(_: str) -> None:
+        return
+
+    async def no_connected_devices(_: object) -> list[object]:
+        return []
+
+    monkeypatch.setattr(
+        transport_module, "BleakClientWithServiceCache", LateClient
+    )
+    monkeypatch.setattr(
+        transport_module, "establish_connection", resistant_connector
+    )
+    monkeypatch.setattr(
+        cleanup_module, "close_stale_connections_by_address", close_address
+    )
+    monkeypatch.setattr(
+        transport_module, "get_connected_devices", no_connected_devices
+    )
+
+    await client.async_start()
+    await asyncio.wait_for(connector_started.wait(), 0.1)
+    await asyncio.wait_for(client.async_shutdown(), 0.1)
+
+    assert environment.stop_calls == 1  # type: ignore[attr-defined]
+    assert ADDRESS_OWNERSHIP.is_owned(environment.address)
+
+    release.set()
+    for _ in range(100):
+        if not ADDRESS_OWNERSHIP.is_owned(environment.address):
+            break
+        await asyncio.sleep(0)
+
+    assert not ADDRESS_OWNERSHIP.is_owned(environment.address)
+    assert clients
+    assert clients[0].disconnect_calls == 1  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
