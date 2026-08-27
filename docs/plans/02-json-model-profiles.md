@@ -1,5 +1,8 @@
 # Phase 2 — Data-Driven Model Profiles
 
+**Status:** Implemented in the working tree; release status remains governed by
+the integration manifest and README release notes.
+
 ## Goal
 
 Move purifier-specific identity, Bluetooth, application-channel, protocol,

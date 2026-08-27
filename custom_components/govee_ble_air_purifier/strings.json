@@ -18,6 +18,7 @@
       "not_discovered": "Home Assistant cannot currently see this purifier from a connectable Bluetooth adapter or proxy."
     },
     "abort": {
+      "model_profile_invalid": "The bundled purifier model profiles are invalid. Reinstall or update the integration, restart Home Assistant, and try again.",
       "already_configured": "This purifier is already configured.",
       "devices_seen_without_supported_name": "Home Assistant received fresh Bluetooth advertisements, but none included or retained a supported Govee H7124 or H7129 purifier name. Move the purifier or Bluetooth proxy closer, close the Govee app, and try Add device again.",
       "no_devices_found": "No unconfigured Govee H7124 or H7129 air purifiers were seen during the Bluetooth scan. Make sure the purifier is powered on, in range, and disconnected from the Govee app."

@@ -34,7 +34,8 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the purifier fan entity."""
-    async_add_entities([GoveePurifierFan(entry)])
+    if entry.runtime_data.profile.capabilities.fan:
+        async_add_entities([GoveePurifierFan(entry)])
 
 
 class GoveePurifierFan(GoveePurifierEntity, FanEntity):

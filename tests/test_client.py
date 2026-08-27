@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -11,7 +12,6 @@ import pytest
 
 from custom_components.govee_ble_air_purifier import client as client_module
 from custom_components.govee_ble_air_purifier.bluetooth import (
-    CONNECTION_ATTEMPT_TIMEOUT,
     BluetoothUnavailableError,
     GattTransportError,
 )
@@ -117,14 +117,25 @@ class SilentChannel:
 
 def make_client(model: Model = Model.H7124) -> ReliablePurifierClient:
     profile = DeviceProfile.for_model(model)
+    environment = FakeEnvironment()
+    environment.profile = profile
+    transport = FakeTransport()
+    transport.profile = profile
     return ReliablePurifierClient(
-        environment=FakeEnvironment(),  # type: ignore[arg-type]
-        transport=FakeTransport(),  # type: ignore[arg-type]
+        environment=environment,  # type: ignore[arg-type]
+        transport=transport,  # type: ignore[arg-type]
         protocol=GoveePurifierProtocol(profile),
         profile=profile,
         state_callback=lambda _: None,
         availability_callback=lambda *_: None,
     )
+
+
+def _set_client_timings(
+    client: ReliablePurifierClient,
+    **changes: float | int,
+) -> None:
+    client._timings = replace(client._timings, **changes)
 
 
 def test_old_generation_callbacks_are_ignored() -> None:
@@ -141,20 +152,26 @@ def test_old_generation_callbacks_are_ignored() -> None:
 
 def test_explicit_validation_budget_is_five_minutes() -> None:
     """Explicit setup validation gets a bounded five-minute recovery window."""
-    maximum_first_backoff = client_module.BACKOFF_MIN * 1.2
+    timings = DeviceProfile.for_model(Model.H7124).timings
+    maximum_first_backoff = timings.backoff_initial * 1.2
     two_cycle_budget = (
-        2 * (client_module.FRESH_ADVERTISEMENT_TIMEOUT + CONNECTION_ATTEMPT_TIMEOUT)
+        2
+        * (
+            timings.fresh_advertisement_timeout
+            + timings.connection_attempt_timeout
+        )
         + maximum_first_backoff
     )
 
-    assert client_module.STARTUP_TIMEOUT >= two_cycle_budget
-    assert client_module.STARTUP_TIMEOUT == 300.0
+    assert timings.startup_timeout >= two_cycle_budget
+    assert timings.startup_timeout == 300.0
 
 
 def test_command_recovery_budget_handles_slow_encrypted_reconnect() -> None:
     """Controls remain pending through a poor-signal reconnect and negotiation."""
-    assert client_module.COMMAND_DEADLINE == 120.0
-    assert client_module.COMMAND_SEND_ATTEMPTS == 3
+    timings = DeviceProfile.for_model(Model.H7129).timings
+    assert timings.command_deadline == 120.0
+    assert timings.command_send_attempts == 3
 
 
 @pytest.mark.asyncio
@@ -180,8 +197,8 @@ async def test_startup_timeout_surfaces_one_final_diagnostic_without_callback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A bounded startup failure remains useful after cleanup completes."""
-    monkeypatch.setattr(client_module, "STARTUP_TIMEOUT", 0.01)
     client = make_client()
+    _set_client_timings(client, startup_timeout=0.01)
     updates: list[tuple[bool, Exception | None]] = []
     client._availability_callback = lambda available, error: updates.append(
         (available, error)
@@ -328,7 +345,9 @@ async def test_connection_loop_retries_after_link_failure() -> None:
 
     assert cycles == 2
     assert availability == [False]
-    client._async_backoff.assert_awaited_once_with(client_module.BACKOFF_MIN)
+    client._async_backoff.assert_awaited_once_with(
+        client._timings.backoff_initial
+    )
     assert client._transport.disconnects == 2  # type: ignore[attr-defined]
     assert len(client._recovery_failure_times) == 1
 
@@ -461,7 +480,7 @@ def test_recovery_circuit_expires_and_resets_after_stable_ready() -> None:
     )
     client._record_recovery_failure(
         client_module.ClientStatus.READY,
-        stable_for=client_module.BACKOFF_RESET_AFTER,
+        stable_for=client._timings.backoff_reset_after,
         now=now + 201.0,
     )
 
@@ -475,8 +494,8 @@ async def test_ready_session_resets_recovery_circuit_at_thirty_second_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A still-current READY session clears its circuit without disconnecting."""
-    monkeypatch.setattr(client_module, "BACKOFF_RESET_AFTER", 0.01)
     client = make_client()
+    _set_client_timings(client, backoff_reset_after=0.01)
     loop = asyncio.get_running_loop()
     _arm_recovery_storm(
         client,
@@ -499,9 +518,12 @@ async def test_recovery_circuit_holds_advertisement_until_floor(
 ) -> None:
     """A fresh advertisement is evidence, not a circuit-breaker bypass."""
     monkeypatch.setattr(client_module.random, "uniform", lambda *_: 1.0)
-    monkeypatch.setattr(client_module, "ADVERTISEMENT_RECOVERY_COOLDOWN", 0.0)
-    monkeypatch.setattr(client_module, "RECOVERY_STORM_INITIAL_FLOOR", 0.03)
     client = make_client()
+    _set_client_timings(
+        client,
+        advertisement_settle_delay=0.0,
+        recovery_storm_initial_floor=0.03,
+    )
     loop = asyncio.get_running_loop()
     _arm_recovery_storm(
         client,
@@ -528,8 +550,8 @@ async def test_recovery_circuit_holds_command_without_dropping_it(
 ) -> None:
     """A command respects the floor while remaining queued for recovery."""
     monkeypatch.setattr(client_module.random, "uniform", lambda *_: 1.0)
-    monkeypatch.setattr(client_module, "RECOVERY_STORM_INITIAL_FLOOR", 0.03)
     client = make_client()
+    _set_client_timings(client, recovery_storm_initial_floor=0.03)
     loop = asyncio.get_running_loop()
     _arm_recovery_storm(
         client,
@@ -560,8 +582,8 @@ async def test_recovery_circuit_shutdown_interrupts_immediately(
 ) -> None:
     """Shutdown never waits behind an active recovery circuit floor."""
     monkeypatch.setattr(client_module.random, "uniform", lambda *_: 1.0)
-    monkeypatch.setattr(client_module, "RECOVERY_STORM_INITIAL_FLOOR", 60.0)
     client = make_client()
+    _set_client_timings(client, recovery_storm_initial_floor=60.0)
     loop = asyncio.get_running_loop()
     _arm_recovery_storm(
         client,
@@ -583,8 +605,8 @@ async def test_new_advertisement_wakes_long_recovery_backoff(
 ) -> None:
     """Fresh radio evidence bypasses a minute-long scheduled recovery delay."""
     monkeypatch.setattr(client_module.random, "uniform", lambda *_: 1.0)
-    monkeypatch.setattr(client_module, "ADVERTISEMENT_RECOVERY_COOLDOWN", 0.0)
     client = make_client()
+    _set_client_timings(client, advertisement_settle_delay=0.0)
     environment = client._environment
 
     backoff = asyncio.create_task(client._async_backoff(60.0))
@@ -616,8 +638,8 @@ async def test_command_interrupts_normal_advertisement_cooldown(
 ) -> None:
     """The circuit does not weaken normal command-priority recovery."""
     monkeypatch.setattr(client_module.random, "uniform", lambda *_: 1.0)
-    monkeypatch.setattr(client_module, "ADVERTISEMENT_RECOVERY_COOLDOWN", 60.0)
     client = make_client()
+    _set_client_timings(client, advertisement_settle_delay=60.0)
     environment = client._environment
 
     backoff = asyncio.create_task(client._async_backoff(60.0))
@@ -1000,7 +1022,9 @@ async def test_initialization_retries_essential_state_on_same_session() -> None:
     ]
     assert calls[-1] == "device_state"
     assert device_state_calls == 2
-    wait_for_work.assert_awaited_once_with(client_module.INITIALIZATION_RETRY_DELAY)
+    wait_for_work.assert_awaited_once_with(
+        client._timings.initialization_retry_delay
+    )
     assert client.diagnostic_snapshot()["incomplete_initialization_requests"] == ()
     assert client._transport.disconnects == 0  # type: ignore[attr-defined]
 
@@ -1010,8 +1034,8 @@ async def test_initialization_recycles_after_three_silent_essential_batches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A zombie connected session gets nine aa-01 attempts, not an infinite loop."""
-    monkeypatch.setattr(client_module, "TRANSACTION_TIMEOUT", 0.001)
     client = make_client()
+    _set_client_timings(client, transaction_timeout=0.001)
     client.status = client_module.ClientStatus.INITIALIZING
     channel = SilentChannel()
     client._channel = channel  # type: ignore[assignment]
@@ -1026,7 +1050,9 @@ async def test_initialization_recycles_after_three_silent_essential_batches(
         await client._async_run_initialization(essential)
 
     assert wait_for_work.await_count == 2
-    wait_for_work.assert_awaited_with(client_module.INITIALIZATION_RETRY_DELAY)
+    wait_for_work.assert_awaited_with(
+        client._timings.initialization_retry_delay
+    )
     assert len(channel.writes) == 9  # type: ignore[attr-defined]
     diagnostics = client.diagnostic_snapshot()
     assert diagnostics["essential_initialization_batches"] == 3
@@ -1211,8 +1237,8 @@ async def test_steady_scheduler_polls_only_aa01(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """No status, light, or metadata query enters the steady poll loop."""
-    monkeypatch.setattr(client_module, "POLL_INTERVAL", 0.01)
     client = make_client()
+    _set_client_timings(client, poll_interval=0.01)
     client._session_generation = 1
     channel = PollChannel(lambda frame: client._on_plaintext_frame(1, frame))
     client._channel = channel  # type: ignore[assignment]
@@ -1483,8 +1509,8 @@ async def test_refresh_yields_and_resumes_when_command_is_queued(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A long best-effort refresh cannot hold the owner ahead of a control."""
-    monkeypatch.setattr(client_module, "TRANSACTION_TIMEOUT", 10.0)
     client = make_client()
+    _set_client_timings(client, transaction_timeout=10.0)
     channel = SilentChannel()
     client._channel = channel  # type: ignore[assignment]
     descriptors = client._protocol.refresh_requests()
@@ -1537,8 +1563,8 @@ async def test_timeout_reports_zero_received_frames_per_attempt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The HA-facing timeout distinguishes silence from matcher rejection."""
-    monkeypatch.setattr(client_module, "TRANSACTION_TIMEOUT", 0.01)
     client = make_client()
+    _set_client_timings(client, transaction_timeout=0.01)
     client._channel = SilentChannel()  # type: ignore[assignment]
     descriptor = client._protocol.initialization_requests()[0]
 
@@ -1557,8 +1583,8 @@ async def test_timeout_reports_unmatched_plaintext_sample(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A valid but unexpected notification is included in timeout evidence."""
-    monkeypatch.setattr(client_module, "TRANSACTION_TIMEOUT", 0.01)
     client = make_client()
+    _set_client_timings(client, transaction_timeout=0.01)
     client._session_generation = 1
     channel = PollChannel(lambda frame: client._on_plaintext_frame(1, frame))
     client._channel = channel  # type: ignore[assignment]

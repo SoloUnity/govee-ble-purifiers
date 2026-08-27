@@ -21,6 +21,13 @@ does not guess a model from an address prefix.
 
 Other Govee models are not currently supported.
 
+These identities and their runtime behavior come from validated profiles
+bundled with the integration. H7124 resolves through `h7124 -> default`; H7129
+resolves through `h7129 -> default-encrypted`. The complete baselines have no
+discoverable names and do not make an unknown purifier supported. Profiles are
+not user-editable configuration and are loaded only from the installed
+integration.
+
 ## Home Assistant entities
 
 Each configured purifier creates four entities:
@@ -366,6 +373,14 @@ that five-minute window failed or the purifier stopped advertising. An already
 configured purifier instead loads as unavailable and keeps recovering in the
 background without delaying Home Assistant startup.
 
+### Bundled model profiles are invalid
+
+This is an installation error, not a Bluetooth outage. The integration validates
+its schema and all H7124/H7129 profile files as one unit before cleanup,
+scanning, or connection work. Reinstall or update the integration, restart Home
+Assistant, and try again. It intentionally does not fall back to a generic
+plaintext or encrypted profile.
+
 ### Physical changes are not reflected
 
 Confirm that the integration still owns the BLE connection. Another central,
@@ -391,6 +406,8 @@ details can include:
 - partial-client and stale-connection cleanup results;
 - recovery failure and advertisement-wake counts, failure stage, cycle and
   backoff timing, active circuit floor, wake reason, and cleanup outcome;
+- the exact profile ID, lineage, schema version, fingerprint, security strategy,
+  capabilities, request names/counts, UUIDs, and effective timing values;
 - essential initialization batch and wire-attempt counts;
 - request name, retry count, received and matched frames; and
 - a bounded sample of ignored application frames.
@@ -417,7 +434,9 @@ Home Assistant config-entry diagnostics expose redacted entry data, cached
 purifier state, connection status, route evidence, transport counters, current
 stage, cleanup statistics, recent bounded failures, recovery-circuit state and
 timing, and startup fan-mode fragments (including the selector-01 value),
-resolution, and connection generation.
+resolution, and connection generation. Profile diagnostics are limited to safe
+resolved metadata; they exclude addresses, device names, raw JSON, session keys,
+negotiation randomness, and protected or decrypted negotiation frames.
 
 ## Removal and updates
 
@@ -439,10 +458,11 @@ cleanup before reconnecting.
 | Module | Responsibility |
 | --- | --- |
 | `config_flow.py` | Manual scan window, name/model classification, selection freshness, validation |
+| `profiles.py` / `model_profiles/` | Atomic profile loading, inheritance, strict validation, immutable device-specific data |
 | `bluetooth.py` | Home Assistant scanner/cache adapter, route diagnostics, GATT transport, connection cleanup |
 | `channel.py` | Plaintext H7124 channel and per-connection H7129 negotiation/encryption |
 | `frame.py` / `crypto.py` | Frame validation, checksum, and cryptographic transforms |
-| `protocol.py` / `models.py` | Typed commands, events, response matching, model-specific request sequences |
+| `protocol.py` / `models.py` | Typed commands/events and registered frame, response-matcher, and state strategies |
 | `client.py` | Single connection owner, initialization, notifications, polling, command queue, recovery |
 | `coordinator.py` | Cached push state and Home Assistant availability/error propagation |
 | `fan.py`, `light.py`, `sensor.py` | Entity mappings only; no direct Bluetooth I/O |
@@ -459,6 +479,7 @@ Create a Python environment with the project dependencies, then run:
 
 ```bash
 env PYTHONPATH=. .venv/bin/ruff check .
+env PYTHONPATH=. .venv/bin/python scripts/validate_model_profiles.py
 env PYTHONPATH=. .venv/bin/pytest -q
 ```
 
@@ -466,7 +487,12 @@ The tests cover setup scanning and cache freshness, separate address-level
 reachability and model/name identity, Home Assistant and session name retention,
 connection timeouts and cleanup, stale callback generations, H7129 session
 negotiation, request/response matching, notification decoding, command recovery,
-entities, diagnostics-related lifecycle behavior, and trace extraction.
+profile inheritance/selection/equivalence, entities, diagnostics-related
+lifecycle behavior, and trace extraction.
+
+See [the bundled model-profile policy](docs/model-profiles.md) before changing a
+name prefix, UUID, request, matcher, capability, security strategy, or runtime
+timing.
 
 ### PacketLogger trace extraction
 

@@ -31,7 +31,6 @@ from .models import (
     DeviceStateEvent,
     FanMode,
     FanModeEvent,
-    Model,
     NightLightColorEvent,
     NightLightStateEvent,
     ProtocolCommand,
@@ -49,30 +48,6 @@ from .protocol import GoveePurifierProtocol, MatchResult, RequestDescriptor
 
 _LOGGER = logging.getLogger(__name__)
 
-POLL_INTERVAL = 3.0
-H7124_INITIAL_POLL_DELAY = 1.936
-TRANSACTION_TIMEOUT = 3.0
-INITIALIZATION_ATTEMPTS = 3
-ESSENTIAL_INITIALIZATION_REQUEST = "device_state"
-ESSENTIAL_INITIALIZATION_MAX_BATCHES = 3
-INITIALIZATION_RETRY_DELAY = 3.0
-PERIODIC_POLL_ATTEMPTS = 3
-REFRESH_ATTEMPTS = 3
-COMMAND_DEADLINE = 120.0
-COMMAND_SEND_ATTEMPTS = 3
-STARTUP_TIMEOUT = 300.0
-FRESH_ADVERTISEMENT_TIMEOUT = 10.0
-BETWEEN_REQUEST_DELAY = 0.001
-BACKOFF_MIN = 1.0
-BACKOFF_MAX = 60.0
-RECENT_ADVERTISEMENT_BACKOFF_MAX = 8.0
-ADVERTISEMENT_RECOVERY_COOLDOWN = 1.0
-BACKOFF_RESET_AFTER = 30.0
-RECOVERY_STORM_WINDOW = 120.0
-RECOVERY_STORM_FAILURE_THRESHOLD = 3
-RECOVERY_STORM_ADVERTISEMENT_THRESHOLD = 2
-RECOVERY_STORM_INITIAL_FLOOR = 5.0
-RECOVERY_STORM_MAX_FLOOR = 8.0
 RECOVERY_EVENT_HISTORY_LIMIT = 32
 
 StateCallback = Callable[[PurifierState], None]
@@ -141,6 +116,15 @@ class ReliablePurifierClient:
         self._transport = transport
         self._protocol = protocol
         self._profile = profile
+        self._timings = profile.timings
+        if (
+            protocol.profile is not profile
+            or environment.profile is not profile
+            or transport.profile is not profile
+        ):
+            raise ValueError(
+                "coordinator, Bluetooth, protocol, and client must share one profile"
+            )
         self._state_callback = state_callback
         self._availability_callback = availability_callback
 
@@ -212,6 +196,9 @@ class ReliablePurifierClient:
         """Return secret-free runtime evidence for Home Assistant diagnostics."""
         current_recovery_floor = self._recovery_cooldown_floor(time.monotonic())
         return {
+            "profile": self._profile.diagnostic_snapshot(
+                requested_model=self._profile.model.value
+            ),
             "status": self.status.value,
             "is_ready": self.is_ready,
             "has_ever_been_ready": self._has_ever_been_ready,
@@ -222,12 +209,14 @@ class ReliablePurifierClient:
                 "advertisement_wake_count_in_window": len(
                     self._recovery_advertisement_wake_times
                 ),
-                "window_seconds": RECOVERY_STORM_WINDOW,
-                "failure_threshold": RECOVERY_STORM_FAILURE_THRESHOLD,
-                "advertisement_wake_threshold": (
-                    RECOVERY_STORM_ADVERTISEMENT_THRESHOLD
+                "window_seconds": self._timings.recovery_storm_window,
+                "failure_threshold": (
+                    self._timings.recovery_storm_failure_threshold
                 ),
-                "stable_reset_seconds": BACKOFF_RESET_AFTER,
+                "advertisement_wake_threshold": (
+                    self._timings.recovery_storm_advertisement_threshold
+                ),
+                "stable_reset_seconds": self._timings.backoff_reset_after,
                 "circuit_breaker_active": current_recovery_floor > 0,
                 "current_circuit_floor_seconds": current_recovery_floor,
                 "last_failure_stage": self._last_recovery_failure_stage,
@@ -293,7 +282,7 @@ class ReliablePurifierClient:
                 self._essential_initialization_attempts
             ),
             "essential_initialization_batch_limit": (
-                ESSENTIAL_INITIALIZATION_MAX_BATCHES
+                self._timings.essential_initialization_max_batches
             ),
             "incomplete_refresh_requests": self._incomplete_refresh_requests,
             "refresh_failure_summaries": dict(self._refresh_failure_summaries),
@@ -341,7 +330,7 @@ class ReliablePurifierClient:
         if self._runner is None or first_ready is None:
             raise PurifierClientError("Purifier client is not running")
         if timeout is None:
-            timeout = STARTUP_TIMEOUT
+            timeout = self._timings.startup_timeout
 
         try:
             async with asyncio.timeout(timeout):
@@ -398,7 +387,7 @@ class ReliablePurifierClient:
         operation = _Operation(
             command,
             future,
-            now + COMMAND_DEADLINE,
+            now + self._timings.command_deadline,
             created_at=now,
         )
         self._coalesce_pending(operation)
@@ -406,7 +395,7 @@ class ReliablePurifierClient:
         self._operation_event.set()
 
         try:
-            async with asyncio.timeout(COMMAND_DEADLINE):
+            async with asyncio.timeout(self._timings.command_deadline):
                 await asyncio.shield(future)
         except TimeoutError as err:
             if not future.done():
@@ -415,7 +404,8 @@ class ReliablePurifierClient:
                 self._operations.remove(operation)
             raise self._command_failure_error(
                 operation,
-                f"Command was not confirmed within {COMMAND_DEADLINE:.0f} seconds",
+                "Command was not confirmed within "
+                f"{self._timings.command_deadline:.0f} seconds",
             ) from err
         except asyncio.CancelledError:
             if not future.done():
@@ -425,7 +415,7 @@ class ReliablePurifierClient:
             raise
 
     async def _run(self) -> None:
-        backoff = BACKOFF_MIN
+        backoff = self._timings.backoff_initial
         loop = asyncio.get_running_loop()
         while not self._stopping.is_set():
             cycle_started = loop.time()
@@ -462,8 +452,8 @@ class ReliablePurifierClient:
                     self._last_error,
                     exc_info=True,
                 )
-                if stable_for >= BACKOFF_RESET_AFTER:
-                    backoff = BACKOFF_MIN
+                if stable_for >= self._timings.backoff_reset_after:
+                    backoff = self._timings.backoff_initial
                 if self._has_ever_been_ready:
                     self._set_available(False, err)
                 else:
@@ -496,7 +486,7 @@ class ReliablePurifierClient:
             effective_backoff = self._recovery_backoff_delay(backoff)
             self._last_backoff_effective_seconds = effective_backoff
             await self._async_backoff(effective_backoff)
-            backoff = min(BACKOFF_MAX, backoff * 2)
+            backoff = min(self._timings.backoff_max, backoff * 2)
 
     async def _connect_initialize_and_run(self) -> None:
         self._connection_cycles += 1
@@ -529,7 +519,7 @@ class ReliablePurifierClient:
 
         self.status = ClientStatus.WAITING_FOR_ADVERTISEMENT
         device = await self._environment.async_wait_for_fresh_device(
-            FRESH_ADVERTISEMENT_TIMEOUT
+            self._timings.fresh_advertisement_timeout
         )
         if device is None:
             raise BluetoothUnavailableError(
@@ -574,10 +564,18 @@ class ReliablePurifierClient:
 
         if self._profile.security is SecurityMode.H7129_SESSION:
             self.status = ClientStatus.NEGOTIATING
-            channel: SecureChannel = H7129SessionChannel(self._transport, callback)
+            channel: SecureChannel = H7129SessionChannel(
+                self._transport,
+                callback,
+                self._profile,
+            )
         else:
             self.status = ClientStatus.SUBSCRIBING
-            channel = PlaintextChannel(self._transport, callback)
+            channel = PlaintextChannel(
+                self._transport,
+                callback,
+                self._profile,
+            )
         self._channel = channel
         await channel.async_establish()
         _LOGGER.debug(
@@ -594,7 +592,7 @@ class ReliablePurifierClient:
             "attempts_per_request=%d",
             self._connection_cycles,
             len(initialization_requests),
-            INITIALIZATION_ATTEMPTS,
+            self._timings.initialization_attempts,
         )
         await self._async_run_initialization(initialization_requests)
 
@@ -603,11 +601,7 @@ class ReliablePurifierClient:
         loop = asyncio.get_running_loop()
         self._ready_since = loop.time()
         self._schedule_recovery_reset(session_generation)
-        initial_poll_delay = (
-            H7124_INITIAL_POLL_DELAY
-            if self._profile.model is Model.H7124
-            else POLL_INTERVAL
-        )
+        initial_poll_delay = self._timings.initial_poll_delay
         self._next_poll_due = loop.time() + initial_poll_delay
         self._last_error = None
         self._last_timeout_summary = None
@@ -633,13 +627,13 @@ class ReliablePurifierClient:
         essential: RequestDescriptor | None = None
 
         for index, descriptor in enumerate(descriptors):
-            if descriptor.name == ESSENTIAL_INITIALIZATION_REQUEST:
+            if descriptor.name == self._profile.protocol.essential_request:
                 essential = descriptor
                 self._essential_initialization_batches += 1
             try:
                 await self._async_execute_descriptor(
                     descriptor,
-                    attempts=INITIALIZATION_ATTEMPTS,
+                    attempts=self._timings.initialization_attempts,
                 )
             except TransactionTimeoutError as err:
                 failures[descriptor.name] = str(err)
@@ -648,12 +642,12 @@ class ReliablePurifierClient:
                     "Initialization request exhausted its retries: request=%s "
                     "attempts=%d essential=%s; continuing startup sweep",
                     descriptor.name,
-                    INITIALIZATION_ATTEMPTS,
-                    descriptor.name == ESSENTIAL_INITIALIZATION_REQUEST,
+                    self._timings.initialization_attempts,
+                    descriptor.name == self._profile.protocol.essential_request,
                     exc_info=True,
                 )
             if index + 1 < len(descriptors):
-                await asyncio.sleep(BETWEEN_REQUEST_DELAY)
+                await asyncio.sleep(self._timings.between_request_delay)
 
         if essential is None:
             raise PurifierClientError(
@@ -663,7 +657,7 @@ class ReliablePurifierClient:
         while essential.name in failures:
             if (
                 self._essential_initialization_batches
-                >= ESSENTIAL_INITIALIZATION_MAX_BATCHES
+                >= self._timings.essential_initialization_max_batches
             ):
                 summary = failures[essential.name]
                 raise TransactionTimeoutError(
@@ -678,15 +672,17 @@ class ReliablePurifierClient:
                 "the connected session and retrying request=%s batch=%d/%d in %.1fs",
                 essential.name,
                 self._essential_initialization_batches + 1,
-                ESSENTIAL_INITIALIZATION_MAX_BATCHES,
-                INITIALIZATION_RETRY_DELAY,
+                self._timings.essential_initialization_max_batches,
+                self._timings.initialization_retry_delay,
             )
-            await self._async_wait_for_ready_work(INITIALIZATION_RETRY_DELAY)
+            await self._async_wait_for_ready_work(
+                self._timings.initialization_retry_delay
+            )
             self._essential_initialization_batches += 1
             try:
                 await self._async_execute_descriptor(
                     essential,
-                    attempts=INITIALIZATION_ATTEMPTS,
+                    attempts=self._timings.initialization_attempts,
                 )
             except TransactionTimeoutError as err:
                 failures[essential.name] = str(err)
@@ -700,7 +696,7 @@ class ReliablePurifierClient:
                 "Purifier initialization is usable with exhausted secondary "
                 "requests: requests=%s attempts_per_request=%d",
                 tuple(failures),
-                INITIALIZATION_ATTEMPTS,
+                self._timings.initialization_attempts,
             )
 
     def _update_initialization_failures(self, failures: dict[str, str]) -> None:
@@ -723,7 +719,7 @@ class ReliablePurifierClient:
 
             if self._refresh_pending:
                 # An idle ee-aa capture began its refresh at about +1 ms.
-                await asyncio.sleep(BETWEEN_REQUEST_DELAY)
+                await asyncio.sleep(self._timings.between_request_delay)
                 await self._async_run_refresh(self._protocol.refresh_requests())
                 continue
 
@@ -731,7 +727,7 @@ class ReliablePurifierClient:
             if loop.time() >= self._next_poll_due:
                 await self._async_execute_descriptor(
                     self._protocol.device_state_poll(),
-                    attempts=PERIODIC_POLL_ATTEMPTS,
+                    attempts=self._timings.periodic_poll_attempts,
                     is_periodic_poll=True,
                 )
                 continue
@@ -759,7 +755,7 @@ class ReliablePurifierClient:
             operation.future.set_result(None)
             return
 
-        if operation.send_attempts >= COMMAND_SEND_ATTEMPTS:
+        if operation.send_attempts >= self._timings.command_send_attempts:
             operation.future.set_exception(
                 self._command_failure_error(
                     operation,
@@ -769,7 +765,7 @@ class ReliablePurifierClient:
             return
 
         descriptor = self._protocol.command_request(operation.command)
-        while operation.send_attempts < COMMAND_SEND_ATTEMPTS:
+        while operation.send_attempts < self._timings.command_send_attempts:
             if operation.future.done():
                 return
             if loop.time() >= operation.deadline:
@@ -786,7 +782,7 @@ class ReliablePurifierClient:
                 "session_generation=%d frame=%s",
                 type(operation.command).__name__,
                 operation.send_attempts + 1,
-                COMMAND_SEND_ATTEMPTS,
+                self._timings.command_send_attempts,
                 max(0.0, operation.deadline - loop.time()),
                 self._session_generation,
                 descriptor.frame.hex(" "),
@@ -822,7 +818,7 @@ class ReliablePurifierClient:
                     f"generation={self._session_generation}: {err}"
                 )
                 if (
-                    operation.send_attempts < COMMAND_SEND_ATTEMPTS
+                    operation.send_attempts < self._timings.command_send_attempts
                     and not operation.future.done()
                     and loop.time() < operation.deadline
                 ):
@@ -831,7 +827,7 @@ class ReliablePurifierClient:
                         "session command=%s next_attempt=%d/%d",
                         type(operation.command).__name__,
                         operation.send_attempts + 1,
-                        COMMAND_SEND_ATTEMPTS,
+                        self._timings.command_send_attempts,
                     )
                     continue
                 self._queue_operation_for_reconciliation(operation)
@@ -885,12 +881,12 @@ class ReliablePurifierClient:
                     index + 1,
                     len(active_descriptors),
                     descriptor.name,
-                    REFRESH_ATTEMPTS,
+                    self._timings.refresh_attempts,
                 )
                 try:
                     await self._async_execute_descriptor(
                         descriptor,
-                        attempts=REFRESH_ATTEMPTS,
+                        attempts=self._timings.refresh_attempts,
                         interrupt_for_command=True,
                     )
                 except _RefreshPreempted:
@@ -899,12 +895,12 @@ class ReliablePurifierClient:
                 except TransactionTimeoutError as err:
                     failures[descriptor.name] = str(err)
                     self._update_refresh_failures(failures)
-                    if descriptor.name == ESSENTIAL_INITIALIZATION_REQUEST:
+                    if descriptor.name == self._profile.protocol.essential_request:
                         _LOGGER.debug(
                             "Essential refresh request exhausted its retries; "
                             "reconnecting request=%s attempts=%d",
                             descriptor.name,
-                            REFRESH_ATTEMPTS,
+                            self._timings.refresh_attempts,
                             exc_info=True,
                         )
                         raise
@@ -912,11 +908,11 @@ class ReliablePurifierClient:
                         "Secondary refresh request exhausted its retries; "
                         "preserving connection request=%s attempts=%d",
                         descriptor.name,
-                        REFRESH_ATTEMPTS,
+                        self._timings.refresh_attempts,
                         exc_info=True,
                     )
                 if index + 1 < len(active_descriptors):
-                    await asyncio.sleep(BETWEEN_REQUEST_DELAY)
+                    await asyncio.sleep(self._timings.between_request_delay)
         finally:
             self._refresh_running = False
 
@@ -971,7 +967,7 @@ class ReliablePurifierClient:
             for attempt in range(attempts):
                 if (
                     self.status is ClientStatus.INITIALIZING
-                    and descriptor.name == ESSENTIAL_INITIALIZATION_REQUEST
+                    and descriptor.name == self._profile.protocol.essential_request
                 ):
                     self._essential_initialization_attempts += 1
                 matcher = self._protocol.new_response_matcher(descriptor)
@@ -990,8 +986,8 @@ class ReliablePurifierClient:
                 await channel.async_send(descriptor.frame)
                 if is_periodic_poll:
                     # This is deliberately write-to-write, not response-to-write.
-                    self._next_poll_due = loop.time() + POLL_INTERVAL
-                deadline = loop.time() + TRANSACTION_TIMEOUT
+                    self._next_poll_due = loop.time() + self._timings.poll_interval
+                deadline = loop.time() + self._timings.transaction_timeout
 
                 try:
                     while not matcher.complete:
@@ -1056,7 +1052,8 @@ class ReliablePurifierClient:
             details = "; ".join(attempt_summaries)
             raise TransactionTimeoutError(
                 f"Timed out waiting for {descriptor.name} response after "
-                f"{attempts} attempt(s) with {TRANSACTION_TIMEOUT:.1f}s deadlines; "
+                f"{attempts} attempt(s) with "
+                f"{self._timings.transaction_timeout:.1f}s deadlines; "
                 f"{details}"
             )
         finally:
@@ -1180,10 +1177,7 @@ class ReliablePurifierClient:
             )
         elif isinstance(event, RefreshRequestedEvent):
             # The short sweep is documented only for an active H7129 session.
-            if (
-                self._profile.security is SecurityMode.H7129_SESSION
-                and not self._refresh_running
-            ):
+            if self._profile.capabilities.refresh and not self._refresh_running:
                 self._refresh_pending = True
 
         if new_state != self.state:
@@ -1227,7 +1221,10 @@ class ReliablePurifierClient:
 
         if event.selector == 0x01:
             self._last_startup_selector_01_value = event.level_or_configuration
-            if self._profile.model is not Model.H7129:
+            if (
+                self._profile.protocol.startup_mode_strategy
+                != "h7129_selector_pair"
+            ):
                 self._startup_mode_generation = self._session_generation
                 return self.state
             completes_current_pair = (
@@ -1273,7 +1270,10 @@ class ReliablePurifierClient:
         self._clear_startup_mode_partial("new_mode_category")
         self._startup_mode_generation = self._session_generation
 
-        if self._profile.model is Model.H7124:
+        if (
+            self._profile.protocol.startup_mode_strategy
+            == "h7124_selector_00"
+        ):
             mode = self._decode_h7124_startup_mode(
                 event.mode_code,
                 event.manual_level,
@@ -1375,9 +1375,11 @@ class ReliablePurifierClient:
         command_detail = type(operation.command).__name__
         if isinstance(operation.command, SetFanMode):
             command_detail += f"(mode={operation.command.mode.value})"
-        sends = " | ".join(operation.send_diagnostics[-COMMAND_SEND_ATTEMPTS:])
+        sends = " | ".join(
+            operation.send_diagnostics[-self._timings.command_send_attempts :]
+        )
         failures = " | ".join(
-            operation.response_failures[-COMMAND_SEND_ATTEMPTS:]
+            operation.response_failures[-self._timings.command_send_attempts :]
         )
         fan_frames = " | ".join(operation.observed_fan_frames[-8:])
         cached_fan_mode = (
@@ -1386,7 +1388,8 @@ class ReliablePurifierClient:
         return (
             f"{reason}; command={command_detail}; "
             f"frame={descriptor.frame.hex(' ')}; "
-            f"sends={operation.send_attempts}/{COMMAND_SEND_ATTEMPTS}; "
+            "sends="
+            f"{operation.send_attempts}/{self._timings.command_send_attempts}; "
             f"send_timeline={sends or 'none'}; "
             f"response_failures={failures or 'none'}; "
             f"observed_fan_frames={fan_frames or 'none'}; "
@@ -1549,7 +1552,7 @@ class ReliablePurifierClient:
 
     def _trim_recovery_window(self, now: float) -> None:
         """Discard failure-storm evidence outside the bounded time window."""
-        cutoff = now - RECOVERY_STORM_WINDOW
+        cutoff = now - self._timings.recovery_storm_window
         while (
             self._recovery_failure_times
             and self._recovery_failure_times[0] < cutoff
@@ -1590,11 +1593,11 @@ class ReliablePurifierClient:
                 "Bluetooth recovery circuit reset after stable READY session: "
                 "session_generation=%d stable_for=%.1fs",
                 session_generation,
-                BACKOFF_RESET_AFTER,
+                self._timings.backoff_reset_after,
             )
 
         self._recovery_reset_handle = loop.call_later(
-            BACKOFF_RESET_AFTER,
+            self._timings.backoff_reset_after,
             reset_if_current,
         )
 
@@ -1611,7 +1614,7 @@ class ReliablePurifierClient:
         self._last_recovery_failure_stable_seconds = round(
             max(0.0, stable_for), 3
         )
-        if stable_for >= BACKOFF_RESET_AFTER:
+        if stable_for >= self._timings.backoff_reset_after:
             self._reset_recovery_storm()
             return
         self._trim_recovery_window(now)
@@ -1628,21 +1631,22 @@ class ReliablePurifierClient:
         failures = len(self._recovery_failure_times)
         advertisement_wakes = len(self._recovery_advertisement_wake_times)
         if (
-            failures < RECOVERY_STORM_FAILURE_THRESHOLD
-            or advertisement_wakes < RECOVERY_STORM_ADVERTISEMENT_THRESHOLD
+            failures < self._timings.recovery_storm_failure_threshold
+            or advertisement_wakes
+            < self._timings.recovery_storm_advertisement_threshold
         ):
             return 0.0
-        if failures == RECOVERY_STORM_FAILURE_THRESHOLD:
-            return RECOVERY_STORM_INITIAL_FLOOR
-        return RECOVERY_STORM_MAX_FLOOR
+        if failures == self._timings.recovery_storm_failure_threshold:
+            return self._timings.recovery_storm_initial_floor
+        return self._timings.recovery_storm_max_floor
 
     def _recovery_backoff_delay(self, requested: float) -> float:
         """Cap recovery delay while Home Assistant still sees advertisements."""
         recent = self._environment.has_recent_advertisement(
-            FRESH_ADVERTISEMENT_TIMEOUT
+            self._timings.fresh_advertisement_timeout
         )
         delay = (
-            min(requested, RECENT_ADVERTISEMENT_BACKOFF_MAX)
+            min(requested, self._timings.recent_advertisement_backoff_max)
             if recent
             else requested
         )
@@ -1652,7 +1656,7 @@ class ReliablePurifierClient:
             requested,
             delay,
             recent,
-            FRESH_ADVERTISEMENT_TIMEOUT,
+            self._timings.fresh_advertisement_timeout,
         )
         return delay
 
@@ -1734,7 +1738,7 @@ class ReliablePurifierClient:
             jittered_delay,
             recovery_floor,
             planned_delay,
-            BACKOFF_MAX,
+            self._timings.backoff_max,
         )
         stop_task = asyncio.create_task(self._stopping.wait())
         operation_task = asyncio.create_task(self._operation_event.wait())
@@ -1768,7 +1772,7 @@ class ReliablePurifierClient:
             if reason == "fresh_advertisement":
                 minimum_wait = max(
                     minimum_wait,
-                    ADVERTISEMENT_RECOVERY_COOLDOWN,
+                    self._timings.advertisement_settle_delay,
                 )
             remaining_floor = max(
                 0.0,

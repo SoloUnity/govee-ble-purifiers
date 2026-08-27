@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -15,6 +16,13 @@ from custom_components.govee_ble_air_purifier.bluetooth import (
     HomeAssistantBluetoothEnvironment,
     exception_chain_detail,
 )
+
+
+def _set_transport_timings(
+    transport: GattTransport,
+    **changes: float | int,
+) -> None:
+    transport._timings = replace(transport._timings, **changes)
 
 
 @pytest.fixture(autouse=True)
@@ -62,8 +70,8 @@ async def test_notification_subscription_timeout_is_bounded_and_observed(
                 cancelled.set()
                 raise
 
-    monkeypatch.setattr(bluetooth_module, "NOTIFICATION_SUBSCRIBE_TIMEOUT", 0.01)
     transport = GattTransport(name="Bedroom purifier")
+    _set_transport_timings(transport, notification_subscribe_timeout=0.01)
     transport._client = HangingClient()  # type: ignore[assignment]
     transport._notify_characteristic = object()
 
@@ -97,8 +105,8 @@ async def test_write_timeout_is_bounded_and_observed(
                 cancelled.set()
                 raise
 
-    monkeypatch.setattr(bluetooth_module, "GATT_WRITE_TIMEOUT", 0.01)
     transport = GattTransport(name="Bedroom purifier")
+    _set_transport_timings(transport, gatt_write_timeout=0.01)
     transport._client = HangingClient()  # type: ignore[assignment]
     transport._command_characteristic = object()
 
@@ -131,8 +139,8 @@ async def test_disconnect_timeout_cannot_block_cleanup(
                 cancelled.set()
                 raise
 
-    monkeypatch.setattr(bluetooth_module, "GATT_DISCONNECT_TIMEOUT", 0.01)
     transport = GattTransport(name="Bedroom purifier")
+    _set_transport_timings(transport, gatt_disconnect_timeout=0.01)
     transport._client = HangingClient()  # type: ignore[assignment]
 
     await asyncio.wait_for(transport.async_disconnect(), 0.1)
@@ -256,8 +264,8 @@ async def test_connection_deadline_cleans_partial_client_and_records_attempts(
         bluetooth_module, "close_stale_connections_by_address", close_address
     )
     monkeypatch.setattr(bluetooth_module, "get_connected_devices", no_connected_devices)
-    monkeypatch.setattr(bluetooth_module, "CONNECTION_ATTEMPT_TIMEOUT", 0.01)
     transport = GattTransport(name="Bedroom purifier")
+    _set_transport_timings(transport, connection_attempt_timeout=0.01)
     device = SimpleNamespace(
         address="AA:BB:CC:DD:EE:FF",
         name="ihoment_H7129_TEST",
@@ -331,8 +339,8 @@ async def test_connection_deadline_inspects_live_partial_client_before_cleanup(
     monkeypatch.setattr(
         bluetooth_module, "get_connected_devices", connected_while_client_is_live
     )
-    monkeypatch.setattr(bluetooth_module, "CONNECTION_ATTEMPT_TIMEOUT", 0.01)
     transport = GattTransport(name="Bedroom purifier")
+    _set_transport_timings(transport, connection_attempt_timeout=0.01)
     device = SimpleNamespace(
         address="AA:BB:CC:DD:EE:FF",
         name="ihoment_H7129_TEST",
@@ -381,8 +389,11 @@ async def test_surviving_bluez_connection_blocks_new_attempt(
     )
     monkeypatch.setattr(bluetooth_module, "get_connected_devices", still_connected)
     monkeypatch.setattr(bluetooth_module, "establish_connection", unexpected_connector)
-    monkeypatch.setattr(bluetooth_module, "STALE_CONNECTION_CLEANUP_TIMEOUT", 0.01)
     transport = GattTransport(name="Bedroom purifier")
+    _set_transport_timings(
+        transport,
+        stale_connection_cleanup_timeout=0.01,
+    )
     device = SimpleNamespace(
         address="AA:BB:CC:DD:EE:FF",
         name="ihoment_H7129_TEST",

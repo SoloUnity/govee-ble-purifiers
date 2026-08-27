@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "profile_id": "h7124",
+  "extends": "default",
+  "identity": {
+    "manufacturer": "Govee",
+    "model": "H7124",
+    "display_name": "Govee H7124",
+    "support_status": "verified",
+    "advertised_name_prefixes": ["GVH7124"]
+  }
+}

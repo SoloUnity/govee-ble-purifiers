@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "profile_id": "default-encrypted",
+  "identity": {
+    "manufacturer": "Govee",
+    "model": null,
+    "display_name": "Encrypted purifier baseline",
+    "support_status": "baseline",
+    "advertised_name_prefixes": []
+  },
+  "bluetooth": {
+    "service_uuid": "00010203-0405-0607-0809-0a0b0c0d1910",
+    "notify_uuid": "00010203-0405-0607-0809-0a0b0c0d2b10",
+    "write_uuid": "00010203-0405-0607-0809-0a0b0c0d2b11"
+  },
+  "channel": {
+    "strategy": "h7129_session",
+    "first_application_delay": 0.003,
+    "negotiation": {
+      "attempts": 3,
+      "retry_interval": 5.0,
+      "phase_timeout": 15.0,
+      "step_delay": 0.001
+    }
+  },
+  "protocol": {
+    "codec": "govee_20_byte_v1",
+    "checksum": "xor_0_18",
+    "frame_size": 20,
+    "auto_parameter": 18,
+    "startup_mode_strategy": "h7129_selector_pair",
+    "commands": {
+      "power": {"strategy": "power_bool_v1", "prefix": "33 01"},
+      "fan_mode": {"strategy": "fan_mode_v1", "prefix": "3a 05"},
+      "night_light_power": {"strategy": "night_light_power_v1", "prefix": "3a 1b 01 01"},
+      "night_light_brightness": {"strategy": "night_light_brightness_v1", "prefix": "3a 1b 01 02"},
+      "night_light_color": {"strategy": "night_light_color_v1", "prefix": "3a 1b 05 0d"}
+    },
+    "request_catalog": [
+      {"name": "capability_b2", "frame": "33 b2 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 81", "response": {"kind": "value_byte", "prefix": "33 b2", "allowed_values": [0, 1]}},
+      {"name": "capability_b5", "frame": "33 b5 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 86", "response": {"kind": "zero_payload", "prefix": "33 b5"}},
+      {"name": "device_state", "frame": "aa 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ab", "response": {"kind": "prefix", "prefix": "aa 01"}},
+      {"name": "mode_data_00", "frame": "aa 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 af", "response": {"kind": "prefix_selector", "prefix": "aa 05", "selector": "00"}},
+      {"name": "mode_data_01", "frame": "aa 05 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ae", "response": {"kind": "prefix_selector", "prefix": "aa 05", "selector": "01"}},
+      {"name": "mode_data_03", "frame": "aa 05 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ac", "response": {"kind": "prefix_selector", "prefix": "aa 05", "selector": "03"}},
+      {"name": "night_light_state", "frame": "aa 1b 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 b0", "response": {"kind": "prefix_selector", "prefix": "aa 1b", "selector": "01"}},
+      {"name": "night_light_color", "frame": "aa 1b 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 b4", "response": {"kind": "prefix_selector", "prefix": "aa 1b", "selector": "05"}},
+      {"name": "capability_1e_01_02", "frame": "aa 1e 01 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 b7", "response": {"kind": "exact", "exact": "aa 1e 03 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 b6"}},
+      {"name": "capability_10", "frame": "aa 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ba", "response": {"kind": "exact", "exact": "aa 10 00 ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 45"}},
+      {"name": "capability_08", "frame": "aa 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 a2", "response": {"kind": "exact", "exact": "aa 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 a2"}},
+      {"name": "capability_26", "frame": "aa 26 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 8c", "response": {"kind": "exact", "exact": "aa 26 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 8c"}},
+      {"name": "structured_16", "frame": "aa 16 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 bc", "response": {"kind": "prefix", "prefix": "aa 16"}},
+      {"name": "capability_17", "frame": "aa 17 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 bd", "response": {"kind": "exact", "exact": "aa 17 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 bd"}},
+      {"name": "air_quality", "frame": "aa 19 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 b3", "response": {"kind": "prefix", "prefix": "aa 19"}},
+      {"name": "device_data_10", "frame": "aa 07 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 bd", "response": {"kind": "prefix_selector", "prefix": "aa 07", "selector": "10"}},
+      {"name": "device_data_11", "frame": "aa 07 11 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 bc", "response": {"kind": "prefix_selector", "prefix": "aa 07", "selector": "11"}},
+      {"name": "device_data_06", "frame": "aa 07 06 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ab", "response": {"kind": "prefix_selector", "prefix": "aa 07", "selector": "06"}},
+      {"name": "capability_07_20", "frame": "aa 07 20 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 8d", "response": {"kind": "exact", "exact": "aa 07 20 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 8d"}},
+      {"name": "capability_1f", "frame": "aa 1f 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 b5", "response": {"kind": "exact", "exact": "aa 1f 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 b5"}},
+      {"name": "metadata_01_02", "frame": "ab 01 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 a8", "response": {"kind": "fragments", "fragments": [0]}},
+      {"name": "metadata_01_05", "frame": "ab 01 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 af", "response": {"kind": "fragments", "fragments": [0, 255]}},
+      {"name": "metadata_01_04", "frame": "ab 01 04 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ae", "response": {"kind": "fragments", "fragments": [0, 1, 2, 3, 4, 5, 6, 7, 255]}},
+      {"name": "metadata_02_02_00_01", "frame": "ab 02 02 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 aa", "response": {"kind": "h7129_metadata"}}
+    ],
+    "initialization_order": ["capability_b2", "capability_b5", "device_state", "mode_data_00", "mode_data_01", "mode_data_03", "night_light_state", "night_light_color", "capability_1e_01_02", "capability_10", "capability_08", "capability_26", "structured_16", "capability_17", "air_quality", "device_data_10", "device_data_11", "device_data_06", "capability_07_20", "capability_1f", "metadata_01_02", "metadata_01_05", "metadata_01_04", "metadata_02_02_00_01"],
+    "refresh_order": ["capability_b5", "device_state", "mode_data_00", "mode_data_01", "mode_data_03", "night_light_state", "night_light_color", "capability_1e_01_02", "capability_10", "capability_08", "capability_26", "structured_16", "capability_17", "air_quality"],
+    "essential_request": "device_state",
+    "periodic_request": "device_state"
+  },
+  "capabilities": {
+    "power": true,
+    "fan": true,
+    "light": true,
+    "pm25": true,
+    "filter_life": true,
+    "unsolicited_updates": true,
+    "refresh": true
+  },
+  "timings": {
+    "connect_attempts": 3,
+    "connection_attempt_timeout": 45.0,
+    "connection_abort_timeout": 5.0,
+    "connection_diagnostic_timeout": 1.0,
+    "notification_subscribe_timeout": 15.0,
+    "gatt_write_timeout": 10.0,
+    "gatt_disconnect_timeout": 5.0,
+    "gatt_operation_cancel_timeout": 1.0,
+    "stale_connection_cleanup_timeout": 5.0,
+    "stale_connection_check_interval": 0.25,
+    "advertisement_check_interval": 0.25,
+    "recent_cached_advertisement_max_age": 5.0,
+    "fresh_advertisement_timeout": 10.0,
+    "transaction_timeout": 3.0,
+    "initialization_attempts": 3,
+    "essential_initialization_max_batches": 3,
+    "initialization_retry_delay": 3.0,
+    "periodic_poll_attempts": 3,
+    "refresh_attempts": 3,
+    "command_send_attempts": 3,
+    "command_deadline": 120.0,
+    "startup_timeout": 300.0,
+    "between_request_delay": 0.001,
+    "poll_interval": 3.0,
+    "initial_poll_delay": 3.0,
+    "backoff_initial": 1.0,
+    "backoff_max": 60.0,
+    "backoff_reset_after": 30.0,
+    "recent_advertisement_backoff_max": 8.0,
+    "advertisement_settle_delay": 1.0,
+    "recovery_storm_window": 120.0,
+    "recovery_storm_failure_threshold": 3,
+    "recovery_storm_advertisement_threshold": 2,
+    "recovery_storm_initial_floor": 5.0,
+    "recovery_storm_max_floor": 8.0
+  },
+  "custom_auto_defaults": {
+    "modes": ["sleep", "low", "medium", "high", "turbo"],
+    "pm25_boundaries": [7, 9, 13, 19],
+    "upshift_confirmation_seconds": 3,
+    "downshift_delays_minutes": [7, 5, 5, 5]
+  }
+}

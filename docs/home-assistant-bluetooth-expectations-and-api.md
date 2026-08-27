@@ -781,6 +781,28 @@ Hassfest, and HACS validation for a custom integration.
 
 The Govee purifier integration applies the general model as follows:
 
+- Before any Bluetooth work, setup loads the bundled draft 2020-12 schema and
+  all four model-profile JSON files atomically off the event loop. It resolves
+  inheritance, performs structural and semantic validation, and publishes one
+  immutable process-cached registry. Runtime setup passes the same exact
+  profile instance through the coordinator, scanner environment, GATT
+  transport, application channel, protocol, and reliable client.
+- `default` and `default-encrypted` are complete non-discoverable baselines.
+  Only `h7124 -> default` and `h7129 -> default-encrypted` are valid exact
+  lineages. Discovery uses exact profiles' explicit case-insensitive name
+  prefixes; nameless traffic, near misses, and the baseline profiles never
+  select a model.
+- Profile data owns model identity, GATT UUIDs, channel-strategy selection,
+  non-secret negotiation policy, registered protocol/request/matcher choices,
+  capabilities, and the effective retry/timing values described below. Python
+  owns scanner/route mechanics, connection generations, cleanup/cancellation,
+  encryption/key material, matcher and command implementations, state
+  authority, scheduling, and hard safety ceilings.
+- A schema, artifact, inheritance, semantic-validation, or exact-selection
+  failure is a permanent setup/config-flow error before address cleanup or
+  connection work. It never enters Bluetooth recovery and never falls back to a
+  plaintext or encrypted baseline. Existing `H7124`/`H7129` config-entry data is
+  resolved without migration or mutation.
 - Home Assistant owns scanning and selects local-adapter or proxy routes.
 - Callback replay is disabled for connection wake-up waits.
 - The first connection accepts a cached connectable advertisement no more than
@@ -924,9 +946,18 @@ The Govee purifier integration applies the general model as follows:
   Startup fan diagnostics additionally retain the last mode code, manual-level
   and raw selector-01 values, Auto parameter, pair-assembly status, resolution
   reason, and connection generation without exposing H7129 session secrets.
+- Diagnostics also expose safe resolved profile metadata: requested model,
+  exact ID, lineage, schema version, support status, source basename,
+  deterministic fingerprint, registered security strategy, capabilities,
+  request names/counts, GATT UUIDs, and effective timing values. They exclude
+  addresses, unredacted names, raw profile JSON, keys, randomness, protected
+  negotiation frames, and captured device metadata.
 
-These values are project policy based on the purifier traces and reliability
-goals. They are not universal Home Assistant constants.
+The timing and attempt values above are effective bundled-profile policy based
+on purifier traces and reliability goals. Python independently enforces the
+reviewed ceilings documented in the
+[model-profile policy](model-profiles.md#validation-and-safety-ceilings). These
+values are not universal Home Assistant constants.
 
 ## 20. Official references
 

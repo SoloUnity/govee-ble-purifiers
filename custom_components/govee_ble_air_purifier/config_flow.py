@@ -21,7 +21,11 @@ from homeassistant.helpers.device_registry import format_mac
 from .bluetooth import BluetoothUnavailableError
 from .const import CONF_MODEL, DOMAIN
 from .coordinator import GoveeDataUpdateCoordinator
-from .models import Model
+from .profiles import (
+    ProfileError,
+    async_get_profile_registry,
+    get_profile_registry,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -73,14 +77,8 @@ def _unique_id_from_address(address: str) -> str:
 
 def _model_from_name(name: str | None) -> str | None:
     """Infer a model from the two documented purifier name families."""
-    if not name:
-        return None
-    normalized = name.upper()
-    if normalized.startswith("GVH7124"):
-        return Model.H7124.value
-    if normalized.startswith("IHOMENT_H7129_"):
-        return Model.H7129.value
-    return None
+    profile = get_profile_registry().match_name(name)
+    return profile.model.value if profile is not None else None
 
 
 def _identity_cache(hass: HomeAssistant) -> dict[str, PurifierIdentity]:
@@ -541,10 +539,12 @@ async def _async_validate_purifier(
     name: str | None,
 ) -> None:
     """Connect and complete initialization before storing the entry."""
+    registry = await async_get_profile_registry(hass)
+    profile = registry.for_model(model)
     coordinator = GoveeDataUpdateCoordinator(
         hass,
         address=address,
-        model=Model(model),
+        profile=profile,
         name=name,
     )
     try:
@@ -563,12 +563,20 @@ class GoveeBleAirPurifierConfigFlow(ConfigFlow, domain=DOMAIN):
         """Initialize the flow."""
         self._manual_discoveries: tuple[DiscoveredPurifier, ...] | None = None
         self._unnamed_devices_seen = False
+        self._profiles_loaded = False
 
     @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Choose a currently discovered purifier without entering an address."""
+        if not self._profiles_loaded:
+            try:
+                await async_get_profile_registry(self.hass)
+            except ProfileError:
+                _LOGGER.exception("Bundled purifier model profiles are invalid")
+                return self.async_abort(reason="model_profile_invalid")
+            self._profiles_loaded = True
         if user_input is None:
             configured_ids = {
                 entry.unique_id

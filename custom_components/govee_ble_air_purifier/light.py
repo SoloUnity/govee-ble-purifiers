@@ -23,7 +23,8 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the purifier night-light entity."""
-    async_add_entities([GoveePurifierLight(entry)])
+    if entry.runtime_data.profile.capabilities.light:
+        async_add_entities([GoveePurifierLight(entry)])
 
 
 class GoveePurifierLight(GoveePurifierEntity, LightEntity):

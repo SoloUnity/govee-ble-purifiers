@@ -21,25 +21,11 @@ from bleak_retry_connector import (
 from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant
 
+from .profiles import DeviceProfile, Model
+
 _LOGGER = logging.getLogger(__name__)
 
-SERVICE_UUID = "00010203-0405-0607-0809-0a0b0c0d1910"
-NOTIFY_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b10"
-COMMAND_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b11"
-
-CONNECT_ATTEMPTS = 3
-CONNECTION_ATTEMPT_TIMEOUT = 45.0
-CONNECTION_ABORT_TIMEOUT = 5.0
-CONNECTION_DIAGNOSTIC_TIMEOUT = 1.0
-NOTIFICATION_SUBSCRIBE_TIMEOUT = 15.0
-GATT_WRITE_TIMEOUT = 10.0
-GATT_DISCONNECT_TIMEOUT = 5.0
-GATT_OPERATION_CANCEL_TIMEOUT = 1.0
-STALE_CONNECTION_CLEANUP_TIMEOUT = 5.0
-STALE_CONNECTION_CHECK_INTERVAL = 0.25
 RECENT_CONNECTION_FAILURE_LIMIT = 4
-ADVERTISEMENT_CHECK_INTERVAL = 0.25
-RECENT_CACHED_ADVERTISEMENT_MAX_AGE = 5.0
 
 NotificationCallback = Callable[[bytes], None]
 DisconnectCallback = Callable[[int], None]
@@ -97,9 +83,16 @@ class HomeAssistantBluetoothEnvironment:
     Home Assistant can then choose the currently best local adapter or proxy.
     """
 
-    def __init__(self, hass: HomeAssistant, address: str) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        address: str,
+        profile: DeviceProfile | None = None,
+    ) -> None:
         self._hass = hass
         self.address = address
+        self.profile = profile or DeviceProfile.for_model(Model.H7124)
+        self._timings = self.profile.timings
         self._advertisement_event = asyncio.Event()
         self._cancel_advertisement: Callable[[], None] | None = None
         self._last_callback_time: float | None = None
@@ -292,7 +285,10 @@ class HomeAssistantBluetoothEnvironment:
         )
         if service_info is None or not isinstance(advertisement_time, int | float):
             return None
-        if advertisement_time < started_at - RECENT_CACHED_ADVERTISEMENT_MAX_AGE:
+        if (
+            advertisement_time
+            < started_at - self._timings.recent_cached_advertisement_max_age
+        ):
             return None
 
         previous_time = self._last_selected_advertisement_time
@@ -387,7 +383,7 @@ class HomeAssistantBluetoothEnvironment:
             "timeout=%.1fs recent_cache_limit=%.1fs previous_age=%s",
             self.address,
             timeout,
-            RECENT_CACHED_ADVERTISEMENT_MAX_AGE,
+            self._timings.recent_cached_advertisement_max_age,
             self._selected_advertisement_age(),
         )
 
@@ -429,7 +425,7 @@ class HomeAssistantBluetoothEnvironment:
 
                 try:
                     async with asyncio.timeout(
-                        min(ADVERTISEMENT_CHECK_INTERVAL, remaining)
+                        min(self._timings.advertisement_check_interval, remaining)
                     ):
                         await self._advertisement_event.wait()
                 except TimeoutError:
@@ -452,8 +448,15 @@ class HomeAssistantBluetoothEnvironment:
 class GattTransport:
     """Own one active GATT connection and transport opaque 20-byte frames."""
 
-    def __init__(self, *, name: str) -> None:
+    def __init__(
+        self,
+        *,
+        name: str,
+        profile: DeviceProfile | None = None,
+    ) -> None:
         self.name = name
+        self.profile = profile or DeviceProfile.for_model(Model.H7124)
+        self._timings = self.profile.timings
         self._client: BleakClientWithServiceCache | None = None
         self._connecting_client: BleakClientWithServiceCache | None = None
         self._connecting_address: str | None = None
@@ -578,7 +581,9 @@ class GattTransport:
                 self._gatt_operation_timeouts += 1
                 self._last_gatt_operation_timed_out = True
                 task.cancel()
-                await asyncio.wait((task,), timeout=GATT_OPERATION_CANCEL_TIMEOUT)
+                await asyncio.wait(
+                    (task,), timeout=self._timings.gatt_operation_cancel_timeout
+                )
                 elapsed = max(0.0, time.monotonic() - started)
                 detail = (
                     f"operation={operation}; stage={self._connection_stage}; "
@@ -592,7 +597,9 @@ class GattTransport:
         except asyncio.CancelledError:
             if not task.done():
                 task.cancel()
-                await asyncio.wait((task,), timeout=GATT_OPERATION_CANCEL_TIMEOUT)
+                await asyncio.wait(
+                    (task,), timeout=self._timings.gatt_operation_cancel_timeout
+                )
             raise
         except Exception as err:
             if self._last_gatt_operation_error is None:
@@ -684,7 +691,9 @@ class GattTransport:
                 diagnostics["service_error"] = exception_detail(err)
 
         try:
-            async with asyncio.timeout(CONNECTION_DIAGNOSTIC_TIMEOUT):
+            async with asyncio.timeout(
+                self._timings.connection_diagnostic_timeout
+            ):
                 connected_devices = await get_connected_devices(device)
             diagnostics["bluez_connection_count"] = len(connected_devices)
         except Exception as err:  # noqa: BLE001
@@ -709,7 +718,7 @@ class GattTransport:
             client.is_connected,
         )
         try:
-            async with asyncio.timeout(CONNECTION_ABORT_TIMEOUT):
+            async with asyncio.timeout(self._timings.connection_abort_timeout):
                 await client.disconnect()
         except Exception as err:
             _LOGGER.debug(
@@ -747,10 +756,15 @@ class GattTransport:
         self._last_address_cleanup_remaining = None
         started = time.monotonic()
         try:
-            async with asyncio.timeout(STALE_CONNECTION_CLEANUP_TIMEOUT):
+            async with asyncio.timeout(
+                self._timings.stale_connection_cleanup_timeout
+            ):
                 await async_close_stale_connections(address, reason=reason)
                 if device is not None:
-                    deadline = time.monotonic() + STALE_CONNECTION_CLEANUP_TIMEOUT
+                    deadline = (
+                        time.monotonic()
+                        + self._timings.stale_connection_cleanup_timeout
+                    )
                     while True:
                         connected_devices = await get_connected_devices(device)
                         remaining = len(connected_devices)
@@ -762,7 +776,9 @@ class GattTransport:
                                 f"BlueZ still reports {remaining} connection(s) "
                                 f"for {address}"
                             )
-                        await asyncio.sleep(STALE_CONNECTION_CHECK_INTERVAL)
+                        await asyncio.sleep(
+                            self._timings.stale_connection_check_interval
+                        )
         except Exception as err:
             self._address_cleanup_failures += 1
             self._last_address_cleanup_error = exception_detail(err)
@@ -830,8 +846,8 @@ class GattTransport:
             device.address,
             generation,
             self._connection_attempts,
-            CONNECT_ATTEMPTS,
-            CONNECTION_ATTEMPT_TIMEOUT,
+            self._timings.connect_attempts,
+            self._timings.connection_attempt_timeout,
         )
 
         def create_tracked_client(
@@ -851,13 +867,14 @@ class GattTransport:
                     disconnected_callback=lambda connected_client: (
                         self._disconnected_from_bleak(connected_client, generation)
                     ),
-                    max_attempts=CONNECT_ATTEMPTS,
+                    max_attempts=self._timings.connect_attempts,
                 ),
                 name=f"govee-connect-{device.address}",
             )
             try:
                 done, _ = await asyncio.wait(
-                    (connection_task,), timeout=CONNECTION_ATTEMPT_TIMEOUT
+                    (connection_task,),
+                    timeout=self._timings.connection_attempt_timeout,
                 )
                 if not done:
                     self._last_connection_timeout_diagnostics = (
@@ -879,7 +896,7 @@ class GattTransport:
             detail = (
                 f"attempt={self._connection_attempts}; "
                 f"stage={self._connection_stage}; elapsed={self._elapsed():.3f}s; "
-                f"deadline={CONNECTION_ATTEMPT_TIMEOUT:.1f}s; "
+                f"deadline={self._timings.connection_attempt_timeout:.1f}s; "
                 f"pre_return_disconnects={self._pre_return_disconnects}; "
                 "cause=TimeoutError: connection attempt deadline exceeded"
             )
@@ -993,10 +1010,12 @@ class GattTransport:
         return generation
 
     def _resolve_characteristics(self, services: BleakGATTServiceCollection) -> None:
-        service = services.get_service(SERVICE_UUID)
-        notify_characteristic = services.get_characteristic(NOTIFY_CHARACTERISTIC_UUID)
+        service = services.get_service(self.profile.bluetooth.service_uuid)
+        notify_characteristic = services.get_characteristic(
+            self.profile.bluetooth.notify_uuid
+        )
         command_characteristic = services.get_characteristic(
-            COMMAND_CHARACTERISTIC_UUID
+            self.profile.bluetooth.write_uuid
         )
         if (
             service is None
@@ -1048,12 +1067,12 @@ class GattTransport:
         _LOGGER.debug(
             "Subscribing to purifier notifications: generation=%d characteristic=%s",
             generation,
-            NOTIFY_CHARACTERISTIC_UUID,
+            self.profile.bluetooth.notify_uuid,
         )
         try:
             await self._async_gatt_operation(
                 "start_notify",
-                NOTIFICATION_SUBSCRIBE_TIMEOUT,
+                self._timings.notification_subscribe_timeout,
                 lambda: client.start_notify(
                     self._notify_characteristic, notification_received
                 ),
@@ -1088,7 +1107,7 @@ class GattTransport:
             try:
                 await self._async_gatt_operation(
                     "write_gatt_char",
-                    GATT_WRITE_TIMEOUT,
+                    self._timings.gatt_write_timeout,
                     lambda: client.write_gatt_char(
                         self._command_characteristic, data, response=False
                     ),
@@ -1135,7 +1154,7 @@ class GattTransport:
             if client.is_connected:
                 await self._async_gatt_operation(
                     "disconnect",
-                    GATT_DISCONNECT_TIMEOUT,
+                    self._timings.gatt_disconnect_timeout,
                     client.disconnect,
                 )
         except Exception as err:

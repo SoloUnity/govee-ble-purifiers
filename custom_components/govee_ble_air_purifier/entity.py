@@ -15,7 +15,7 @@ from homeassistant.helpers.device_registry import (
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import GoveeConfigEntry
-from .const import CONF_MODEL, DOMAIN, MANUFACTURER
+from .const import DOMAIN
 from .coordinator import GoveeDataUpdateCoordinator
 
 
@@ -38,8 +38,8 @@ class GoveePurifierEntity(CoordinatorEntity[GoveeDataUpdateCoordinator]):
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, stable_address)},
             connections={(CONNECTION_BLUETOOTH, address)},
-            manufacturer=MANUFACTURER,
-            model=entry.data[CONF_MODEL],
+            manufacturer=self.coordinator.profile.identity.manufacturer,
+            model=self.coordinator.profile.model.value,
             name=entry.title,
         )
 

@@ -66,8 +66,15 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up purifier sensors."""
+    capabilities = entry.runtime_data.profile.capabilities
+    supported = {
+        "pm25": capabilities.pm25,
+        "filter_life": capabilities.filter_life,
+    }
     async_add_entities(
-        GoveePurifierSensor(entry, description) for description in SENSORS
+        GoveePurifierSensor(entry, description)
+        for description in SENSORS
+        if supported[description.key]
     )
 
 

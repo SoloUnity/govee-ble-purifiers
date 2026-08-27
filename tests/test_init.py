@@ -3,7 +3,9 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
 from homeassistant.const import CONF_ADDRESS, EVENT_HOMEASSISTANT_STOP
+from homeassistant.exceptions import ConfigEntryError
 
 from custom_components.govee_ble_air_purifier import (
     async_remove_entry,
@@ -12,6 +14,7 @@ from custom_components.govee_ble_air_purifier import (
 )
 from custom_components.govee_ble_air_purifier.const import CONF_MODEL, PLATFORMS
 from custom_components.govee_ble_air_purifier.models import Model
+from custom_components.govee_ble_air_purifier.profiles import ProfileError
 
 
 def _setup_objects() -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace]:
@@ -100,6 +103,51 @@ async def test_setup_cleanup_failure_does_not_prevent_normal_connection() -> Non
 
     coordinator.async_start.assert_awaited_once_with()
     coordinator.async_wait_until_ready.assert_not_awaited()
+
+
+async def test_invalid_profile_stops_setup_before_bluetooth_work() -> None:
+    """A bundled artifact failure is permanent and cannot start recovery."""
+    _coordinator, hass, entry = _setup_objects()
+
+    with (
+        patch(
+            "custom_components.govee_ble_air_purifier.async_get_profile_registry",
+            new_callable=AsyncMock,
+            side_effect=ProfileError("invalid bundled request frame"),
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier._async_cleanup_address",
+            new_callable=AsyncMock,
+        ) as cleanup,
+        patch(
+            "custom_components.govee_ble_air_purifier.GoveeDataUpdateCoordinator"
+        ) as coordinator_class,
+    ):
+        with pytest.raises(ConfigEntryError, match="Bundled purifier model profiles"):
+            await async_setup_entry(hass, entry)  # type: ignore[arg-type]
+
+    cleanup.assert_not_awaited()
+    coordinator_class.assert_not_called()
+
+
+async def test_version_one_entry_data_is_not_mutated_during_setup() -> None:
+    """Existing H7124/H7129 model values remain migration-free."""
+    coordinator, hass, entry = _setup_objects()
+    original_data = dict(entry.data)
+
+    with (
+        patch(
+            "custom_components.govee_ble_air_purifier.async_close_stale_connections",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.GoveeDataUpdateCoordinator",
+            return_value=coordinator,
+        ),
+    ):
+        assert await async_setup_entry(hass, entry)  # type: ignore[arg-type]
+
+    assert entry.data == original_data
 
 
 async def test_unload_shuts_down_after_platforms_unload() -> None:

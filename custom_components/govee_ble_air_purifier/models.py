@@ -7,50 +7,19 @@ is shared by the protocol codec, the reliable client, and unit tests.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
 
-
-class Model(StrEnum):
-    """Supported purifier models."""
-
-    H7124 = "H7124"
-    H7129 = "H7129"
-
-
-class SecurityMode(StrEnum):
-    """Application-frame security used by a model."""
-
-    PLAINTEXT = "plaintext"
-    H7129_SESSION = "h7129_session"
-
-
-class FanMode(StrEnum):
-    """Fan modes whose wire representation is documented."""
-
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-    SLEEP = "sleep"
-    AUTO = "auto"
-    TURBO = "turbo"
-
-
-@dataclass(frozen=True, slots=True)
-class DeviceProfile:
-    """Model-specific protocol parameters."""
-
-    model: Model
-    security: SecurityMode
-    auto_parameter: int
-
-    @classmethod
-    def for_model(cls, model: Model | str) -> DeviceProfile:
-        """Build the documented profile for *model*."""
-
-        model = Model(model)
-        if model is Model.H7124:
-            return cls(model, SecurityMode.PLAINTEXT, 0x14)
-        return cls(model, SecurityMode.H7129_SESSION, 0x12)
+from .profiles import (
+    DeviceProfile as DeviceProfile,
+)
+from .profiles import (
+    FanMode as FanMode,
+)
+from .profiles import (
+    Model as Model,
+)
+from .profiles import (
+    SecurityMode as SecurityMode,
+)
 
 
 @dataclass(frozen=True, slots=True)

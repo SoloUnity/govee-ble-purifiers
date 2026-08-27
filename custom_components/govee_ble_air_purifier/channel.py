@@ -16,14 +16,9 @@ from .crypto import (
     extract_session_key,
 )
 from .frame import FrameError, build_frame, validate_frame
+from .profiles import DeviceProfile, Model
 
 _LOGGER = logging.getLogger(__name__)
-
-NEGOTIATION_ATTEMPTS = 3
-NEGOTIATION_RETRY_INTERVAL = 5.0
-NEGOTIATION_PHASE_TIMEOUT = 15.0
-NEGOTIATION_STEP_DELAY = 0.001
-FIRST_APPLICATION_DELAY = 0.003
 
 PlaintextCallback = Callable[[bytes], None]
 
@@ -52,10 +47,14 @@ class SecureChannel:
     """Transform plaintext application frames over an opaque BLE transport."""
 
     def __init__(
-        self, transport: FrameTransport, plaintext_callback: PlaintextCallback
+        self,
+        transport: FrameTransport,
+        plaintext_callback: PlaintextCallback,
+        profile: DeviceProfile,
     ) -> None:
         self._transport = transport
         self._plaintext_callback = plaintext_callback
+        self.profile = profile
         self._ready = False
 
     @property
@@ -76,6 +75,18 @@ class SecureChannel:
 class PlaintextChannel(SecureChannel):
     """Pass validated H7124 application frames through unchanged."""
 
+    def __init__(
+        self,
+        transport: FrameTransport,
+        plaintext_callback: PlaintextCallback,
+        profile: DeviceProfile | None = None,
+    ) -> None:
+        super().__init__(
+            transport,
+            plaintext_callback,
+            profile or DeviceProfile.for_model(Model.H7124),
+        )
+
     async def async_establish(self) -> None:
         _LOGGER.debug("Establishing H7124 plaintext channel")
         self.invalidate()
@@ -83,10 +94,10 @@ class PlaintextChannel(SecureChannel):
         self._ready = True
         # The captured H7124 connection sent its first initialization request
         # about 3 ms after notifications were enabled.
-        await asyncio.sleep(FIRST_APPLICATION_DELAY)
+        await asyncio.sleep(self.profile.channel.first_application_delay)
         _LOGGER.debug(
             "H7124 plaintext channel ready after %.3f-second application delay",
-            FIRST_APPLICATION_DELAY,
+            self.profile.channel.first_application_delay,
         )
 
     async def async_send(self, plaintext: bytes) -> None:
@@ -115,9 +126,18 @@ class H7129SessionChannel(SecureChannel):
     """Negotiate and own one H7129 session key per BLE connection."""
 
     def __init__(
-        self, transport: FrameTransport, plaintext_callback: PlaintextCallback
+        self,
+        transport: FrameTransport,
+        plaintext_callback: PlaintextCallback,
+        profile: DeviceProfile | None = None,
     ) -> None:
-        super().__init__(transport, plaintext_callback)
+        super().__init__(
+            transport,
+            plaintext_callback,
+            profile or DeviceProfile.for_model(Model.H7129),
+        )
+        if self.profile.channel.negotiation is None:
+            raise ValueError("encrypted channel profile requires negotiation policy")
         self._session_key: bytes | None = None
         self._phase = 0
         self._phase_future: asyncio.Future[bytes | None] | None = None
@@ -136,7 +156,9 @@ class H7129SessionChannel(SecureChannel):
 
             # Captures place e7-02 1-2 ms after e7-01. Yielding for one
             # millisecond preserves that ordering without busy waiting.
-            await asyncio.sleep(NEGOTIATION_STEP_DELAY)
+            negotiation = self.profile.channel.negotiation
+            assert negotiation is not None
+            await asyncio.sleep(negotiation.step_delay)
             failed_phase = 0x02
             await self._exchange_step(0x02)
         except (TimeoutError, ValueError, ConnectionError) as err:
@@ -152,11 +174,11 @@ class H7129SessionChannel(SecureChannel):
 
         self._phase = 3
         self._ready = True
-        await asyncio.sleep(FIRST_APPLICATION_DELAY)
+        await asyncio.sleep(self.profile.channel.first_application_delay)
         _LOGGER.debug(
             "H7129 session channel ready after %.3f-second application delay; "
             "session key established but intentionally not logged",
-            FIRST_APPLICATION_DELAY,
+            self.profile.channel.first_application_delay,
         )
 
         # ee-aa is legal under the communication key during negotiation. It
@@ -173,9 +195,11 @@ class H7129SessionChannel(SecureChannel):
         request = create_negotiation_frame(step)
         wire_request = encrypt_frame(request, COMMUNICATION_KEY)
         started = loop.time()
-        deadline = started + NEGOTIATION_PHASE_TIMEOUT
+        negotiation = self.profile.channel.negotiation
+        assert negotiation is not None
+        deadline = started + negotiation.phase_timeout
         try:
-            for attempt in range(1, NEGOTIATION_ATTEMPTS + 1):
+            for attempt in range(1, negotiation.attempts + 1):
                 if future.done():
                     response = self._phase_response(future)
                     break
@@ -189,7 +213,7 @@ class H7129SessionChannel(SecureChannel):
                     "padding and keys are not logged",
                     step,
                     attempt,
-                    NEGOTIATION_ATTEMPTS,
+                    negotiation.attempts,
                 )
                 # Reuse the exact encrypted request for every attempt. A late
                 # response to any send may therefore complete this one phase.
@@ -201,7 +225,7 @@ class H7129SessionChannel(SecureChannel):
                     break
 
                 wait_for = min(
-                    NEGOTIATION_RETRY_INTERVAL,
+                    negotiation.retry_interval,
                     max(0.0, deadline - loop.time()),
                 )
                 if wait_for <= 0:
@@ -215,7 +239,7 @@ class H7129SessionChannel(SecureChannel):
                     "after attempt=%d/%d elapsed=%.3fs",
                     step,
                     attempt,
-                    NEGOTIATION_ATTEMPTS,
+                    negotiation.attempts,
                     loop.time() - started,
                 )
             else:
@@ -227,13 +251,13 @@ class H7129SessionChannel(SecureChannel):
                 step,
                 loop.time() - started,
                 attempt,
-                NEGOTIATION_ATTEMPTS,
+                negotiation.attempts,
             )
             return response
         except TimeoutError as err:
             raise TimeoutError(
-                f"no matching response after {NEGOTIATION_ATTEMPTS} attempt(s) "
-                f"within {NEGOTIATION_PHASE_TIMEOUT:.1f} seconds"
+                f"no matching response after {negotiation.attempts} attempt(s) "
+                f"within {negotiation.phase_timeout:.1f} seconds"
             ) from err
         finally:
             if self._phase_future is future:

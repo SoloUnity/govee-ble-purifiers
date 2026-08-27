@@ -19,6 +19,9 @@ Use the existing documentation as the source of truth:
   — general Home Assistant and HACS requirements.
 - [Implementation plans](docs/plans/README.md) — ordered proposals for future
   work; planned behavior is not current behavior until implemented and released.
+- [Bundled model profiles](docs/model-profiles.md) and
+  [their schema](custom_components/govee_ble_air_purifier/model_profiles/schema.json)
+  — ownership, inheritance, validation, selection, and safe extension policy.
 
 Inspect the implementation and tests as well as the documentation. When they
 disagree, identify the discrepancy rather than silently choosing one.
@@ -33,6 +36,8 @@ architecture policy, implementation, and tests for the released contract.
   Assistant entities.
 - H7124 uses the plaintext protocol. H7129 uses a newly negotiated encrypted
   session for every connection.
+- Resolve only exact, validated bundled profiles. Invalid profile artifacts fail
+  before Bluetooth work and never fall back to either baseline.
 - Home Assistant owns Bluetooth scanning and route selection. Do not create a
   private scanner or permanently bind a device to one adapter or proxy.
 - Treat disconnects, weak signals, unplugged devices, adapter resets, and
@@ -44,6 +49,9 @@ architecture policy, implementation, and tests for the released contract.
 - Preserve command serialization, bounded sends, state reconciliation,
   advertisement-aware recovery, and defensive address-level cleanup.
 - Never log H7129 keys, negotiation secrets, or decrypted sensitive material.
+- Profile values require the same trace or runtime evidence as Python protocol
+  values. Never add secrets, executable content, imports, user paths, or remote
+  profile loading.
 
 Detailed timing and retry policies belong in the linked Bluetooth architecture
 document.
@@ -81,6 +89,8 @@ The protocol document is evidence-only.
 - Keep changes focused on the requested behavior.
 - Add or update regression tests for every protocol, recovery, setup, lifecycle,
   or command-handling change.
+- Keep profile schema/semantic validation and H7124/H7129 equivalence tests in
+  step with every profile or strategy change.
 - Prefer deterministic event-driven recovery over simply increasing every
   timeout.
 - Keep stale callbacks, responses, and partial state scoped to their connection
@@ -106,6 +116,7 @@ Run:
 
 ```bash
 env PYTHONPATH=. .venv/bin/ruff check .
+env PYTHONPATH=. .venv/bin/python scripts/validate_model_profiles.py
 env PYTHONPATH=. .venv/bin/pytest -q
 python3 -m compileall custom_components tests
 git diff --check

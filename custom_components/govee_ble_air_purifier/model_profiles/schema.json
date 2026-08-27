@@ -1,0 +1,211 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/SoloUnity/govee-ble-purifiers/model-profile.schema.json",
+  "title": "Govee BLE Air Purifier bundled model profile",
+  "$defs": {
+    "hex": {"type": "string", "pattern": "^(?:[0-9a-f]{2})(?: [0-9a-f]{2})*$"},
+    "identity": {
+      "type": "object",
+      "properties": {
+        "manufacturer": {"type": "string", "minLength": 1},
+        "model": {"type": ["string", "null"], "enum": ["H7124", "H7129", null]},
+        "display_name": {"type": "string", "minLength": 1},
+        "support_status": {"enum": ["baseline", "verified"]},
+        "advertised_name_prefixes": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+      },
+      "additionalProperties": false
+    },
+    "bluetooth": {
+      "type": "object",
+      "properties": {
+        "service_uuid": {"type": "string", "format": "uuid"},
+        "notify_uuid": {"type": "string", "format": "uuid"},
+        "write_uuid": {"type": "string", "format": "uuid"}
+      },
+      "additionalProperties": false
+    },
+    "negotiation": {
+      "type": "object",
+      "properties": {
+        "attempts": {"type": "integer", "minimum": 1, "maximum": 3},
+        "retry_interval": {"type": "number", "minimum": 0, "maximum": 15},
+        "phase_timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 15},
+        "step_delay": {"type": "number", "minimum": 0, "maximum": 1}
+      },
+      "additionalProperties": false
+    },
+    "channel": {
+      "type": "object",
+      "properties": {
+        "strategy": {"enum": ["plaintext", "h7129_session"]},
+        "first_application_delay": {"type": "number", "minimum": 0, "maximum": 1},
+        "negotiation": {"oneOf": [{"$ref": "#/$defs/negotiation"}, {"type": "null"}]}
+      },
+      "additionalProperties": false
+    },
+    "matcher": {
+      "type": "object",
+      "properties": {
+        "kind": {"enum": ["exact", "value_byte", "zero_payload", "prefix", "prefix_selector", "fragments", "h7129_metadata", "fields"]},
+        "prefix": {"$ref": "#/$defs/hex"},
+        "selector": {"$ref": "#/$defs/hex"},
+        "exact": {"$ref": "#/$defs/hex"},
+        "exact_alternatives": {"type": "array", "items": {"$ref": "#/$defs/hex"}},
+        "fragments": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 255}},
+        "allowed_prefixes": {"type": "array", "items": {"$ref": "#/$defs/hex"}},
+        "expected_fields": {"type": "array", "items": {"type": "array", "prefixItems": [{"type": "integer", "minimum": 0, "maximum": 18}, {"type": "integer", "minimum": 0, "maximum": 255}], "items": false, "minItems": 2, "maxItems": 2}},
+        "allowed_values": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 255}}
+      },
+      "additionalProperties": false
+    },
+    "request": {
+      "type": "object",
+      "properties": {
+        "name": {"type": "string", "pattern": "^[a-z0-9]+(?:_[a-z0-9]+)*$"},
+        "frame": {"$ref": "#/$defs/hex"},
+        "response": {"$ref": "#/$defs/matcher"}
+      },
+      "additionalProperties": false
+    },
+    "command": {
+      "type": "object",
+      "properties": {
+        "strategy": {"type": "string", "minLength": 1},
+        "prefix": {"$ref": "#/$defs/hex"}
+      },
+      "required": ["strategy", "prefix"],
+      "additionalProperties": false
+    },
+    "commands": {
+      "type": "object",
+      "properties": {
+        "power": {"$ref": "#/$defs/command"},
+        "fan_mode": {"$ref": "#/$defs/command"},
+        "night_light_power": {"$ref": "#/$defs/command"},
+        "night_light_brightness": {"$ref": "#/$defs/command"},
+        "night_light_color": {"$ref": "#/$defs/command"}
+      },
+      "required": ["power", "fan_mode", "night_light_power", "night_light_brightness", "night_light_color"],
+      "additionalProperties": false
+    },
+    "protocol": {
+      "type": "object",
+      "properties": {
+        "codec": {"const": "govee_20_byte_v1"},
+        "checksum": {"const": "xor_0_18"},
+        "frame_size": {"const": 20},
+        "auto_parameter": {"type": "integer", "minimum": 0, "maximum": 255},
+        "startup_mode_strategy": {"enum": ["h7124_selector_00", "h7129_selector_pair"]},
+        "commands": {"$ref": "#/$defs/commands"},
+        "request_catalog": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/request"}},
+        "initialization_order": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "refresh_order": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "essential_request": {"type": "string"},
+        "periodic_request": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "capabilities": {
+      "type": "object",
+      "properties": {
+        "power": {"type": "boolean"},
+        "fan": {"type": "boolean"},
+        "light": {"type": "boolean"},
+        "pm25": {"type": "boolean"},
+        "filter_life": {"type": "boolean"},
+        "unsolicited_updates": {"type": "boolean"},
+        "refresh": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "timings": {
+      "type": "object",
+      "properties": {
+        "connect_attempts": {"type": "integer", "minimum": 1, "maximum": 3},
+        "connection_attempt_timeout": {"type": "number", "minimum": 0, "maximum": 45},
+        "connection_abort_timeout": {"type": "number", "minimum": 0},
+        "connection_diagnostic_timeout": {"type": "number", "minimum": 0},
+        "notification_subscribe_timeout": {"type": "number", "minimum": 0, "maximum": 15},
+        "gatt_write_timeout": {"type": "number", "minimum": 0, "maximum": 15},
+        "gatt_disconnect_timeout": {"type": "number", "minimum": 0},
+        "gatt_operation_cancel_timeout": {"type": "number", "minimum": 0},
+        "stale_connection_cleanup_timeout": {"type": "number", "minimum": 0},
+        "stale_connection_check_interval": {"type": "number", "minimum": 0},
+        "advertisement_check_interval": {"type": "number", "minimum": 0},
+        "recent_cached_advertisement_max_age": {"type": "number", "minimum": 0},
+        "fresh_advertisement_timeout": {"type": "number", "minimum": 0},
+        "transaction_timeout": {"type": "number", "minimum": 0, "maximum": 15},
+        "initialization_attempts": {"type": "integer", "minimum": 1, "maximum": 3},
+        "essential_initialization_max_batches": {"type": "integer", "minimum": 1, "maximum": 3},
+        "initialization_retry_delay": {"type": "number", "minimum": 0},
+        "periodic_poll_attempts": {"type": "integer", "minimum": 1, "maximum": 3},
+        "refresh_attempts": {"type": "integer", "minimum": 1, "maximum": 3},
+        "command_send_attempts": {"type": "integer", "minimum": 1, "maximum": 3},
+        "command_deadline": {"type": "number", "minimum": 0, "maximum": 120},
+        "startup_timeout": {"type": "number", "minimum": 0, "maximum": 300},
+        "between_request_delay": {"type": "number", "minimum": 0},
+        "poll_interval": {"type": "number", "minimum": 0},
+        "initial_poll_delay": {"type": "number", "minimum": 0},
+        "backoff_initial": {"type": "number", "minimum": 0},
+        "backoff_max": {"type": "number", "minimum": 0, "maximum": 60},
+        "backoff_reset_after": {"type": "number", "minimum": 0},
+        "recent_advertisement_backoff_max": {"type": "number", "minimum": 0},
+        "advertisement_settle_delay": {"type": "number", "minimum": 0},
+        "recovery_storm_window": {"type": "number", "minimum": 0, "maximum": 300},
+        "recovery_storm_failure_threshold": {"type": "integer", "minimum": 1},
+        "recovery_storm_advertisement_threshold": {"type": "integer", "minimum": 1},
+        "recovery_storm_initial_floor": {"type": "number", "minimum": 0},
+        "recovery_storm_max_floor": {"type": "number", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "customAuto": {
+      "type": "object",
+      "properties": {
+        "modes": {"type": "array", "prefixItems": [{"const": "sleep"}, {"const": "low"}, {"const": "medium"}, {"const": "high"}, {"const": "turbo"}], "items": false, "minItems": 5, "maxItems": 5},
+        "pm25_boundaries": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 999}, "minItems": 4, "maxItems": 4},
+        "upshift_confirmation_seconds": {"type": "integer", "minimum": 0, "maximum": 300},
+        "downshift_delays_minutes": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 1440}, "minItems": 4, "maxItems": 4}
+      },
+      "additionalProperties": false
+    },
+    "sections": {
+      "type": "object",
+      "properties": {
+        "schema_version": {"const": 1},
+        "profile_id": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+        "identity": {"$ref": "#/$defs/identity"},
+        "bluetooth": {"$ref": "#/$defs/bluetooth"},
+        "channel": {"$ref": "#/$defs/channel"},
+        "protocol": {"$ref": "#/$defs/protocol"},
+        "capabilities": {"$ref": "#/$defs/capabilities"},
+        "timings": {"$ref": "#/$defs/timings"},
+        "custom_auto_defaults": {"$ref": "#/$defs/customAuto"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "oneOf": [
+    {
+      "allOf": [{"$ref": "#/$defs/sections"}],
+      "required": ["schema_version", "profile_id", "identity", "bluetooth", "channel", "protocol", "capabilities", "timings", "custom_auto_defaults"]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "schema_version": {"const": 1},
+        "profile_id": {"enum": ["h7124", "h7129"]},
+        "extends": {"enum": ["default", "default-encrypted"]},
+        "identity": {"$ref": "#/$defs/identity"},
+        "bluetooth": {"$ref": "#/$defs/bluetooth"},
+        "channel": {"$ref": "#/$defs/channel"},
+        "protocol": {"$ref": "#/$defs/protocol"},
+        "capabilities": {"$ref": "#/$defs/capabilities"},
+        "timings": {"$ref": "#/$defs/timings"},
+        "custom_auto_defaults": {"$ref": "#/$defs/customAuto"}
+      },
+      "required": ["schema_version", "profile_id", "extends"],
+      "additionalProperties": false
+    }
+  ]
+}

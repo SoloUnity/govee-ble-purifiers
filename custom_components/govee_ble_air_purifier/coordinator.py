@@ -11,9 +11,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .bluetooth import GattTransport, HomeAssistantBluetoothEnvironment
 from .client import PurifierClientError, ReliablePurifierClient
 from .models import (
-    DeviceProfile,
     FanMode,
-    Model,
     ProtocolCommand,
     PurifierState,
     SetFanMode,
@@ -22,6 +20,7 @@ from .models import (
     SetNightLightPower,
     SetPower,
 )
+from .profiles import DeviceProfile
 from .protocol import GoveePurifierProtocol
 
 _LOGGER = logging.getLogger(__name__)
@@ -35,13 +34,13 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
         hass: HomeAssistant,
         *,
         address: str,
-        model: Model,
+        profile: DeviceProfile,
         name: str | None = None,
     ) -> None:
         self.address = address
-        self.model = Model(model)
-        self.profile = DeviceProfile.for_model(self.model)
-        self.name = name or f"Govee {self.model.value}"
+        self.profile = profile
+        self.model = profile.model
+        self.name = name or profile.identity.display_name
 
         super().__init__(
             hass,
@@ -53,8 +52,8 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
         self._shutdown = False
         self._client_available = False
 
-        environment = HomeAssistantBluetoothEnvironment(hass, address)
-        transport = GattTransport(name=self.name)
+        environment = HomeAssistantBluetoothEnvironment(hass, address, profile)
+        transport = GattTransport(name=self.name, profile=profile)
         protocol = GoveePurifierProtocol(self.profile)
         self.client = ReliablePurifierClient(
             environment=environment,

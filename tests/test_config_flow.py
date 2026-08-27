@@ -24,6 +24,7 @@ from custom_components.govee_ble_air_purifier.config_flow import (
     _model_from_name,
 )
 from custom_components.govee_ble_air_purifier.const import CONF_MODEL, DOMAIN
+from custom_components.govee_ble_air_purifier.profiles import ProfileError
 
 
 @pytest.fixture(autouse=True)
@@ -71,6 +72,32 @@ def _prepare_bluetooth_test_environment(
 
 
 pytestmark = pytest.mark.usefixtures("enable_custom_integrations")
+
+
+async def test_invalid_profile_aborts_before_setup_scan(
+    hass: HomeAssistant,
+) -> None:
+    """Broken bundled data is permanent and cannot start Bluetooth discovery."""
+    with (
+        patch.object(
+            config_flow_module,
+            "async_get_profile_registry",
+            new=AsyncMock(side_effect=ProfileError("bad profile")),
+        ),
+        patch.object(
+            config_flow_module,
+            "_async_discover_purifiers",
+            new_callable=AsyncMock,
+        ) as discover,
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": config_entries.SOURCE_USER},
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "model_profile_invalid"
+    discover.assert_not_awaited()
 
 
 async def test_explicit_validation_waits_for_ready_and_always_shuts_down(

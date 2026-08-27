@@ -1,8 +1,9 @@
 # Implementation Plans
 
-These documents describe proposed future work. They are not descriptions of
-current released behavior until their completion criteria have been implemented,
-tested, documented, and released.
+These documents describe ordered work. A plan's status line identifies whether
+it remains proposed or has been implemented in the working tree. It is not
+released behavior until its completion criteria are tested, documented, and
+included in a release.
 
 Implement the phases in order:
 

@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import replace
 
 import pytest
 
-from custom_components.govee_ble_air_purifier import channel as channel_module
 from custom_components.govee_ble_air_purifier.channel import (
     ChannelNotReadyError,
     H7129SessionChannel,
@@ -19,6 +19,20 @@ from custom_components.govee_ble_air_purifier.crypto import (
     encrypt_frame,
 )
 from custom_components.govee_ble_air_purifier.frame import build_frame
+from custom_components.govee_ble_air_purifier.profiles import DeviceProfile, Model
+
+
+def _h7129_profile(**timing_changes: float) -> DeviceProfile:
+    profile = DeviceProfile.for_model(Model.H7129)
+    negotiation = profile.channel.negotiation
+    assert negotiation is not None
+    return replace(
+        profile,
+        channel=replace(
+            profile.channel,
+            negotiation=replace(negotiation, **timing_changes),
+        ),
+    )
 
 
 class FakeTransport:
@@ -93,8 +107,6 @@ async def test_h7129_retries_same_negotiation_request_on_one_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A lost negotiation packet is retried without replacing the GATT link."""
-    monkeypatch.setattr(channel_module, "NEGOTIATION_RETRY_INTERVAL", 0.01)
-    monkeypatch.setattr(channel_module, "NEGOTIATION_PHASE_TIMEOUT", 0.03)
     session_key = b"0123456789abcdef"
 
     class DelayedTransport(FakeTransport):
@@ -114,7 +126,11 @@ async def test_h7129_retries_same_negotiation_request_on_one_connection(
                 )
 
     transport = DelayedTransport(session_key)
-    channel = H7129SessionChannel(transport, lambda _: None)  # type: ignore[arg-type]
+    channel = H7129SessionChannel(
+        transport,
+        lambda _: None,
+        _h7129_profile(retry_interval=0.01, phase_timeout=0.03),
+    )  # type: ignore[arg-type]
 
     await channel.async_establish()
 
@@ -128,9 +144,6 @@ async def test_h7129_disconnect_aborts_negotiation_without_more_sends(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Invalidating a dropped connection interrupts the open phase immediately."""
-    monkeypatch.setattr(channel_module, "NEGOTIATION_RETRY_INTERVAL", 60.0)
-    monkeypatch.setattr(channel_module, "NEGOTIATION_PHASE_TIMEOUT", 180.0)
-
     class SilentTransport:
         callback: Callable[[bytes], None] | None = None
         writes: list[bytes] = []
@@ -142,7 +155,11 @@ async def test_h7129_disconnect_aborts_negotiation_without_more_sends(
             self.writes.append(data)
 
     transport = SilentTransport()
-    channel = H7129SessionChannel(transport, lambda _: None)  # type: ignore[arg-type]
+    channel = H7129SessionChannel(
+        transport,
+        lambda _: None,
+        _h7129_profile(retry_interval=60.0, phase_timeout=180.0),
+    )  # type: ignore[arg-type]
     establish = asyncio.create_task(channel.async_establish())
     await asyncio.sleep(0)
 
@@ -158,8 +175,6 @@ async def test_h7129_disconnect_after_retry_has_no_orphaned_future_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A disconnect after a retry wakes only the owning negotiation task."""
-    monkeypatch.setattr(channel_module, "NEGOTIATION_RETRY_INTERVAL", 0.005)
-    monkeypatch.setattr(channel_module, "NEGOTIATION_PHASE_TIMEOUT", 1.0)
     session_key = b"0123456789abcdef"
 
     class SilentTransport:
@@ -185,7 +200,11 @@ async def test_h7129_disconnect_after_retry_has_no_orphaned_future_error(
                 self.retry_written.set()
 
     transport = SilentTransport()
-    channel = H7129SessionChannel(transport, lambda _: None)  # type: ignore[arg-type]
+    channel = H7129SessionChannel(
+        transport,
+        lambda _: None,
+        _h7129_profile(retry_interval=0.005, phase_timeout=1.0),
+    )  # type: ignore[arg-type]
     loop = asyncio.get_running_loop()
     previous_handler = loop.get_exception_handler()
     unexpected_contexts: list[dict[str, object]] = []
@@ -215,9 +234,6 @@ async def test_h7129_reconnects_only_after_phase_retry_budget_is_exhausted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A silent phase transmits three identical requests before it fails."""
-    monkeypatch.setattr(channel_module, "NEGOTIATION_RETRY_INTERVAL", 0.005)
-    monkeypatch.setattr(channel_module, "NEGOTIATION_PHASE_TIMEOUT", 0.015)
-
     class SilentTransport:
         writes: list[bytes]
 
@@ -231,7 +247,11 @@ async def test_h7129_reconnects_only_after_phase_retry_budget_is_exhausted(
             self.writes.append(data)
 
     transport = SilentTransport()
-    channel = H7129SessionChannel(transport, lambda _: None)  # type: ignore[arg-type]
+    channel = H7129SessionChannel(
+        transport,
+        lambda _: None,
+        _h7129_profile(retry_interval=0.005, phase_timeout=0.015),
+    )  # type: ignore[arg-type]
 
     with pytest.raises(NegotiationError, match=r"3 attempt\(s\)"):
         await channel.async_establish()

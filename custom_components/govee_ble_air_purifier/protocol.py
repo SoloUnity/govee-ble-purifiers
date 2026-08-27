@@ -32,6 +32,7 @@ from .models import (
     StartupFanModeEvent,
     UnknownEvent,
 )
+from .profiles import CommandDefinition, MatcherDefinition
 
 
 class ProtocolError(ValueError):
@@ -195,98 +196,19 @@ def _exact(frame: bytes) -> ResponseSpec:
     return ResponseSpec(ResponseKind.EXACT, exact=frame)
 
 
-def _request(
-    name: str,
-    content: bytes,
-    response: ResponseSpec | None = None,
-) -> RequestDescriptor:
-    frame = build_frame(content)
-    return RequestDescriptor(name, frame, response or _exact(frame))
-
-
-_BASE_INITIALIZATION_REQUESTS: tuple[RequestDescriptor, ...] = (
-    _request(
-        "capability_b2",
-        b"\x33\xb2",
-        ResponseSpec(
-            ResponseKind.VALUE_BYTE,
-            prefix=b"\x33\xb2",
-            allowed_values=(0x00, 0x01),
-        ),
-    ),
-    _request(
-        "capability_b5",
-        b"\x33\xb5",
-        ResponseSpec(ResponseKind.ZERO_PAYLOAD, prefix=b"\x33\xb5"),
-    ),
-    _request("device_state", b"\xaa\x01", _prefix(b"\xaa\x01")),
-    _request("mode_data_00", b"\xaa\x05\x00", _selector(b"\xaa\x05", b"\x00")),
-    _request("mode_data_01", b"\xaa\x05\x01", _selector(b"\xaa\x05", b"\x01")),
-    _request("mode_data_03", b"\xaa\x05\x03", _selector(b"\xaa\x05", b"\x03")),
-    _request("night_light_state", b"\xaa\x1b\x01", _selector(b"\xaa\x1b", b"\x01")),
-    _request("night_light_color", b"\xaa\x1b\x05", _selector(b"\xaa\x1b", b"\x05")),
-    _request("capability_1e_01_02", b"\xaa\x1e\x01\x02"),
-    _request("capability_10", b"\xaa\x10"),
-    _request("capability_08", b"\xaa\x08"),
-    _request("capability_26", b"\xaa\x26"),
-    _request("structured_16", b"\xaa\x16", _prefix(b"\xaa\x16")),
-    _request("capability_17", b"\xaa\x17"),
-    _request("air_quality", b"\xaa\x19", _prefix(b"\xaa\x19")),
-    _request("device_data_10", b"\xaa\x07\x10", _selector(b"\xaa\x07", b"\x10")),
-    _request("device_data_11", b"\xaa\x07\x11", _selector(b"\xaa\x07", b"\x11")),
-    _request("device_data_06", b"\xaa\x07\x06", _selector(b"\xaa\x07", b"\x06")),
-    _request("capability_07_20", b"\xaa\x07\x20"),
-    _request("capability_1f", b"\xaa\x1f"),
-    _request(
-        "metadata_01_02",
-        b"\xab\x01\x02",
-        ResponseSpec(ResponseKind.FRAGMENTS, fragments=(0x00,)),
-    ),
-    _request(
-        "metadata_01_05",
-        b"\xab\x01\x05",
-        ResponseSpec(ResponseKind.FRAGMENTS, fragments=(0x00, 0xFF)),
-    ),
-    _request(
-        "metadata_01_04",
-        b"\xab\x01\x04",
-        ResponseSpec(
-            ResponseKind.FRAGMENTS,
-            fragments=(0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0xFF),
-        ),
-    ),
-)
-
-_H7129_CAPABILITY_1E_REQUEST = _request(
-    "capability_1e_01_02",
-    b"\xaa\x1e\x01\x02",
-    _exact(build_frame(b"\xaa\x1e\x03\x01")),
-)
-
-_H7129_CAPABILITY_10_REQUEST = _request(
-    "capability_10",
-    b"\xaa\x10",
-    _exact(build_frame(b"\xaa\x10\x00\xff\xff\xff")),
-)
-
-_H7129_BASE_INITIALIZATION_REQUESTS = (
-    _BASE_INITIALIZATION_REQUESTS[:8]
-    + (_H7129_CAPABILITY_1E_REQUEST, _H7129_CAPABILITY_10_REQUEST)
-    + _BASE_INITIALIZATION_REQUESTS[10:]
-)
-
-_H7129_METADATA_REQUEST = _request(
-    "metadata_02_02_00_01",
-    b"\xab\x02\x02\x00\x01",
-    ResponseSpec(ResponseKind.H7129_METADATA),
-)
-
-# The documented active-session ee-aa refresh omits the initial 33-b2 and the
-# aa-07/aa-1f/ab metadata tail, and begins with 33-b5.
-_REFRESH_REQUESTS = _BASE_INITIALIZATION_REQUESTS[1:15]
-_H7129_REFRESH_REQUESTS = _H7129_BASE_INITIALIZATION_REQUESTS[1:15]
-
-DEVICE_STATE_POLL = _BASE_INITIALIZATION_REQUESTS[2]
+def _response_spec(definition: MatcherDefinition) -> ResponseSpec:
+    """Translate one validated closed matcher definition to runtime rules."""
+    return ResponseSpec(
+        kind=ResponseKind(definition.kind),
+        prefix=definition.prefix,
+        selector=definition.selector,
+        exact=definition.exact,
+        exact_alternatives=definition.exact_alternatives,
+        fragments=definition.fragments,
+        allowed_prefixes=definition.allowed_prefixes,
+        expected_fields=definition.expected_fields,
+        allowed_values=definition.allowed_values,
+    )
 
 
 class GoveePurifierProtocol:
@@ -294,25 +216,34 @@ class GoveePurifierProtocol:
 
     def __init__(self, profile: DeviceProfile) -> None:
         self.profile = profile
+        self._requests = {
+            name: RequestDescriptor(
+                definition.name,
+                definition.frame,
+                _response_spec(definition.response),
+            )
+            for name, definition in profile.protocol.request_catalog.items()
+        }
 
     def initialization_requests(self) -> tuple[RequestDescriptor, ...]:
         """Return the official app's documented 23/24 request sweep."""
 
-        if self.profile.model.value == "H7129":
-            return _H7129_BASE_INITIALIZATION_REQUESTS + (_H7129_METADATA_REQUEST,)
-        return _BASE_INITIALIZATION_REQUESTS
+        return tuple(
+            self._requests[name]
+            for name in self.profile.protocol.initialization_order
+        )
 
     def refresh_requests(self) -> tuple[RequestDescriptor, ...]:
         """Return the documented short sweep triggered by active-session ``ee aa``."""
 
-        if self.profile.model.value == "H7129":
-            return _H7129_REFRESH_REQUESTS
-        return _REFRESH_REQUESTS
+        return tuple(
+            self._requests[name] for name in self.profile.protocol.refresh_order
+        )
 
     def device_state_poll(self) -> RequestDescriptor:
         """Return the sole documented steady-state three-second poll."""
 
-        return DEVICE_STATE_POLL
+        return self._requests[self.profile.protocol.periodic_request]
 
     @staticmethod
     def new_response_matcher(descriptor: RequestDescriptor) -> ResponseMatcher:
@@ -398,31 +329,57 @@ class GoveePurifierProtocol:
         if isinstance(command, RawCommand):
             return validate_frame(command.frame)
         if isinstance(command, QueryDeviceState):
-            return build_frame(b"\xaa\x01")
+            return self._requests["device_state"].frame
         if isinstance(command, QueryNightLightState):
-            return build_frame(b"\xaa\x1b\x01")
+            return self._requests["night_light_state"].frame
         if isinstance(command, QueryNightLightColor):
-            return build_frame(b"\xaa\x1b\x05")
+            return self._requests["night_light_color"].frame
         if isinstance(command, QueryAirQuality):
-            return build_frame(b"\xaa\x19")
+            return self._requests["air_quality"].frame
         if isinstance(command, SetPower):
-            return build_frame(bytes((0x33, 0x01, int(command.on))))
+            definition = self._require_command_strategy("power", "power_bool_v1")
+            return build_frame(definition.prefix + bytes((int(command.on),)))
         if isinstance(command, SetFanMode):
-            return self._encode_fan_mode(command.mode)
+            definition = self._require_command_strategy("fan_mode", "fan_mode_v1")
+            return self._encode_fan_mode(command.mode, definition)
         if isinstance(command, SetNightLightPower):
-            return build_frame(bytes((0x3A, 0x1B, 0x01, 0x01, int(command.on))))
+            definition = self._require_command_strategy(
+                "night_light_power", "night_light_power_v1"
+            )
+            return build_frame(definition.prefix + bytes((int(command.on),)))
         if isinstance(command, SetNightLightBrightness):
+            definition = self._require_command_strategy(
+                "night_light_brightness", "night_light_brightness_v1"
+            )
             if not 1 <= command.percent <= 100:
                 raise ProtocolError("night-light brightness must be from 1 through 100")
-            return build_frame(bytes((0x3A, 0x1B, 0x01, 0x02, command.percent)))
+            return build_frame(definition.prefix + bytes((command.percent,)))
         if isinstance(command, SetNightLightColor):
+            definition = self._require_command_strategy(
+                "night_light_color", "night_light_color_v1"
+            )
             components = (command.red, command.green, command.blue)
             if any(not 0 <= component <= 255 for component in components):
                 raise ProtocolError("RGB components must be from 0 through 255")
-            return build_frame(bytes((0x3A, 0x1B, 0x05, 0x0D, *components)))
+            return build_frame(definition.prefix + bytes(components))
         raise TypeError(f"unsupported command type: {type(command).__name__}")
 
-    def _encode_fan_mode(self, mode: FanMode) -> bytes:
+    def _require_command_strategy(
+        self, command: str, expected: str
+    ) -> CommandDefinition:
+        """Retain a hard assertion around profile-selected Python strategies."""
+        definition = self.profile.protocol.commands.get(command)
+        if definition is None or definition.strategy != expected:
+            raise ProtocolError(
+                f"profile selected unsupported {command} strategy"
+            )
+        return definition
+
+    def _encode_fan_mode(
+        self,
+        mode: FanMode,
+        definition: CommandDefinition,
+    ) -> bytes:
         try:
             mode = FanMode(mode)
         except ValueError as err:
@@ -437,7 +394,8 @@ class GoveePurifierProtocol:
         }
         mode_code, manual_level, auto_parameter = payload[mode]
         return build_frame(
-            bytes((0x3A, 0x05, mode_code, manual_level, 0x00, auto_parameter))
+            definition.prefix
+            + bytes((mode_code, manual_level, 0x00, auto_parameter))
         )
 
     def decode(

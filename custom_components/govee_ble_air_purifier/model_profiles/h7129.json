@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "profile_id": "h7129",
+  "extends": "default-encrypted",
+  "identity": {
+    "manufacturer": "Govee",
+    "model": "H7129",
+    "display_name": "Govee H7129",
+    "support_status": "verified",
+    "advertised_name_prefixes": ["ihoment_H7129_"]
+  }
+}
