@@ -35,7 +35,7 @@ from custom_components.govee_ble_air_purifier.transactions import (
 PACKAGE = Path(__file__).parents[1] / "custom_components" / "govee_ble_air_purifier"
 PACKAGE_IMPORT = "custom_components.govee_ble_air_purifier"
 
-ENTITY_MODULES = {"entity", "fan", "light", "sensor"}
+ENTITY_MODULES = {"entity", "fan", "light", "sensor", "switch"}
 HOME_ASSISTANT_OR_BLUETOOTH_IMPORTS = {
     "bleak",
     "bleak_retry_connector",
@@ -150,6 +150,23 @@ SYNC_POLICY_FORBIDDEN = {
     *ENTITY_MODULES,
     *HOME_ASSISTANT_OR_BLUETOOTH_IMPORTS,
 }
+CUSTOM_AUTO_CONTROLLER_FORBIDDEN = {
+    "bluetooth_profile",
+    "channel",
+    "client",
+    "config_flow",
+    "coordinator",
+    "discovery",
+    "operations",
+    "profiles",
+    "protocol",
+    "recovery",
+    "setup_validation",
+    "state_reducer",
+    "transactions",
+    *ENTITY_MODULES,
+    *HOME_ASSISTANT_OR_BLUETOOTH_IMPORTS,
+}
 LOWER_LAYER_FILES = (
     PACKAGE / "bluetooth_profile.py",
     PACKAGE / "channel.py",
@@ -158,6 +175,7 @@ LOWER_LAYER_FILES = (
     PACKAGE / "frame.py",
     PACKAGE / "models.py",
     PACKAGE / "operations.py",
+    PACKAGE / "observations.py",
     PACKAGE / "recovery.py",
     PACKAGE / "state_reducer.py",
     PACKAGE / "transactions.py",
@@ -187,9 +205,20 @@ LOWER_LAYER_FILES = (
             id="profiles-package",
         ),
         pytest.param(
-            (PACKAGE / "state_reducer.py", PACKAGE / "recovery.py"),
+            (
+                PACKAGE / "state_reducer.py",
+                PACKAGE / "recovery.py",
+                PACKAGE / "custom_auto_options.py",
+                PACKAGE / "custom_auto_policy.py",
+                PACKAGE / "observations.py",
+            ),
             SYNC_POLICY_FORBIDDEN,
             id="synchronous-policy",
+        ),
+        pytest.param(
+            (PACKAGE / "custom_auto_controller.py",),
+            CUSTOM_AUTO_CONTROLLER_FORBIDDEN,
+            id="custom-auto-controller",
         ),
         pytest.param(
             LOWER_LAYER_FILES,

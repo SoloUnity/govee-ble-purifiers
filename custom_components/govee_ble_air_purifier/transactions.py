@@ -7,6 +7,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Protocol
 
+from .observations import ReceivedFrame
 from .operations import PurifierClientError
 from .protocol import MatchResult, RequestDescriptor, ResponseMatcher
 
@@ -21,6 +22,7 @@ __all__ = (
 MatcherFactory = Callable[[RequestDescriptor], ResponseMatcher]
 SendFrame = Callable[[bytes], Awaitable[None]]
 AttemptHook = Callable[[], None]
+MatchHook = Callable[[ReceivedFrame], None]
 DisconnectErrorFactory = Callable[[], Exception]
 
 
@@ -29,7 +31,7 @@ class FrameReducer(Protocol):
 
     def __call__(
         self,
-        frame: bytes,
+        received: ReceivedFrame,
         *,
         matched_request: str | None = None,
     ) -> None: ...
@@ -43,7 +45,8 @@ class NextFrame(Protocol):
         deadline: float,
         *,
         interrupt_for_command: bool = False,
-    ) -> bytes: ...
+        interrupt_for_secondary: bool = False,
+    ) -> ReceivedFrame: ...
 
 
 class TransactionTimeoutError(PurifierClientError):
@@ -61,15 +64,17 @@ class TransactionExecutor:
         self,
         *,
         matcher_factory: MatcherFactory,
-        frame_queue: asyncio.Queue[bytes],
+        frame_queue: asyncio.Queue[ReceivedFrame],
         disconnected: asyncio.Event,
         command_wake: asyncio.Event,
         disconnect_error: DisconnectErrorFactory,
+        secondary_wake: asyncio.Event | None = None,
     ) -> None:
         self._matcher_factory = matcher_factory
         self._frame_queue = frame_queue
         self._disconnected = disconnected
         self._command_wake = command_wake
+        self._secondary_wake = secondary_wake
         self._disconnect_error = disconnect_error
         self._active_request: str | None = None
         self._last_timeout_summary: str | None = None
@@ -98,9 +103,11 @@ class TransactionExecutor:
         reduce_frame: FrameReducer,
         next_frame: NextFrame | None = None,
         interrupt_for_command: bool = False,
+        interrupt_for_secondary: bool = False,
         on_attempt: AttemptHook | None = None,
         on_send: AttemptHook | None = None,
         on_sent: AttemptHook | None = None,
+        on_match: MatchHook | None = None,
     ) -> tuple[bytes, ...]:
         """Send and match a descriptor within bounded per-attempt deadlines."""
         loop = asyncio.get_running_loop()
@@ -132,14 +139,22 @@ class TransactionExecutor:
                 try:
                     while not matcher.complete:
                         wait_for_frame = next_frame or self.async_next_frame
-                        frame = await wait_for_frame(
-                            deadline,
-                            interrupt_for_command=interrupt_for_command,
-                        )
+                        if interrupt_for_secondary:
+                            received = await wait_for_frame(
+                                deadline,
+                                interrupt_for_command=interrupt_for_command,
+                                interrupt_for_secondary=True,
+                            )
+                        else:
+                            received = await wait_for_frame(
+                                deadline,
+                                interrupt_for_command=interrupt_for_command,
+                            )
                         received_count += 1
+                        frame = received.frame
                         result = matcher.feed(frame)
                         reduce_frame(
-                            frame,
+                            received,
                             matched_request=(
                                 descriptor.name
                                 if result is MatchResult.COMPLETE
@@ -160,6 +175,8 @@ class TransactionExecutor:
                             if len(ignored_sample) < 4:
                                 ignored_sample.append(frame)
                         if result is MatchResult.COMPLETE:
+                            if on_match is not None:
+                                on_match(received)
                             self._last_timeout_summary = None
                             _LOGGER.debug(
                                 "Transaction complete: request=%s attempt=%d/%d "
@@ -208,7 +225,8 @@ class TransactionExecutor:
         deadline: float,
         *,
         interrupt_for_command: bool = False,
-    ) -> bytes:
+        interrupt_for_secondary: bool = False,
+    ) -> ReceivedFrame:
         """Arbitrate the next frame, disconnect, timeout, and command wake."""
         loop = asyncio.get_running_loop()
         remaining = deadline - loop.time()
@@ -222,10 +240,20 @@ class TransactionExecutor:
             if interrupt_for_command
             else None
         )
-        tasks = (
-            (frame_task, disconnect_task, command_task)
-            if command_task is not None
-            else (frame_task, disconnect_task)
+        secondary_task = (
+            asyncio.create_task(self._secondary_wake.wait())
+            if interrupt_for_secondary and self._secondary_wake is not None
+            else None
+        )
+        tasks = tuple(
+            task
+            for task in (
+                frame_task,
+                disconnect_task,
+                command_task,
+                secondary_task,
+            )
+            if task is not None
         )
         try:
             done, _ = await asyncio.wait(
@@ -247,4 +275,6 @@ class TransactionExecutor:
             return frame_task.result()
         if command_task is not None and command_task in done:
             raise RefreshPreemptedError("Refresh yielded to a pending command")
+        if secondary_task is not None and secondary_task in done:
+            raise RefreshPreemptedError("Refresh yielded to a one-shot query")
         raise TimeoutError

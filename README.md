@@ -30,7 +30,8 @@ integration.
 
 ## Home Assistant entities
 
-Each configured purifier creates four entities:
+Each configured purifier creates four core entities. Opting in to Custom Auto
+adds one switch:
 
 | Entity | Capabilities |
 | --- | --- |
@@ -38,6 +39,7 @@ Each configured purifier creates four entities:
 | Night light | Power, brightness, and RGB colour |
 | PM2.5 sensor | Current particulate concentration in µg/m³ |
 | Filter-life sensor | Remaining filter life as a percentage; diagnostic category |
+| Custom Auto switch | Present only when Custom Auto is enabled in the integration options |
 
 Entities use the integration's cached push state and do not independently poll
 Bluetooth. Physical controls update Home Assistant when the purifier sends the
@@ -74,6 +76,77 @@ should be updated as follows:
 | Medium near 67% | `percentage: 60` |
 | High at 100% | `percentage: 80` (100% now selects Turbo) |
 | Auto preset | No change |
+
+## Custom Auto
+
+Custom Auto is an optional Home Assistant policy that uses authoritative PM2.5
+observations to select the existing Sleep, Low, Medium, High, or Turbo mode. It
+is disabled by default and is not a new purifier mode. During initial setup,
+select **Enable Custom Auto** after purifier validation to review its settings.
+For an existing purifier, open **Settings > Devices & services**, select the
+integration, open the purifier's **Configure** flow, and enable it there.
+
+The bundled profiles provide these initial settings:
+
+| Model | PM2.5 boundaries (µg/m³) | Upshift confirmation | Downshift delays |
+| --- | --- | --- | --- |
+| H7124 | 3, 5, 9, 15 | 3 seconds | 7, 5, 5, 5 minutes |
+| H7129 | 7, 9, 13, 19 | 3 seconds | 7, 5, 5, 5 minutes |
+
+The four boundaries divide Sleep, Low, Medium, High, and Turbo. A value equal
+to a boundary remains in the lower band. The four downshift delays apply to
+Low→Sleep, Medium→Low, High→Medium, and Turbo→High. Values may be edited per
+purifier: boundaries must be four strictly ascending integers from 0 through
+999, upshift confirmation must be 0–300 seconds, and each downshift delay must
+be 0–1440 minutes.
+
+Custom Auto has these runtime semantics:
+
+- Turning its switch **ON** starts with no remembered target and requires a
+  fresh PM2.5 observation to choose the initial target. After a level is
+  confirmed, a positive upshift delay requires a second distinct authoritative
+  observation at or after the confirmation time; the confirming reading may
+  jump directly across several levels. A zero delay permits the first fresh
+  reading.
+- A cleaner reading starts each applicable downshift dwell independently. A
+  fresh, still-qualifying reading at or after maturity is required before the
+  fan slows. Dirtier air cancels incompatible downward dwell. Separate events
+  with equal PM2.5 values count as separate revisions.
+- The fan entity continues to report the purifier's actual Sleep–Turbo
+  percentage and **Manual** preset. The Custom Auto switch, rather than a false
+  hardware-Auto fan state, reports policy ownership.
+- A genuine physical selection of Auto while the switch is ON keeps Custom Auto
+  ON, requests a fresh sample, and redirects the purifier to the resulting
+  Sleep–Turbo level. Startup mode restoration and integration command
+  confirmations are not treated as physical Auto presses.
+- A physical Sleep–Turbo selection, a Home Assistant percentage request, or an
+  explicit Home Assistant **Auto** preset yields Custom Auto ownership before
+  applying the override. Explicit Auto selects the purifier's hardware Auto.
+- Powering the purifier off leaves the switch logically ON but suspended and
+  cancels policy timers. Power-on resumes only after the connection is usable
+  and a fresh PM2.5 observation arrives.
+- During a disconnect the switch is unavailable, but active intent is retained.
+  Samples and timers from the old connection are rejected. Recovery never acts
+  on PM2.5 cached before the reconnect, option reload, or activation.
+- Turning the switch **OFF** clears policy intent. If the purifier is powered on
+  and available, the integration requests hardware Auto; if it is powered off,
+  it does not turn it on. An unavailable or unknown-power handoff is recorded as
+  not attempted, and a command error is recorded as failed; the switch remains
+  truthfully OFF rather than claiming policy ownership.
+
+Saving Custom Auto options validates the complete setting set and reloads the
+entry once. Editing settings while policy is active first performs the same
+switch-off handoff; the reloaded controller starts inactive. Disabling the
+feature removes its switch and registry entry after a successful reload and
+clears the mutable settings. Re-enabling recreates the switch with the selected
+settings but does not restore its previous ON state or prior target. No Custom
+Auto state or policy history is persisted across reloads or restarts.
+
+Custom Auto uses event-driven PM2.5 updates plus bounded, one-shot air-quality
+requests at activation and confirmation/downshift boundaries. It does not add a
+fixed PM2.5 polling cadence. User commands take priority over a one-shot request,
+and the existing three-second `aa 01` health poll remains the only periodic
+request.
 
 ## Requirements
 
@@ -400,6 +473,32 @@ Confirm that the integration still owns the BLE connection. Another central,
 including the Govee app, can displace or block Home Assistant. Enable debug
 logging and look for notification RX, disconnect, and recovery messages.
 
+### Custom Auto has stale PM2.5 or does not change the fan
+
+Custom Auto deliberately refuses to use a cached reading from before
+activation, power suspension, option reload, or reconnect. Confirm the PM2.5
+sensor receives a new value while the purifier is powered on and the switch is
+available. If no fresh observation arrives, move the adapter or proxy closer
+and check for one-shot air-quality timeout or recovery messages in debug logs.
+There is no fixed PM2.5 poll to wait for.
+
+### Custom Auto is unavailable or a handoff is deferred
+
+The Govee app may own the purifier's single BLE connection. Close the app and
+allow Home Assistant's normal advertisement-aware recovery to reconnect. A
+switch-off handoff cannot request hardware Auto while power is unknown or the
+application channel is unavailable; after recovery, turning the already-OFF
+switch OFF again retries a previously not-attempted handoff. If the Auto command
+failed, inspect the command and connection evidence before retrying.
+
+### Custom Auto options are invalid
+
+Open the purifier's **Configure** flow. The form reports invalid stored options
+and seeds a complete replacement from the model profile. Either submit a valid
+strictly ascending setting set or disable Custom Auto to repair the entry. A
+runtime entry with invalid stored options fails closed instead of starting
+Bluetooth work.
+
 ## Logs and diagnostics
 
 Connection and protocol failures appear in Home Assistant's normal log. Error
@@ -424,6 +523,14 @@ details can include:
 - essential initialization batch and wire-attempt counts;
 - request name, retry count, received and matched frames; and
 - a bounded sample of ignored application frames.
+
+For Custom Auto troubleshooting, download config-entry diagnostics and include
+the redacted entry options, client readiness/status and connection generation,
+cached power/fan/PM2.5 state, command evidence, and refresh/recovery evidence.
+Also note whether the switch was ON, OFF, suspended, or unavailable; whether a
+physical or Home Assistant override occurred; and whether switch-off Auto
+handoff was pending, not attempted, confirmed, or failed. Diagnostics and logs
+must still be redacted before sharing.
 
 Enable detailed logging in `configuration.yaml`:
 
@@ -487,12 +594,14 @@ retained cleanup task already owns that purifier address.
 | `frame.py` / `crypto.py` | Frame validation, checksum, and cryptographic transforms |
 | `protocol/` / `models.py` | Typed commands/events, profile-derived request rules, frame codecs, and response matching |
 | `state_reducer.py` | Synchronous cached-state authority, startup fan-mode assembly, command reconciliation, and state effects |
+| `custom_auto_options.py` / `custom_auto_policy.py` | Profile-backed option parsing and pure synchronous PM2.5 hysteresis |
+| `custom_auto_controller.py` | Custom Auto activation, freshness generations, timers, target deduplication, and coordinator callbacks |
 | `recovery.py` | Deterministic recovery windows, circuit/backoff decisions, and recovery diagnostics |
 | `operations.py` | Command queue lifecycle, superseding, deadlines, reconciliation decisions, completion/failure, and bounded command evidence |
 | `transactions.py` | One-in-flight descriptor attempts, response matching, candidate-frame reduction, transaction wait arbitration, and bounded timeout evidence |
 | `client.py` | Single connection/session owner, initialization, notifications, polling and refresh policy, command use cases, callbacks, and asynchronous recovery scheduling |
 | `coordinator.py` | Cached push state and Home Assistant availability/error propagation |
-| `fan.py`, `light.py`, `sensor.py` | Entity mappings only; no direct Bluetooth I/O |
+| `fan.py`, `light.py`, `sensor.py`, `switch.py` | Entity mappings only; no direct Bluetooth I/O |
 | `diagnostics.py` | Redacted config-entry and runtime diagnostics |
 
 The dependency direction is deliberate: Home Assistant entities call the

@@ -23,12 +23,36 @@ from .channel import (
     PlaintextChannel,
     SecureChannel,
 )
-from .models import ProtocolCommand, PurifierState, SecurityMode
+from .models import (
+    AirQualityEvent,
+    FanMode,
+    FanModeEvent,
+    ProtocolCommand,
+    PurifierState,
+    QueryAirQuality,
+    SecurityMode,
+    SetFanMode,
+    StartupFanModeEvent,
+)
+from .observations import (
+    AirQualityObservation,
+    CommandOrigin,
+    FanModeObservation,
+    ObservationPurpose,
+    ObservationSource,
+    PurifierObservation,
+    ReceivedFrame,
+)
 from .operations import (
+    AirQualityQueryCancelled,
+    AirQualityQueryController,
+    AirQualityQueryPreempted,
+    AirQualityQueryTimeout,
     CommandDeadlineExceeded,
     CommandOperationController,
     CommandSuperseded,
     PurifierClientError,
+    _AirQualityRequest,
     _Operation,
 )
 from .profiles import DeviceProfile
@@ -48,6 +72,9 @@ from .transactions import (
 _LOGGER = logging.getLogger(__name__)
 
 __all__ = [
+    "AirQualityQueryCancelled",
+    "AirQualityQueryPreempted",
+    "AirQualityQueryTimeout",
     "CommandDeadlineExceeded",
     "CommandSuperseded",
     "PurifierClientError",
@@ -58,6 +85,7 @@ __all__ = [
 
 StateCallback = Callable[[PurifierState], None]
 AvailabilityCallback = Callable[[bool, Exception | None], None]
+ObservationCallback = Callable[[PurifierObservation], None]
 
 
 class ClientStatus(str, Enum):
@@ -88,6 +116,7 @@ class ReliablePurifierClient:
         profile: DeviceProfile,
         state_callback: StateCallback,
         availability_callback: AvailabilityCallback,
+        observation_callback: ObservationCallback | None = None,
     ) -> None:
         self._environment = environment
         self._transport = transport
@@ -102,6 +131,7 @@ class ReliablePurifierClient:
             )
         self._state_callback = state_callback
         self._availability_callback = availability_callback
+        self._observation_callback = observation_callback
 
         self._state_reducer = PurifierStateReducer(profile)
         self.status = ClientStatus.STOPPED
@@ -109,17 +139,19 @@ class ReliablePurifierClient:
         self._runner: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._disconnected = asyncio.Event()
-        self._frame_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._frame_queue: asyncio.Queue[ReceivedFrame] = asyncio.Queue()
         self._command_operations = CommandOperationController(
             self._timings,
             protocol,
             self._state_reducer,
         )
+        self._air_quality_queries = AirQualityQueryController()
         self._transactions = TransactionExecutor(
             matcher_factory=protocol.new_response_matcher,
             frame_queue=self._frame_queue,
             disconnected=self._disconnected,
             command_wake=self._command_operations.event,
+            secondary_wake=self._air_quality_queries.event,
             disconnect_error=lambda: GattTransportError(
                 "Purifier disconnected during transaction"
             ),
@@ -146,6 +178,7 @@ class ReliablePurifierClient:
         self._essential_initialization_attempts = 0
         self._has_ever_been_ready = False
         self._reported_available: bool | None = None
+        self._observation_revision = 0
 
     @property
     def state(self) -> PurifierState:
@@ -160,6 +193,11 @@ class ReliablePurifierClient:
     @property
     def is_ready(self) -> bool:
         return self.status is ClientStatus.READY
+
+    @property
+    def connection_generation(self) -> int:
+        """Return the current connection generation for lifecycle consumers."""
+        return self._session_generation
 
     @property
     def _operations(self) -> deque[_Operation]:
@@ -280,7 +318,10 @@ class ReliablePurifierClient:
     async def async_shutdown(self) -> None:
         """Stop recovery, fail outstanding controls, and release BLE resources."""
         self._stopping.set()
+        self._command_operations.clear_superseded_fan_echoes()
         self._operation_event.set()
+        air_quality_request = self._air_quality_queries.request
+        self._air_quality_queries.disconnect()
         active_operation = self._active_operation
         runner = self._runner
         self._runner = None
@@ -290,6 +331,8 @@ class ReliablePurifierClient:
                 await runner
             except asyncio.CancelledError:
                 pass
+        if air_quality_request is not None:
+            await air_quality_request.quiesced.wait()
 
         channel = self._channel
         self._channel = None
@@ -306,7 +349,12 @@ class ReliablePurifierClient:
         self._recovery.reset_after_stable_session()
         self.status = ClientStatus.STOPPED
 
-    async def async_execute(self, command: ProtocolCommand) -> None:
+    async def async_execute(
+        self,
+        command: ProtocolCommand,
+        *,
+        origin: CommandOrigin = CommandOrigin.HOME_ASSISTANT,
+    ) -> None:
         """Execute one absolute control within a bounded recovery window."""
         if self._runner is None:
             raise PurifierClientError("Purifier client is not running")
@@ -317,6 +365,7 @@ class ReliablePurifierClient:
             command,
             loop=loop,
             now=now,
+            origin=origin,
         )
         future = operation.future
 
@@ -325,6 +374,7 @@ class ReliablePurifierClient:
                 await asyncio.shield(future)
         except TimeoutError as err:
             self._command_operations.cancel(operation)
+            await asyncio.shield(operation.quiesced.wait())
             raise self._command_operations.failure_error(
                 operation,
                 reason=(
@@ -335,7 +385,48 @@ class ReliablePurifierClient:
             ) from err
         except asyncio.CancelledError:
             self._command_operations.cancel(operation)
+            await asyncio.shield(operation.quiesced.wait())
             raise
+        except CommandSuperseded:
+            await asyncio.shield(operation.quiesced.wait())
+            raise
+
+    async def async_query_air_quality(self) -> None:
+        """Run or join one connection-scoped, one-attempt aa-19 request."""
+        if self._runner is None or not self.is_ready:
+            raise PurifierClientError("Purifier client is not ready")
+        loop = asyncio.get_running_loop()
+        current = self._air_quality_queries.request
+        if current is not None and current.generation != self._session_generation:
+            self._air_quality_queries.disconnect()
+        if current is not None and current.future.done():
+            await current.quiesced.wait()
+        request = self._air_quality_queries.acquire(
+            loop=loop,
+            now=loop.time(),
+            timeout=self._timings.transaction_timeout,
+            generation=self._session_generation,
+        )
+        try:
+            async with asyncio.timeout_at(request.deadline):
+                await asyncio.shield(request.future)
+        except TimeoutError as err:
+            if not request.future.done():
+                self._air_quality_queries.fail(
+                    request,
+                    AirQualityQueryTimeout(
+                        "Air-quality query exceeded its end-to-end deadline"
+                    ),
+                )
+            raise AirQualityQueryTimeout(
+                "Air-quality query exceeded its end-to-end deadline"
+            ) from err
+
+    async def async_cancel_air_quality_query(self) -> None:
+        """Deactivate one-shot work and wait until channel ownership is released."""
+        request = self._air_quality_queries.cancel()
+        if request is not None:
+            await request.quiesced.wait()
 
     async def _run(self) -> None:
         self._recovery.begin_sequence()
@@ -427,8 +518,10 @@ class ReliablePurifierClient:
     async def _connect_initialize_and_run(self) -> None:
         self._connection_cycles += 1
         self._session_generation += 1
+        self._command_operations.clear_superseded_fan_echoes()
         session_generation = self._session_generation
         self._disconnected.clear()
+        self._air_quality_queries.disconnect()
         self._drain_frame_queue()
         self._refresh_pending = False
         self._refresh_running = False
@@ -570,6 +663,7 @@ class ReliablePurifierClient:
                 await self._async_execute_descriptor(
                     descriptor,
                     attempts=self._timings.initialization_attempts,
+                    purpose=ObservationPurpose.STARTUP,
                 )
             except TransactionTimeoutError as err:
                 failures[descriptor.name] = str(err)
@@ -619,6 +713,7 @@ class ReliablePurifierClient:
                 await self._async_execute_descriptor(
                     essential,
                     attempts=self._timings.initialization_attempts,
+                    purpose=ObservationPurpose.STARTUP,
                 )
             except TransactionTimeoutError as err:
                 failures[essential.name] = str(err)
@@ -653,6 +748,14 @@ class ReliablePurifierClient:
                     self._command_operations.release(operation)
                 continue
 
+            air_quality_request = self._air_quality_queries.take(
+                now=asyncio.get_running_loop().time(),
+                generation=self._session_generation,
+            )
+            if air_quality_request is not None:
+                await self._async_execute_air_quality_query(air_quality_request)
+                continue
+
             if self._refresh_pending:
                 # An idle ee-aa capture began its refresh at about +1 ms.
                 await asyncio.sleep(self._timings.between_request_delay)
@@ -665,6 +768,7 @@ class ReliablePurifierClient:
                     self._protocol.device_state_poll(),
                     attempts=self._timings.periodic_poll_attempts,
                     is_periodic_poll=True,
+                    purpose=ObservationPurpose.PERIODIC,
                 )
                 continue
 
@@ -682,6 +786,12 @@ class ReliablePurifierClient:
             return
 
         descriptor = self._protocol.command_request(operation.command)
+        confirmation: ReceivedFrame | None = None
+
+        def record_confirmation(received: ReceivedFrame) -> None:
+            nonlocal confirmation
+            confirmation = received
+
         while self._command_operations.prepare_for_send(
             operation,
             now=loop.time(),
@@ -713,11 +823,40 @@ class ReliablePurifierClient:
 
             try:
                 async with asyncio.timeout_at(operation.deadline):
-                    await self._async_execute_descriptor(
-                        descriptor,
-                        attempts=1,
-                        on_send=record_send,
+                    transaction = asyncio.create_task(
+                        self._async_execute_descriptor(
+                            descriptor,
+                            attempts=1,
+                            on_send=record_send,
+                            purpose=ObservationPurpose.COMMAND,
+                            operation_id=operation.operation_id,
+                            command_origin=operation.origin,
+                            on_match=record_confirmation,
+                        )
                     )
+                    cancelled = asyncio.create_task(operation.cancel_event.wait())
+                    try:
+                        done, _ = await asyncio.wait(
+                            (transaction, cancelled),
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if cancelled in done and cancelled.result():
+                            transaction.cancel()
+                            await asyncio.gather(
+                                transaction, return_exceptions=True
+                            )
+                            return
+                        await transaction
+                    finally:
+                        if not transaction.done():
+                            transaction.cancel()
+                        if not cancelled.done():
+                            cancelled.cancel()
+                        await asyncio.gather(
+                            transaction,
+                            cancelled,
+                            return_exceptions=True,
+                        )
             except TransactionTimeoutError as err:
                 self._command_operations.record_response_failure(
                     operation,
@@ -757,11 +896,103 @@ class ReliablePurifierClient:
                 )
                 raise
             else:
-                self._apply_confirmed_command(operation.command)
+                if operation.future.done():
+                    return
+                self._apply_confirmed_command(
+                    operation.command,
+                    confirmation=confirmation,
+                    operation=operation,
+                )
                 self._command_operations.complete(operation)
                 return
 
-    def _apply_confirmed_command(self, command: ProtocolCommand) -> None:
+    async def _async_execute_air_quality_query(
+        self, request: _AirQualityRequest
+    ) -> None:
+        """Execute one one-shot send, interruptible by commands or deactivation."""
+        descriptor = self._protocol.command_request(QueryAirQuality())
+        transaction = asyncio.create_task(
+            self._async_execute_descriptor(
+                descriptor,
+                attempts=1,
+                interrupt_for_command=True,
+                purpose=ObservationPurpose.ONE_SHOT,
+                request_id=request.request_id,
+            )
+        )
+        cancelled = asyncio.create_task(request.cancel_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (transaction, cancelled),
+                timeout=max(
+                    0.0,
+                    request.deadline - asyncio.get_running_loop().time(),
+                ),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if cancelled in done and cancelled.result():
+                transaction.cancel()
+                await asyncio.gather(transaction, return_exceptions=True)
+                return
+            if transaction not in done:
+                transaction.cancel()
+                await asyncio.gather(transaction, return_exceptions=True)
+                self._air_quality_queries.fail(
+                    request,
+                    AirQualityQueryTimeout(
+                        "Air-quality query exceeded its end-to-end deadline"
+                    ),
+                )
+                return
+            try:
+                await transaction
+            except RefreshPreemptedError:
+                self._air_quality_queries.fail(
+                    request,
+                    AirQualityQueryPreempted(
+                        "Air-quality query yielded to a pending command"
+                    ),
+                )
+            except TransactionTimeoutError as err:
+                self._air_quality_queries.fail(
+                    request,
+                    AirQualityQueryTimeout(str(err)),
+                )
+            except Exception as err:
+                failure = (
+                    err
+                    if isinstance(err, PurifierClientError)
+                    else PurifierClientError(
+                        f"Air-quality query failed: {type(err).__name__}: {err}"
+                    )
+                )
+                self._air_quality_queries.fail(request, failure)
+            else:
+                if request.generation == self._session_generation:
+                    self._air_quality_queries.complete(request)
+                else:
+                    self._air_quality_queries.disconnect()
+        finally:
+            if not transaction.done():
+                transaction.cancel()
+                await asyncio.gather(transaction, return_exceptions=True)
+            if not cancelled.done():
+                cancelled.cancel()
+            await asyncio.gather(cancelled, return_exceptions=True)
+            if not request.future.done():
+                self._air_quality_queries.fail(
+                    request,
+                    PurifierClientError("Air-quality query execution ended"),
+                )
+            self._air_quality_queries.release(request)
+
+    def _apply_confirmed_command(
+        self,
+        command: ProtocolCommand,
+        *,
+        confirmation: ReceivedFrame | None,
+        operation: _Operation,
+    ) -> None:
         """Publish state established by a documented command acknowledgement."""
         reduction = self._state_reducer.apply_confirmed_command(
             command,
@@ -769,6 +1000,19 @@ class ReliablePurifierClient:
         )
         if reduction.state_changed:
             self._state_callback(reduction.state)
+        if (
+            isinstance(command, SetFanMode)
+            and confirmation is not None
+            and confirmation.generation == self._session_generation
+            and operation.operation_id is not None
+        ):
+            if confirmation.frame.startswith(b"\x3a\x05"):
+                self._publish_command_fan_observation(
+                    mode=command.mode,
+                    received=confirmation,
+                    operation_id=operation.operation_id,
+                    origin=operation.origin,
+                )
 
     async def _async_run_refresh(
         self, descriptors: tuple[RequestDescriptor, ...]
@@ -783,7 +1027,7 @@ class ReliablePurifierClient:
         self._update_refresh_failures(failures)
         try:
             for index, descriptor in enumerate(active_descriptors):
-                if self._has_pending_command():
+                if self._has_pending_command() or self._has_pending_air_quality_query():
                     self._defer_refresh(active_descriptors[index:], descriptor.name)
                     return
                 _LOGGER.debug(
@@ -798,6 +1042,8 @@ class ReliablePurifierClient:
                         descriptor,
                         attempts=self._timings.refresh_attempts,
                         interrupt_for_command=True,
+                        interrupt_for_query=True,
+                        purpose=ObservationPurpose.REFRESH,
                     )
                 except _RefreshPreempted:
                     self._defer_refresh(active_descriptors[index:], descriptor.name)
@@ -832,6 +1078,15 @@ class ReliablePurifierClient:
             now=asyncio.get_running_loop().time()
         )
 
+    def _has_pending_air_quality_query(self) -> bool:
+        """Return whether current connection-scoped one-shot work is waiting."""
+        request = self._air_quality_queries.request
+        return (
+            request is not None
+            and not request.future.done()
+            and request.generation == self._session_generation
+        )
+
     def _defer_refresh(
         self,
         remaining: tuple[RequestDescriptor, ...],
@@ -862,7 +1117,13 @@ class ReliablePurifierClient:
         attempts: int,
         is_periodic_poll: bool = False,
         interrupt_for_command: bool = False,
+        interrupt_for_query: bool = False,
         on_send: Callable[[], None] | None = None,
+        purpose: ObservationPurpose = ObservationPurpose.UNSOLICITED,
+        request_id: int | None = None,
+        operation_id: int | None = None,
+        command_origin: CommandOrigin | None = None,
+        on_match: Callable[[ReceivedFrame], None] | None = None,
     ) -> tuple[bytes, ...]:
         channel = self._channel
         if channel is None or not channel.ready:
@@ -882,17 +1143,66 @@ class ReliablePurifierClient:
                 # This is deliberately write-to-write, not response-to-write.
                 self._next_poll_due = loop.time() + self._timings.poll_interval
 
+        generation = self._session_generation
+
+        async def next_current_frame(
+            deadline: float,
+            *,
+            interrupt_for_command: bool = False,
+            interrupt_for_secondary: bool = False,
+        ) -> ReceivedFrame:
+            while True:
+                received = await self._transactions.async_next_frame(
+                    deadline,
+                    interrupt_for_command=interrupt_for_command,
+                    interrupt_for_secondary=interrupt_for_secondary,
+                )
+                if received.generation == generation:
+                    if self._command_operations.consume_superseded_fan_echo(
+                        generation=generation,
+                        frame=received.frame,
+                    ):
+                        _LOGGER.debug(
+                            "Ignoring exact fan acknowledgement from physically "
+                            "superseded work: generation=%d frame=%s",
+                            generation,
+                            received.frame.hex(" "),
+                        )
+                        continue
+                    return received
+                _LOGGER.debug(
+                    "Ignoring queued frame from stale session: "
+                    "frame_generation=%d request_generation=%d frame=%s",
+                    received.generation,
+                    generation,
+                    received.frame.hex(" "),
+                )
+
+        def reduce_frame(
+            received: ReceivedFrame, *, matched_request: str | None = None
+        ) -> None:
+            self._process_plaintext_frame(
+                received,
+                matched_request=matched_request,
+                purpose=purpose,
+                request_id=request_id,
+                operation_id=operation_id,
+                command_origin=command_origin,
+            )
+
         return await self._transactions.async_execute(
             descriptor,
             attempts=attempts,
             timeout=self._timings.transaction_timeout,
             send=channel.async_send,
-            reduce_frame=self._process_plaintext_frame,
-            next_frame=self._async_next_transaction_frame,
+            reduce_frame=reduce_frame,
+            next_frame=next_current_frame,
             interrupt_for_command=interrupt_for_command,
+            interrupt_for_secondary=interrupt_for_query,
             on_attempt=record_attempt,
             on_send=on_send,
             on_sent=record_sent,
+            on_match=on_match,
         )
 
     async def _async_next_transaction_frame(
@@ -900,17 +1210,20 @@ class ReliablePurifierClient:
         deadline: float,
         *,
         interrupt_for_command: bool = False,
-    ) -> bytes:
+        interrupt_for_secondary: bool = False,
+    ) -> ReceivedFrame:
         return await self._transactions.async_next_frame(
             deadline,
             interrupt_for_command=interrupt_for_command,
+            interrupt_for_secondary=interrupt_for_secondary,
         )
 
     async def _async_wait_for_ready_work(self, timeout: float) -> None:
         frame_task = asyncio.create_task(self._frame_queue.get())
         operation_task = asyncio.create_task(self._operation_event.wait())
+        query_task = asyncio.create_task(self._air_quality_queries.event.wait())
         disconnect_task = asyncio.create_task(self._disconnected.wait())
-        tasks = (frame_task, operation_task, disconnect_task)
+        tasks = (frame_task, operation_task, query_task, disconnect_task)
         try:
             done, _ = await asyncio.wait(
                 tasks,
@@ -932,20 +1245,228 @@ class ReliablePurifierClient:
 
     def _process_plaintext_frame(
         self,
-        frame: bytes,
+        received: ReceivedFrame | bytes,
         *,
         matched_request: str | None = None,
+        generation: int | None = None,
+        purpose: ObservationPurpose = ObservationPurpose.UNSOLICITED,
+        request_id: int | None = None,
+        operation_id: int | None = None,
+        command_origin: CommandOrigin | None = None,
     ) -> None:
+        if isinstance(received, ReceivedFrame):
+            frame = received.frame
+            generation = received.generation
+            observed_at = received.received_at
+        else:
+            frame = received
+            if generation is None:
+                generation = self._session_generation
+            observed_at = time.monotonic()
+        if generation != self._session_generation or self._stopping.is_set():
+            return
+        if self._command_operations.consume_superseded_fan_echo(
+            generation=generation,
+            frame=frame,
+        ):
+            _LOGGER.debug(
+                "Ignoring exact fan acknowledgement from physically superseded "
+                "work: generation=%d frame=%s",
+                generation,
+                frame.hex(" "),
+            )
+            return
         event = self._protocol.decode(frame)
+        if (
+            isinstance(event, FanModeEvent)
+            and event.mode is not None
+            and frame.startswith(b"\xee\x05")
+            and matched_request == "SetFanMode"
+        ):
+            self._command_operations.discard_active_fan_echo_reservation(
+                generation=generation
+            )
+        if (
+            isinstance(event, FanModeEvent)
+            and event.mode is not None
+            and frame.startswith(b"\xee\x05")
+            and matched_request is None
+        ):
+            self._command_operations.supersede_active_fan_by_physical(
+                generation=generation
+            )
+        previous_state = self.state
         reduction = self._state_reducer.reduce_event(
             event,
-            generation=self._session_generation,
+            generation=generation,
             matched_request=matched_request,
         )
         if reduction.refresh_requested and not self._refresh_running:
             self._refresh_pending = True
         if reduction.state_changed:
             self._state_callback(reduction.state)
+        self._publish_semantic_observation(
+            event,
+            previous_state=previous_state,
+            matched_request=matched_request,
+            generation=generation,
+            purpose=purpose,
+            request_id=request_id,
+            operation_id=operation_id,
+            command_origin=command_origin,
+            observed_at=observed_at,
+        )
+
+    def _publish_semantic_observation(
+        self,
+        event: object,
+        *,
+        previous_state: PurifierState,
+        matched_request: str | None,
+        generation: int,
+        purpose: ObservationPurpose,
+        request_id: int | None,
+        operation_id: int | None,
+        command_origin: CommandOrigin | None,
+        observed_at: float,
+    ) -> None:
+        """Publish semantic authority after matcher correlation and reduction."""
+        callback = self._observation_callback
+        if callback is None or generation != self._session_generation:
+            return
+        source: ObservationSource
+        observation: PurifierObservation
+        self._observation_revision += 1
+        revision = self._observation_revision
+
+        if isinstance(event, AirQualityEvent):
+            source = (
+                ObservationSource.DEVICE
+                if event.unsolicited
+                else ObservationSource.QUERY
+            )
+            correlated = (
+                matched_request in {"QueryAirQuality", "air_quality"}
+                and not event.unsolicited
+            )
+            observation = AirQualityObservation(
+                revision=revision,
+                generation=generation,
+                observed_at=observed_at,
+                source=source,
+                purpose=(
+                    ObservationPurpose.UNSOLICITED
+                    if event.unsolicited
+                    else purpose
+                ),
+                request_id=request_id if correlated else None,
+                operation_id=operation_id if correlated else None,
+                command_origin=command_origin if correlated else None,
+                pm25=event.pm25_ug_m3,
+                filter_life=event.filter_life,
+            )
+        else:
+            mode = self.state.fan_mode
+            if isinstance(event, FanModeEvent) and mode is not None:
+                matching_command = (
+                    matched_request == "SetFanMode"
+                    and operation_id is not None
+                    and command_origin is not None
+                    and isinstance(self._active_operation, _Operation)
+                    and isinstance(self._active_operation.command, SetFanMode)
+                    and self._active_operation.command.mode is mode
+                )
+                source = (
+                    ObservationSource.COMMAND
+                    if matching_command
+                    else ObservationSource.PHYSICAL
+                )
+                if source is ObservationSource.PHYSICAL:
+                    operation_id = None
+                    command_origin = None
+                observation = FanModeObservation(
+                    revision=revision,
+                    generation=generation,
+                    observed_at=observed_at,
+                    source=source,
+                    purpose=(
+                        ObservationPurpose.COMMAND
+                        if source is ObservationSource.COMMAND
+                        else ObservationPurpose.UNSOLICITED
+                    ),
+                    request_id=None,
+                    operation_id=operation_id,
+                    command_origin=command_origin,
+                    mode=mode,
+                )
+            elif (
+                isinstance(event, StartupFanModeEvent)
+                and matched_request == f"mode_data_{event.selector:02x}"
+                and mode is not None
+                and (
+                    (
+                        self._profile.protocol.startup_mode_strategy
+                        == "h7124_selector_00"
+                        and event.selector == 0x00
+                    )
+                    or (
+                        self._profile.protocol.startup_mode_strategy
+                        == "h7129_selector_pair"
+                        and (
+                            (event.selector == 0x00 and event.mode_code != 0x01)
+                            or (
+                                event.selector == 0x01
+                                and previous_state.fan_mode is None
+                            )
+                        )
+                    )
+                )
+            ):
+                observation = FanModeObservation(
+                    revision=revision,
+                    generation=generation,
+                    observed_at=observed_at,
+                    source=ObservationSource.STARTUP,
+                    purpose=purpose,
+                    request_id=request_id,
+                    operation_id=None,
+                    command_origin=None,
+                    mode=mode,
+                )
+            else:
+                self._observation_revision -= 1
+                return
+        callback(observation)
+
+    def _publish_command_fan_observation(
+        self,
+        *,
+        mode: FanMode,
+        received: ReceivedFrame,
+        operation_id: int,
+        origin: CommandOrigin,
+    ) -> None:
+        """Publish exact 3a-05 command confirmation after state application."""
+        callback = self._observation_callback
+        if (
+            callback is None
+            or received.generation != self._session_generation
+            or self._stopping.is_set()
+        ):
+            return
+        self._observation_revision += 1
+        callback(
+            FanModeObservation(
+                revision=self._observation_revision,
+                generation=received.generation,
+                observed_at=received.received_at,
+                source=ObservationSource.COMMAND,
+                purpose=ObservationPurpose.COMMAND,
+                operation_id=operation_id,
+                command_origin=origin,
+                mode=mode,
+            )
+        )
 
     def _command_is_satisfied(self, command: ProtocolCommand) -> bool:
         return self._command_operations.command_is_satisfied(command)
@@ -965,11 +1486,35 @@ class ReliablePurifierClient:
                 frame.hex(" "),
             )
             return
+        if frame.startswith(b"\xee\x05"):
+            try:
+                event = self._protocol.decode(frame)
+            except Exception:  # noqa: BLE001 - normal processing retains evidence
+                pass
+            else:
+                if isinstance(event, FanModeEvent) and event.mode is not None:
+                    # Establish old-echo ownership at receipt time so a physical
+                    # frame and its following stale echo cannot both queue first.
+                    self._command_operations.reserve_active_fan_echo_by_physical(
+                        generation=generation
+                    )
+        if self._command_operations.consume_superseded_fan_echo(
+            generation=generation,
+            frame=frame,
+        ):
+            _LOGGER.debug(
+                "Ignoring exact fan acknowledgement received before its "
+                "forced replacement send: generation=%d frame=%s",
+                generation,
+                frame.hex(" "),
+            )
+            return
+        received_at = asyncio.get_running_loop().time()
         fan_detail = self._command_operations.record_fan_frame(
             generation=generation,
             frame=frame,
             phase=self._active_request or self.status.value,
-            now=asyncio.get_running_loop().time(),
+            now=received_at,
         )
         if fan_detail is not None:
             _LOGGER.debug("Fan command diagnostic notification: %s", fan_detail)
@@ -982,7 +1527,9 @@ class ReliablePurifierClient:
             self._active_request,
             frame.hex(" "),
         )
-        self._frame_queue.put_nowait(frame)
+        self._frame_queue.put_nowait(
+            ReceivedFrame(bytes(frame), generation, received_at)
+        )
 
     def _on_disconnected(
         self,
@@ -1014,6 +1561,8 @@ class ReliablePurifierClient:
         if channel is not None:
             channel.invalidate()
         self._invalidate_connection_scoped_state()
+        self._command_operations.clear_superseded_fan_echoes()
+        self._air_quality_queries.disconnect()
         self._disconnected.set()
 
     def _set_available(self, available: bool, error: Exception | None) -> None:

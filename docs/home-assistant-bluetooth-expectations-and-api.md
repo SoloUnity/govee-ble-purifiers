@@ -1029,6 +1029,99 @@ The Govee purifier integration applies the general model as follows:
   neither value. The `manual` preset is only an entity-layer grouping, never a
   protocol `FanMode` or wire command. Selecting it reapplies an existing level
   or falls back to Low when the device is in Auto or its mode is unknown.
+- Custom Auto is opt-in and disabled when the option is absent or false. Its
+  complete mutable boundary and delay values live in `ConfigEntry.options`;
+  immutable H7124 and H7129 defaults come only from the exact resolved profile.
+  The config and options flows validate four integer boundaries from 0 through
+  999 in strict ascending order, a 0–300-second upshift confirmation, and four
+  0–1440-minute downshift delays. Disabled entries create no controller, switch,
+  policy timers, or one-shot work.
+- The Custom Auto implementation preserves four ownership boundaries. The
+  synchronous policy maps one immutable PM2.5 revision to hysteresis state and
+  decisions without tasks, Bluetooth, or Home Assistant. One serialized
+  controller actor owns activation, freshness barriers, independent timers,
+  target deduplication, and worker cancellation, and invokes only typed
+  callbacks. The coordinator owns semantic-event fan-out, controller lifecycle,
+  Home Assistant ownership linearization, and handoff. The reliable client
+  alone owns channel scheduling, the bounded one-shot transaction, command
+  reliability, refresh, polling, and recovery. Entities read cached coordinator
+  and controller state and never perform Bluetooth I/O in properties.
+- Authoritative PM2.5 ingress consists of typed air-quality observations from
+  matched startup/refresh requests, matched one-shot requests, and unsolicited
+  device events. The bounded one-attempt `aa 19` path is approved as an
+  implementation policy under the maintainer-supplied assumption that its
+  response supplies authoritative PM2.5 for these models; this is not a new
+  wire-evidence claim. It is requested only on activation/resume, at a mature
+  confirmation or downshift boundary, or for physical-Auto redirection. It is
+  coalesced per connection, has the normal transaction deadline, is never
+  retained across disconnect, and has no fixed cadence.
+- READY scheduling priority is command, one-shot air quality, resumable refresh,
+  then due `aa 01`. A queued command preempts an active silent one-shot, which
+  ends rather than resuming. A command or one-shot preempts refresh; refresh
+  retains the interrupted descriptor and ordered remainder for later resume.
+  Work already owning a bounded transaction is not overlapped. The periodic
+  due time remains write-to-write and one-shot/refresh work does not replace or
+  reset it. Only `aa 01` is periodic.
+- Raw receipt evidence carries connection generation and monotonic receipt
+  time. Semantic observations add a monotonically increasing revision,
+  observation source and purpose, request/operation identity where applicable,
+  command origin, and connection generation. The controller separately tokens
+  configuration, activation, and connection generations. A revision must be
+  newer than the controller barrier and belong to the current connection before
+  it can affect policy; old callbacks, equal/older revisions, cancelled workers,
+  and pre-reload timers cannot act on a newer owner.
+- The pure policy uses profile order Sleep, Low, Medium, High, Turbo. Equality at
+  a PM2.5 boundary selects the lower band. Unknown ownership uses the first
+  fresh valid revision to select an initial target. After a level is confirmed,
+  worsening air with positive confirmation requires two distinct authoritative
+  revisions separated by at least the configured delay; equal numeric readings
+  count when they are separate events, and the confirming reading may make a
+  multi-level jump. Zero delay permits the first revision. Cleaner air starts
+  every applicable downward crossing independently; each crossing uses its
+  corresponding Low→Sleep,
+  Medium→Low, High→Medium, or Turbo→High dwell and requires a newer
+  still-qualifying revision at or after maturity. Dirtier air removes
+  incompatible downward crossings. Missing, invalid, sentinel, cached, stale,
+  or command-side values do not drive policy.
+- Fan-mode provenance distinguishes matched startup restoration, exact command
+  confirmation, and genuine unsolicited physical changes. Only a physical
+  Sleep–Turbo observation yields Custom Auto ownership. A physical Auto
+  observation while active preserves ownership, invalidates old policy state,
+  and requests a fresh sample for redirection; startup Auto and command-caused
+  observations are not redirected as button presses. The fan entity continues
+  to show the actual Manual percentage while the separate switch shows policy
+  ownership.
+- Home Assistant percentage/manual and explicit Auto requests acquire one
+  coordinator lock, deactivate policy and await cancellation first, then issue
+  optional power-on and fan commands through the existing client. This
+  linearizes ownership so policy cannot race a newer Home Assistant request.
+  Explicit Auto yields ownership and selects hardware Auto. A Custom Auto
+  command uses a distinct origin but the same deadline, send budget, exact
+  acknowledgement, reconciliation, and recovery machinery as other fan
+  commands. A failed policy command waits for a newer valid sample or completed
+  recovery rather than looping.
+- Power-off preserves active intent, suspends the switch, and cancels timers,
+  samples, and pending policy ownership without issuing a fan command. Power-on
+  resumes only when available and behind a fresh-sample barrier. Disconnect
+  makes the switch unavailable but preserves active intent; operational work is
+  cancelled, one-shot ownership is released, and recovery requires a current-
+  generation observation. Cached PM2.5 from before activation, power resume,
+  option reload, or reconnect cannot drive a command.
+- Switching Custom Auto off first makes intent false and cancels policy work.
+  If authoritative power is false, no fan command is sent. If power is true and
+  the application channel is ready, a serialized handoff requests hardware
+  Auto. Unknown power or unavailability records a not-attempted handoff that an
+  explicit later OFF request may retry; command failure is retained as failed.
+  The switch remains truthfully OFF for pending, deferred, and failed handoff.
+- Saving options validates before one atomic reload. An active old controller
+  yields ownership using the same handoff before reload. The replacement starts
+  inactive. Disabling removes the stable `custom_auto` switch registry entry
+  after successful reload; re-enabling creates one switch but restores no prior
+  activation or target. Phase 3 persists no controller state or policy history.
+  Exactly one config-entry update listener is registered. Unload and failed
+  setup remove observation/entity listeners, stop and await the controller actor
+  and workers before client shutdown, and leave no one-shot request owned by a
+  replacement generation.
 - Physical-control notifications update cached state without waiting for a poll.
 - Diagnostics retain recent connection failures, Home Assistant reachability,
   essential initialization batch/attempt counts, and GATT operation deadline,

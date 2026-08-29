@@ -1,5 +1,6 @@
 """Tests for cached Home Assistant entity mappings."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -14,6 +15,12 @@ from custom_components.govee_ble_air_purifier.sensor import (
     SENSORS,
     GoveePurifierSensor,
 )
+from custom_components.govee_ble_air_purifier.switch import (
+    GoveePurifierCustomAutoSwitch,
+)
+from custom_components.govee_ble_air_purifier.switch import (
+    async_setup_entry as async_setup_switch_entry,
+)
 
 
 def _entry_and_coordinator(
@@ -25,6 +32,11 @@ def _entry_and_coordinator(
     coordinator.client_available = True
     coordinator.async_set_power = AsyncMock()
     coordinator.async_set_fan_mode = AsyncMock()
+    coordinator.async_apply_ha_fan_mode = AsyncMock()
+    coordinator.async_activate_custom_auto = AsyncMock()
+    coordinator.async_deactivate_custom_auto = AsyncMock()
+    coordinator.add_custom_auto_listener = MagicMock()
+    coordinator.custom_auto_snapshot = None
     coordinator.async_set_light_power = AsyncMock()
     coordinator.async_set_light_brightness = AsyncMock()
     coordinator.async_set_light_rgb = AsyncMock()
@@ -98,8 +110,11 @@ async def test_fan_maps_percentages_to_physical_modes(
 
     await fan.async_set_percentage(percentage)
 
+    coordinator.async_apply_ha_fan_mode.assert_awaited_once_with(
+        expected, power_on=False
+    )
     coordinator.async_set_power.assert_not_awaited()
-    coordinator.async_set_fan_mode.assert_awaited_once_with(expected)
+    coordinator.async_set_fan_mode.assert_not_awaited()
 
 
 async def test_fan_zero_percentage_powers_off() -> None:
@@ -111,21 +126,18 @@ async def test_fan_zero_percentage_powers_off() -> None:
 
     coordinator.async_set_power.assert_awaited_once_with(False)
     coordinator.async_set_fan_mode.assert_not_awaited()
+    coordinator.async_apply_ha_fan_mode.assert_not_awaited()
 
 
 async def test_fan_powers_on_before_setting_a_level() -> None:
     """An off purifier is powered before its physical level is selected."""
     entry, coordinator = _entry_and_coordinator(PurifierState(power=False))
     fan = GoveePurifierFan(entry)
-    calls: list[tuple[str, bool | FanMode]] = []
-    coordinator.async_set_power.side_effect = lambda on: calls.append(("power", on))
-    coordinator.async_set_fan_mode.side_effect = lambda mode: calls.append(
-        ("mode", mode)
-    )
-
     await fan.async_set_percentage(100)
 
-    assert calls == [("power", True), ("mode", FanMode.TURBO)]
+    coordinator.async_apply_ha_fan_mode.assert_awaited_once_with(
+        FanMode.TURBO, power_on=True
+    )
 
 
 @pytest.mark.parametrize(
@@ -141,7 +153,9 @@ async def test_manual_preset_preserves_current_level(mode: FanMode) -> None:
 
     await fan.async_set_preset_mode("manual")
 
-    coordinator.async_set_fan_mode.assert_awaited_once_with(mode)
+    coordinator.async_apply_ha_fan_mode.assert_awaited_once_with(
+        mode, power_on=False
+    )
 
 
 @pytest.mark.parametrize("mode", [FanMode.AUTO, None])
@@ -154,7 +168,9 @@ async def test_manual_preset_falls_back_to_low(mode: FanMode | None) -> None:
 
     await fan.async_set_preset_mode("manual")
 
-    coordinator.async_set_fan_mode.assert_awaited_once_with(FanMode.LOW)
+    coordinator.async_apply_ha_fan_mode.assert_awaited_once_with(
+        FanMode.LOW, power_on=False
+    )
 
 
 async def test_auto_preset_selects_hardware_auto() -> None:
@@ -164,7 +180,9 @@ async def test_auto_preset_selects_hardware_auto() -> None:
 
     await fan.async_set_preset_mode("auto")
 
-    coordinator.async_set_fan_mode.assert_awaited_once_with(FanMode.AUTO)
+    coordinator.async_apply_ha_fan_mode.assert_awaited_once_with(
+        FanMode.AUTO, power_on=False
+    )
 
 
 @pytest.mark.parametrize("method", ["set_preset", "turn_on"])
@@ -183,36 +201,29 @@ async def test_unsupported_preset_is_rejected_before_coordinator_call(
 
     coordinator.async_set_power.assert_not_awaited()
     coordinator.async_set_fan_mode.assert_not_awaited()
+    coordinator.async_apply_ha_fan_mode.assert_not_awaited()
 
 
 async def test_turn_on_percentage_takes_precedence_over_preset() -> None:
     """A percentage wins when Home Assistant supplies both mode arguments."""
     entry, coordinator = _entry_and_coordinator(PurifierState(power=False))
     fan = GoveePurifierFan(entry)
-    calls: list[tuple[str, bool | FanMode]] = []
-    coordinator.async_set_power.side_effect = lambda on: calls.append(("power", on))
-    coordinator.async_set_fan_mode.side_effect = lambda mode: calls.append(
-        ("mode", mode)
-    )
-
     await fan.async_turn_on(percentage=20, preset_mode="auto")
 
-    assert calls == [("power", True), ("mode", FanMode.SLEEP)]
+    coordinator.async_apply_ha_fan_mode.assert_awaited_once_with(
+        FanMode.SLEEP, power_on=True
+    )
 
 
 async def test_turn_on_with_preset_powers_on_before_mode() -> None:
     """Preset-only turn-on resolves and applies the preset after power."""
     entry, coordinator = _entry_and_coordinator(PurifierState(power=False))
     fan = GoveePurifierFan(entry)
-    calls: list[tuple[str, bool | FanMode]] = []
-    coordinator.async_set_power.side_effect = lambda on: calls.append(("power", on))
-    coordinator.async_set_fan_mode.side_effect = lambda mode: calls.append(
-        ("mode", mode)
-    )
-
     await fan.async_turn_on(preset_mode="auto")
 
-    assert calls == [("power", True), ("mode", FanMode.AUTO)]
+    coordinator.async_apply_ha_fan_mode.assert_awaited_once_with(
+        FanMode.AUTO, power_on=True
+    )
 
 
 async def test_turn_on_without_mode_only_powers_on() -> None:
@@ -224,6 +235,61 @@ async def test_turn_on_without_mode_only_powers_on() -> None:
 
     coordinator.async_set_power.assert_awaited_once_with(True)
     coordinator.async_set_fan_mode.assert_not_awaited()
+    coordinator.async_apply_ha_fan_mode.assert_not_awaited()
+
+
+async def test_explicit_turn_on_yields_ownership_before_power_and_mode() -> None:
+    """A requested mode cannot race policy work after power-on."""
+    entry, coordinator = _entry_and_coordinator(PurifierState(power=False))
+    fan = GoveePurifierFan(entry)
+    await fan.async_turn_on(percentage=100)
+
+    coordinator.async_apply_ha_fan_mode.assert_awaited_once_with(
+        FanMode.TURBO, power_on=True
+    )
+
+
+def test_policy_ownership_never_reports_hardware_auto_preset() -> None:
+    """The fan does not claim hardware Auto while Custom Auto owns control."""
+    entry, coordinator = _entry_and_coordinator(
+        PurifierState(power=True, fan_mode=FanMode.AUTO)
+    )
+    coordinator.custom_auto_snapshot = SimpleNamespace(active=True)
+    fan = GoveePurifierFan(entry)
+
+    assert fan.percentage is None
+    assert fan.preset_mode is None
+
+
+async def test_fan_custom_auto_listener_refreshes_and_is_removed(hass) -> None:
+    """Ownership-only changes refresh fan state without leaking a listener."""
+    entry, coordinator = _entry_and_coordinator(
+        PurifierState(power=True, fan_mode=FanMode.AUTO)
+    )
+    coordinator.custom_auto_snapshot = SimpleNamespace(active=False)
+    coordinator.async_add_listener.return_value = MagicMock()
+    remove_custom_auto_listener = MagicMock()
+    listeners = []
+
+    def add_listener(listener):
+        listeners.append(listener)
+        return remove_custom_auto_listener
+
+    coordinator.add_custom_auto_listener.side_effect = add_listener
+    fan = GoveePurifierFan(entry)
+    fan.hass = hass
+    fan.entity_id = "fan.bedroom_purifier"
+    fan.async_write_ha_state = MagicMock()
+
+    await fan.async_added_to_hass()
+    coordinator.add_custom_auto_listener.assert_called_once()
+    assert len(listeners) == 1
+    listeners[0](SimpleNamespace(active=True))
+    fan.async_write_ha_state.assert_called_once_with()
+
+    await fan.async_will_remove_from_hass()
+    remove_custom_auto_listener.assert_called_once_with()
+    assert fan._remove_custom_auto_listener is None  # noqa: SLF001
 
 
 async def test_light_maps_percent_brightness_and_rgb() -> None:
@@ -268,3 +334,73 @@ def test_entities_become_unavailable_during_quiet_bluetooth_recovery() -> None:
 
     coordinator.client_available = False
     assert not fan.available
+
+
+def test_custom_auto_switch_identity_device_availability_and_suspension() -> None:
+    """The switch is stable, device-scoped, cached, and follows availability."""
+    entry, coordinator = _entry_and_coordinator(PurifierState(power=False))
+    coordinator.custom_auto_controller = MagicMock()
+    coordinator.custom_auto_snapshot = SimpleNamespace(
+        active=True, suspended=True
+    )
+    switch = GoveePurifierCustomAutoSwitch(entry)
+
+    assert switch.unique_id == "aa:bb:cc:dd:ee:ff_custom_auto"
+    assert switch.translation_key == "custom_auto"
+    assert switch.device_info["identifiers"] == {
+        (DOMAIN, "aa:bb:cc:dd:ee:ff")
+    }
+    assert switch.is_on is True
+    assert switch.available is True
+    coordinator.client_available = False
+    assert switch.available is False
+    assert switch.is_on is True
+
+
+async def test_custom_auto_switch_activation_deactivation_and_listener_cleanup(
+    hass,
+) -> None:
+    """Controls delegate once and controller listeners do not leak."""
+    entry, coordinator = _entry_and_coordinator(PurifierState(power=True))
+    coordinator.custom_auto_snapshot = SimpleNamespace(active=False)
+    remove_listener = MagicMock()
+    listeners = []
+
+    def add_listener(listener):
+        listeners.append(listener)
+        return remove_listener
+
+    coordinator.add_custom_auto_listener.side_effect = add_listener
+    coordinator.async_add_listener.return_value = MagicMock()
+    switch = GoveePurifierCustomAutoSwitch(entry)
+    switch.hass = hass
+    switch.entity_id = "switch.bedroom_custom_auto"
+    switch.async_write_ha_state = MagicMock()
+
+    await switch.async_added_to_hass()
+    listeners[0](SimpleNamespace(active=True))
+    switch.async_write_ha_state.assert_called_once_with()
+    await switch.async_turn_on()
+    await switch.async_turn_off()
+    coordinator.async_activate_custom_auto.assert_awaited_once_with()
+    coordinator.async_deactivate_custom_auto.assert_awaited_once_with()
+
+    await switch.async_will_remove_from_hass()
+    remove_listener.assert_called_once_with()
+    assert switch._remove_custom_auto_listener is None  # noqa: SLF001
+
+
+async def test_switch_setup_adds_one_only_when_controller_exists() -> None:
+    """Disabled entries expose no switch; enabled entries expose exactly one."""
+    entry, coordinator = _entry_and_coordinator(PurifierState())
+    add_entities = MagicMock()
+
+    coordinator.custom_auto_controller = None
+    await async_setup_switch_entry(MagicMock(), entry, add_entities)
+    add_entities.assert_not_called()
+
+    coordinator.custom_auto_controller = MagicMock()
+    await async_setup_switch_entry(MagicMock(), entry, add_entities)
+    entities = add_entities.call_args.args[0]
+    assert len(entities) == 1
+    assert isinstance(entities[0], GoveePurifierCustomAutoSwitch)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, override
 
 from homeassistant.components.fan import FanEntity, FanEntityFeature
@@ -54,6 +55,29 @@ class GoveePurifierFan(GoveePurifierEntity, FanEntity):
     def __init__(self, entry: GoveeConfigEntry) -> None:
         """Initialize the fan."""
         super().__init__(entry, "fan")
+        self._remove_custom_auto_listener: Callable[[], None] | None = None
+
+    @override
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to ownership changes that do not alter purifier state."""
+        await super().async_added_to_hass()
+        if (
+            self.coordinator.custom_auto_snapshot is not None
+            and self._remove_custom_auto_listener is None
+        ):
+            self._remove_custom_auto_listener = (
+                self.coordinator.add_custom_auto_listener(
+                    lambda _: self.async_write_ha_state()
+                )
+            )
+
+    @override
+    async def async_will_remove_from_hass(self) -> None:
+        """Unsubscribe ownership refresh before entity removal."""
+        if self._remove_custom_auto_listener is not None:
+            self._remove_custom_auto_listener()
+            self._remove_custom_auto_listener = None
+        await super().async_will_remove_from_hass()
 
     @property
     @override
@@ -78,6 +102,9 @@ class GoveePurifierFan(GoveePurifierEntity, FanEntity):
         if mode in _MANUAL_MODES:
             return _PRESET_MANUAL
         if mode is FanMode.AUTO:
+            snapshot = self.coordinator.custom_auto_snapshot
+            if snapshot is not None and snapshot.active:
+                return None
             return _PRESET_AUTO
         return None
 
@@ -107,9 +134,12 @@ class GoveePurifierFan(GoveePurifierEntity, FanEntity):
         elif preset_mode is not None:
             mode = self._fan_mode_for_preset(preset_mode)
 
-        await self._async_run_operation(self.coordinator.async_set_power(True))
         if mode is not None:
-            await self._async_run_operation(self.coordinator.async_set_fan_mode(mode))
+            await self._async_run_operation(
+                self.coordinator.async_apply_ha_fan_mode(mode, power_on=True)
+            )
+            return
+        await self._async_run_operation(self.coordinator.async_set_power(True))
 
     @override
     async def async_turn_off(self, **kwargs: Any) -> None:
@@ -123,14 +153,20 @@ class GoveePurifierFan(GoveePurifierEntity, FanEntity):
             await self.async_turn_off()
             return
         mode = percentage_to_ordered_list_item(_MANUAL_MODES, percentage)
-        if self.is_on is False:
-            await self._async_run_operation(self.coordinator.async_set_power(True))
-        await self._async_run_operation(self.coordinator.async_set_fan_mode(mode))
+        await self._async_run_operation(
+            self.coordinator.async_apply_ha_fan_mode(
+                mode,
+                power_on=self.is_on is False,
+            )
+        )
 
     @override
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         """Set the Auto preset or select the current/default manual level."""
         mode = self._fan_mode_for_preset(preset_mode)
-        if self.is_on is False:
-            await self._async_run_operation(self.coordinator.async_set_power(True))
-        await self._async_run_operation(self.coordinator.async_set_fan_mode(mode))
+        await self._async_run_operation(
+            self.coordinator.async_apply_ha_fan_mode(
+                mode,
+                power_on=self.is_on is False,
+            )
+        )

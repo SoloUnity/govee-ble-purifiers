@@ -1,7 +1,7 @@
 # Bundled model profiles
 
 Purifier-specific identity, Bluetooth, application-channel, protocol,
-capability, timing, and future Custom Auto defaults are defined in validated
+capability, timing, and Custom Auto defaults are defined in validated
 JSON under `custom_components/govee_ble_air_purifier/model_profiles`. The files
 are integration assets, not user configuration. They are never loaded from a
 config entry, URL, or user-provided path.
@@ -29,7 +29,8 @@ JSON owns model-specific values:
 - checksum-valid request frames and initialization/refresh order;
 - the essential request and sole periodic request;
 - capabilities and bounded runtime timing/retry values; and
-- inactive Custom Auto defaults reserved for the next implementation phase.
+- active Custom Auto policy defaults: the ordered Sleep–Turbo modes, four PM2.5
+  boundaries, upshift confirmation, and four downshift delays.
 
 Python owns the closed implementations selected by those identifiers, Home
 Assistant scanner and route handling, Bleak clients, connection generations,
@@ -128,6 +129,16 @@ Validate the shipped bundle with:
 env PYTHONPATH=. .venv/bin/python scripts/validate_model_profiles.py
 ```
 
-The Custom Auto boundary and delay values are validated now, but remain inert.
-They do not create an entity, timer, query, or fan command until Custom Auto is
-implemented and explicitly enabled.
+The profile values are the active defaults when a user opts in to Custom Auto.
+H7124 inherits boundaries `3, 5, 9, 15`, a three-second upshift confirmation,
+and downshift delays `7, 5, 5, 5` minutes from `default`. H7129 inherits
+boundaries `7, 9, 13, 19` with the same confirmation and delays from
+`default-encrypted`. Enabling the feature writes the complete mutable setting
+set to `ConfigEntry.options`; edits remain there and never modify bundled JSON.
+A missing enable option means disabled. Profile defaults alone do not create an
+entity, timer, query, or fan command.
+
+The existing ownership, inheritance, exact-selection, and fail-closed rules are
+unchanged. In particular, mutable per-entry values live only in options; entry
+data continues to contain identity, and neither a baseline nor a malformed
+artifact can be used as a runtime fallback.

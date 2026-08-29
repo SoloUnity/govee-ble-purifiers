@@ -7,10 +7,13 @@ from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, field
 
-from .models import FanModeEvent, ProtocolCommand, SetFanMode
+from .models import FanMode, FanModeEvent, ProtocolCommand, SetFanMode
+from .observations import CommandOrigin
 from .profiles import TimingProfile
 from .protocol import GoveePurifierProtocol
 from .state_reducer import PurifierStateReducer
+
+_MAX_SUPERSEDED_FAN_ECHOES = 8
 
 
 class PurifierClientError(ConnectionError):
@@ -25,6 +28,18 @@ class CommandSuperseded(PurifierClientError):
     """Raised when a newer pending control replaces an older one."""
 
 
+class AirQualityQueryPreempted(PurifierClientError):
+    """Raised when a user command preempts a silent one-shot query."""
+
+
+class AirQualityQueryCancelled(PurifierClientError):
+    """Raised when a one-shot query is explicitly deactivated."""
+
+
+class AirQualityQueryTimeout(PurifierClientError):
+    """Normalized caller-facing timeout for one-shot air-quality work."""
+
+
 @dataclass(slots=True)
 class _Operation:
     """One absolute command and its bounded cross-reconnect evidence."""
@@ -37,6 +52,124 @@ class _Operation:
     send_diagnostics: list[str] = field(default_factory=list)
     response_failures: list[str] = field(default_factory=list)
     observed_fan_frames: list[str] = field(default_factory=list)
+    operation_id: int | None = None
+    origin: CommandOrigin = CommandOrigin.HOME_ASSISTANT
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    quiesced: asyncio.Event = field(default_factory=asyncio.Event)
+    force_fan_confirmation: bool = False
+
+
+@dataclass(slots=True)
+class _AirQualityRequest:
+    """One connection-scoped, coalesced one-shot request."""
+
+    future: asyncio.Future[None]
+    deadline: float
+    generation: int
+    request_id: int
+    active: bool = False
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    quiesced: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+class AirQualityQueryController:
+    """Own the lower-priority one-shot lane without performing asynchronous I/O."""
+
+    def __init__(self) -> None:
+        self.request: _AirQualityRequest | None = None
+        self.event = asyncio.Event()
+        self._next_request_id = 0
+
+    def acquire(
+        self,
+        *,
+        loop: asyncio.AbstractEventLoop,
+        now: float,
+        timeout: float,
+        generation: int,
+    ) -> _AirQualityRequest:
+        """Coalesce with current work or create one absolute-deadline request."""
+        current = self.request
+        if current is not None:
+            if current.future.done():
+                raise RuntimeError("Previous air-quality query is still tearing down")
+            if current.generation == generation:
+                return current
+            self.fail(
+                current,
+                PurifierClientError("Air-quality query connection ended"),
+            )
+            if current.active:
+                raise RuntimeError("Previous air-quality query is still tearing down")
+        self._next_request_id += 1
+        request = _AirQualityRequest(
+            future=loop.create_future(),
+            deadline=now + timeout,
+            generation=generation,
+            request_id=self._next_request_id,
+        )
+        self.request = request
+        self.event.set()
+        return request
+
+    def take(self, *, now: float, generation: int) -> _AirQualityRequest | None:
+        """Activate pending current-generation work, settling stale/expired work."""
+        request = self.request
+        if request is None or request.future.done() or request.active:
+            return None
+        if request.generation != generation:
+            self.fail(
+                request,
+                PurifierClientError("Air-quality query connection ended"),
+            )
+            return None
+        if now >= request.deadline:
+            self.fail(
+                request,
+                AirQualityQueryTimeout("Air-quality query deadline expired"),
+            )
+            return None
+        request.active = True
+        self.event.clear()
+        return request
+
+    def complete(self, request: _AirQualityRequest) -> None:
+        """Complete exactly the active request."""
+        if self.request is request and not request.future.done():
+            request.future.set_result(None)
+        self.release(request)
+
+    def fail(self, request: _AirQualityRequest, error: Exception) -> None:
+        """Settle one request and interrupt it if active."""
+        if not request.future.done():
+            request.future.set_exception(error)
+        request.cancel_event.set()
+        if not request.active:
+            self.release(request)
+
+    def cancel(self) -> _AirQualityRequest | None:
+        """Explicitly deactivate pending or active one-shot work."""
+        request = self.request
+        if request is not None and not request.future.done():
+            self.fail(request, AirQualityQueryCancelled("Air-quality query cancelled"))
+        return request
+
+    def disconnect(self) -> None:
+        """Settle all connection-scoped work without retaining it for recovery."""
+        request = self.request
+        if request is not None and not request.future.done():
+            self.fail(
+                request,
+                PurifierClientError("Air-quality query connection ended"),
+            )
+
+    def release(self, request: _AirQualityRequest) -> None:
+        """Clear ownership after the one owner has stopped executing the request."""
+        request.active = False
+        if self.request is request and request.future.done():
+            self.request = None
+            self.event.clear()
+        request.quiesced.set()
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +209,11 @@ class CommandOperationController:
         self.active: _Operation | None = None
         self.event = asyncio.Event()
         self._last_command_diagnostics: str | None = None
+        self._next_operation_id = 0
+        self._fan_modes_requiring_confirmation: set[FanMode] = set()
+        self._superseded_fan_echoes: deque[tuple[int, bytes]] = deque(
+            maxlen=_MAX_SUPERSEDED_FAN_ECHOES
+        )
 
     @property
     def last_command_diagnostics(self) -> str | None:
@@ -93,14 +231,24 @@ class CommandOperationController:
         *,
         loop: asyncio.AbstractEventLoop,
         now: float,
+        origin: CommandOrigin = CommandOrigin.HOME_ASSISTANT,
     ) -> _Operation:
         """Create and queue one command after superseding matching pending work."""
+        self._next_operation_id += 1
         operation = _Operation(
             command,
             loop.create_future(),
             now + self.timings.command_deadline,
             created_at=now,
+            operation_id=self._next_operation_id,
+            origin=origin,
         )
+        if (
+            isinstance(command, SetFanMode)
+            and command.mode in self._fan_modes_requiring_confirmation
+        ):
+            operation.force_fan_confirmation = True
+            self._fan_modes_requiring_confirmation.discard(command.mode)
         self._coalesce_pending(operation)
         self.pending.append(operation)
         self.event.set()
@@ -119,6 +267,7 @@ class CommandOperationController:
         """Release an operation after the client finishes its async execution."""
         if self.active is operation:
             self.active = None
+        operation.quiesced.set()
 
     def has_pending(self, *, now: float) -> bool:
         """Return whether an unexpired user command is waiting for the owner."""
@@ -156,7 +305,7 @@ class CommandOperationController:
                 generation=generation,
             )
             return False
-        if self.reconcile(operation):
+        if not operation.force_fan_confirmation and self.reconcile(operation):
             return False
         if operation.send_attempts >= self.send_attempt_limit:
             self.fail(
@@ -208,6 +357,99 @@ class CommandOperationController:
             operation.future.set_result(None)
         self._last_command_diagnostics = None
 
+    def supersede_active_fan_by_physical(self, *, generation: int) -> bool:
+        """Cancel sent fan work after a physical update takes authority."""
+        operation = self.active
+        if (
+            operation is None
+            or not isinstance(operation.command, SetFanMode)
+            or operation.send_attempts == 0
+            or operation.future.done()
+        ):
+            return False
+        operation.future.set_exception(
+            CommandSuperseded(
+                "Physical fan control superseded this request"
+            )
+        )
+        operation.cancel_event.set()
+        self._fan_modes_requiring_confirmation.add(operation.command.mode)
+        for pending in self.pending:
+            if (
+                isinstance(pending.command, SetFanMode)
+                and pending.command.mode is operation.command.mode
+            ):
+                pending.force_fan_confirmation = True
+                self._fan_modes_requiring_confirmation.discard(
+                    operation.command.mode
+                )
+        self.reserve_active_fan_echo_by_physical(generation=generation)
+        return True
+
+    def reserve_active_fan_echo_by_physical(self, *, generation: int) -> bool:
+        """Reserve an old echo as soon as a valid physical frame is received."""
+        operation = self.active
+        if (
+            operation is None
+            or not isinstance(operation.command, SetFanMode)
+            or operation.send_attempts == 0
+        ):
+            return False
+        stale = (
+            generation,
+            self._protocol.command_request(operation.command).frame,
+        )
+        if stale not in self._superseded_fan_echoes:
+            self._superseded_fan_echoes.append(stale)
+        return True
+
+    def discard_active_fan_echo_reservation(self, *, generation: int) -> None:
+        """Discard a provisional reservation after ee-05 matches the command."""
+        operation = self.active
+        if operation is None or not isinstance(operation.command, SetFanMode):
+            return
+        stale = (
+            generation,
+            self._protocol.command_request(operation.command).frame,
+        )
+        with suppress(ValueError):
+            self._superseded_fan_echoes.remove(stale)
+
+    def consume_superseded_fan_echo(
+        self, *, generation: int, frame: bytes
+    ) -> bool:
+        """Consume one exact 3a acknowledgement belonging to superseded work."""
+        if not frame.startswith(b"\x3a\x05"):
+            return False
+        for stale in tuple(self._superseded_fan_echoes):
+            if stale == (generation, frame):
+                self._superseded_fan_echoes.remove(stale)
+                return True
+        return False
+
+    def clear_superseded_fan_echoes(self) -> None:
+        """Forget stale-echo ownership at a connection lifecycle boundary."""
+        self._superseded_fan_echoes.clear()
+
+    def _retire_superseded_fan_echo_for_send(
+        self, operation: _Operation, *, generation: int
+    ) -> None:
+        """Let a forced replacement own its matching echoes once sending starts."""
+        if not (
+            operation.force_fan_confirmation
+            and isinstance(operation.command, SetFanMode)
+        ):
+            return
+        echo = self._protocol.command_request(operation.command).frame
+        self._superseded_fan_echoes = deque(
+            (
+                stale
+                for stale in self._superseded_fan_echoes
+                if stale != (generation, echo)
+            ),
+            maxlen=_MAX_SUPERSEDED_FAN_ECHOES,
+        )
+
     def record_send(
         self,
         operation: _Operation,
@@ -216,6 +458,9 @@ class CommandOperationController:
         now: float,
     ) -> None:
         """Spend one send attempt and append its bounded timeline evidence."""
+        self._retire_superseded_fan_echo_for_send(
+            operation, generation=generation
+        )
         operation.send_attempts += 1
         elapsed = now - operation.created_at if operation.created_at > 0 else 0.0
         operation.send_diagnostics.append(
@@ -266,6 +511,7 @@ class CommandOperationController:
                     reason="Command deadline expired while queued",
                     generation=generation,
                 )
+                operation.quiesced.set()
             else:
                 retained.append(operation)
         self.pending.extend(retained)
@@ -276,8 +522,14 @@ class CommandOperationController:
         """Cancel a caller-abandoned operation and remove it if still queued."""
         if not operation.future.done():
             operation.future.cancel()
+        operation.cancel_event.set()
+        was_pending = operation in self.pending
         with suppress(ValueError):
             self.pending.remove(operation)
+        if was_pending:
+            operation.quiesced.set()
+        if not any(not pending.future.done() for pending in self.pending):
+            self.event.clear()
 
     def fail(
         self,
@@ -319,6 +571,7 @@ class CommandOperationController:
         active: _Operation | None = None,
     ) -> None:
         """Fail captured active and currently queued commands during shutdown."""
+        self.clear_superseded_fan_echoes()
         current = active if active is not None else self.active
         if current is not None and not current.future.done():
             current.future.set_exception(error)
@@ -326,6 +579,7 @@ class CommandOperationController:
             operation = self.pending.popleft()
             if not operation.future.done():
                 operation.future.set_exception(error)
+            operation.quiesced.set()
 
     def record_fan_frame(
         self,
@@ -341,6 +595,7 @@ class CommandOperationController:
         operation = self._pending_fan_operation()
         if operation is None:
             return None
+        assert isinstance(operation.command, SetFanMode)
 
         mode: str | None = None
         if frame.startswith(b"\x3a\x05"):
@@ -395,6 +650,7 @@ class CommandOperationController:
                 pending.future.set_exception(
                     CommandSuperseded("A newer control superseded this request")
                 )
+                pending.quiesced.set()
             else:
                 retained.append(pending)
         self.pending.extend(retained)

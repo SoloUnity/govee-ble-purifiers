@@ -11,17 +11,77 @@
         "data_description": {
           "address": "Select the purifier you want Home Assistant to configure."
         }
+      },
+      "enable_custom_auto": {
+        "title": "Enable Custom Auto",
+        "description": "Custom Auto uses PM2.5 readings to select the purifier's fan level. It is disabled by default and can be enabled later in the integration settings.",
+        "data": {
+          "custom_auto_enabled": "Enable Custom Auto"
+        }
+      },
+      "custom_auto_settings": {
+        "title": "Custom Auto settings",
+        "description": "Set the PM2.5 boundaries and the time required before Custom Auto changes fan levels.",
+        "data": {
+          "pm25_boundary_sleep_low": "Sleep to Low PM2.5 boundary",
+          "pm25_boundary_low_medium": "Low to Medium PM2.5 boundary",
+          "pm25_boundary_medium_high": "Medium to High PM2.5 boundary",
+          "pm25_boundary_high_turbo": "High to Turbo PM2.5 boundary",
+          "custom_auto_upshift_confirmation_seconds": "Upshift confirmation (seconds)",
+          "downshift_low_sleep_minutes": "Low to Sleep delay (minutes)",
+          "downshift_medium_low_minutes": "Medium to Low delay (minutes)",
+          "downshift_high_medium_minutes": "High to Medium delay (minutes)",
+          "downshift_turbo_high_minutes": "Turbo to High delay (minutes)"
+        }
       }
     },
     "error": {
       "cannot_connect": "Could not connect to and initialize the purifier. Make sure it is powered on, in Bluetooth range, and not connected to the Govee app.",
-      "not_discovered": "Home Assistant cannot currently see this purifier from a connectable Bluetooth adapter or proxy."
+      "not_discovered": "Home Assistant cannot currently see this purifier from a connectable Bluetooth adapter or proxy.",
+      "boundaries_not_ascending": "PM2.5 boundaries must increase from Sleep to Turbo.",
+      "invalid_integer": "Enter whole numbers for all Custom Auto settings.",
+      "value_out_of_range": "One or more Custom Auto values are outside the allowed range.",
+      "invalid_custom_auto_settings": "The Custom Auto settings are invalid.",
+      "stored_options_invalid": "The saved Custom Auto settings are invalid. Disable Custom Auto or enable it and save a complete replacement configuration."
     },
     "abort": {
       "model_profile_invalid": "The bundled purifier model profiles are invalid. Reinstall or update the integration, restart Home Assistant, and try again.",
       "already_configured": "This purifier is already configured.",
       "devices_seen_without_supported_name": "Home Assistant received fresh Bluetooth advertisements, but none included or retained a supported Govee H7124 or H7129 purifier name. Move the purifier or Bluetooth proxy closer, close the Govee app, and try Add device again.",
       "no_devices_found": "No unconfigured Govee H7124 or H7129 air purifiers were seen during the Bluetooth scan. Make sure the purifier is powered on, in range, and disconnected from the Govee app."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Enable Custom Auto",
+        "description": "Custom Auto uses PM2.5 readings to select the purifier's fan level.",
+        "data": {
+          "custom_auto_enabled": "Enable Custom Auto"
+        }
+      },
+      "custom_auto_settings": {
+        "title": "Custom Auto settings",
+        "description": "Set the PM2.5 boundaries and the time required before Custom Auto changes fan levels.",
+        "data": {
+          "pm25_boundary_sleep_low": "Sleep to Low PM2.5 boundary",
+          "pm25_boundary_low_medium": "Low to Medium PM2.5 boundary",
+          "pm25_boundary_medium_high": "Medium to High PM2.5 boundary",
+          "pm25_boundary_high_turbo": "High to Turbo PM2.5 boundary",
+          "custom_auto_upshift_confirmation_seconds": "Upshift confirmation (seconds)",
+          "downshift_low_sleep_minutes": "Low to Sleep delay (minutes)",
+          "downshift_medium_low_minutes": "Medium to Low delay (minutes)",
+          "downshift_high_medium_minutes": "High to Medium delay (minutes)",
+          "downshift_turbo_high_minutes": "Turbo to High delay (minutes)"
+        }
+      }
+    },
+    "error": {
+      "boundaries_not_ascending": "PM2.5 boundaries must increase from Sleep to Turbo.",
+      "invalid_integer": "Enter whole numbers for all Custom Auto settings.",
+      "value_out_of_range": "One or more Custom Auto values are outside the allowed range.",
+      "invalid_custom_auto_settings": "The Custom Auto settings are invalid.",
+      "stored_options_invalid": "The saved Custom Auto settings are invalid. Disable Custom Auto or enable it and save a complete replacement configuration."
     }
   },
   "entity": {
@@ -36,6 +96,11 @@
       },
       "filter_life": {
         "name": "Filter life"
+      }
+    },
+    "switch": {
+      "custom_auto": {
+        "name": "Custom Auto"
       }
     }
   },

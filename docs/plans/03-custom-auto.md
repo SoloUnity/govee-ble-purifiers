@@ -1,5 +1,8 @@
 # Phase 3 — Opt-In Custom Auto
 
+**Status: implemented in the working tree. This status does not claim a release
+or version change.**
+
 ## Goal
 
 Add one integration-managed **Custom Auto** switch per purifier. The feature is
@@ -22,7 +25,7 @@ changes use the existing coordinator and reliable-client command path.
 
 ## Dependencies
 
-Do not implement Phase 3 until:
+Phase 3 was implemented after:
 
 - Phase 1 has frozen the five-level Manual/Auto fan UI.
 - Phase 2 supplies a validated immutable profile, capabilities, and these
@@ -37,18 +40,20 @@ The four downshift delays apply respectively to Low→Sleep, Medium→Low,
 High→Medium, and Turbo→High. Mutable per-entry values live in options; defaults
 must never be duplicated in Python or localization strings.
 
-## Required pre-implementation decision
+## Approved implementation decision
 
-Before controller code begins, write a short decision record, present the final
-recommendation, and obtain maintainer approval for both sample count and PM2.5
-source. Tests must encode the approved decision.
+The maintainer approved the sample count, PM2.5 source, and handoff in
+[decision 0001](../decisions/0001-custom-auto-sampling-and-handoff.md). Tests
+encode the approved behavior.
 
-### Initial recommendation
+### Approved confirmation policy
 
-- **Upshift:** when the configured confirmation is positive, require two
-  distinct authoritative PM2.5 revisions separated by the confirmation window.
-  The confirming reading selects the target and may jump several levels. A zero
-  delay permits the first valid reading.
+- **Upshift:** after a level is confirmed, when the configured confirmation is
+  positive, require two distinct authoritative PM2.5 revisions separated by the
+  confirmation window. The confirming reading selects the target and may jump
+  several levels. Activation with unknown ownership uses its first fresh valid
+  reading to select an initial target. A zero delay also permits the first valid
+  reading for a later upshift.
 - **Downshift:** one qualifying reading starts the configured dwell, but a fresh
   still-qualifying reading at or after maturity is required before slowing down.
   Dirtier air resets incompatible downward dwell.
@@ -60,25 +65,24 @@ source. Tests must encode the approved decision.
 This asymmetric policy reacts quickly to worsening air while refusing to slow
 the fan based on old data.
 
-### PM2.5 source decision
+### Approved PM2.5 source
 
-Compare and document:
+The alternatives considered were:
 
 1. startup/refresh and unsolicited `ee 19` observations only;
 2. opt-in fixed-cadence `aa 19` sampling while Custom Auto is active; and
 3. event-driven observations plus bounded one-shot `aa 19` requests at
    activation, confirmation, or matured-downshift boundaries.
 
-The recommended starting point is option 3, provided traces/runtime evidence
-confirm the existing `aa 19` request is authoritative for both models. It avoids
-a new permanent cadence while ensuring confirmation does not depend on stale
-data. If evidence shows unsolicited updates are sufficiently regular, prefer
-option 1. Do not introduce fixed periodic `aa 19` polling without explicit
-approval and an architecture-policy update.
+Option 3 is implemented: authoritative event-driven observations plus bounded
+one-shot `aa 19` requests at activation, confirmation, and matured-downshift
+boundaries. Treating the response as authoritative PM2.5 is an approved
+implementation assumption supplied by the maintainer, not new wire evidence.
+The implementation adds no fixed `aa 19` cadence and makes no protocol-document
+claim from that assumption.
 
-Any approved query path must be bounded, serialized by the existing one-owner
-scheduler, preemptible by user controls, and must preserve the `aa 01` health
-poll.
+The one-shot path is bounded, serialized by the existing one-owner scheduler,
+preemptible by user controls, and preserves the `aa 01` health poll.
 
 ## Configuration and entity exposure
 
@@ -109,9 +113,10 @@ validation:
   reload/restart, never across an explicit feature disable.
 - Register one update listener and avoid listener accumulation.
 
-Recommended handoff when disabling an active feature: request hardware Auto if
-the purifier is powered on; if off, clear intent without powering it on. Confirm
-this at the decision gate.
+The approved handoff when disabling an active feature requests hardware Auto if
+the purifier is powered on and usable. If it is off, intent is cleared without
+powering it on; unknown power or unavailability records that the handoff was not
+attempted, and a command error records failure.
 
 ### Custom Auto switch
 
@@ -285,3 +290,7 @@ Continue redacting device identity and all H7129 session material.
 - Weak signal produces suspended/recovering behavior, not stale decisions or
   command storms.
 - Documentation is updated with every implemented slice and all tests pass.
+
+These Phase 3 criteria are implemented in the working tree. Phase 4 remains
+future work: this phase does not persist activation, the previous fan target,
+samples, timers, or policy history across reloads or restarts.

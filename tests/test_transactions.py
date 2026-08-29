@@ -10,6 +10,7 @@ import pytest
 from custom_components.govee_ble_air_purifier import client as client_module
 from custom_components.govee_ble_air_purifier.frame import build_frame
 from custom_components.govee_ble_air_purifier.models import Model
+from custom_components.govee_ble_air_purifier.observations import ReceivedFrame
 from custom_components.govee_ble_air_purifier.profiles import DeviceProfile
 from custom_components.govee_ble_air_purifier.protocol import GoveePurifierProtocol
 from custom_components.govee_ble_air_purifier.transactions import (
@@ -25,12 +26,12 @@ def _executor(
 ) -> tuple[
     TransactionExecutor,
     GoveePurifierProtocol,
-    asyncio.Queue[bytes],
+    asyncio.Queue[ReceivedFrame],
     asyncio.Event,
     asyncio.Event,
 ]:
     protocol = GoveePurifierProtocol(DeviceProfile.for_model(Model.H7124))
-    frame_queue: asyncio.Queue[bytes] = asyncio.Queue()
+    frame_queue: asyncio.Queue[ReceivedFrame] = asyncio.Queue()
     disconnected = asyncio.Event()
     command_wake = asyncio.Event()
     executor = TransactionExecutor(
@@ -41,6 +42,10 @@ def _executor(
         disconnect_error=disconnect_error or (lambda: RuntimeError("disconnected")),
     )
     return executor, protocol, frame_queue, disconnected, command_wake
+
+
+def _received(frame: bytes, *, received_at: float = 1.0) -> ReceivedFrame:
+    return ReceivedFrame(frame=frame, generation=1, received_at=received_at)
 
 
 def test_client_reexports_transaction_control_errors() -> None:
@@ -61,8 +66,8 @@ async def test_executor_reduces_every_candidate_and_authorizes_only_completion(
     )
     ignored = build_frame(b"\xaa\x05\x01\x03")
     matched = build_frame(b"\xaa\x05\x03\x00\x00\x14")
-    frame_queue.put_nowait(ignored)
-    frame_queue.put_nowait(matched)
+    frame_queue.put_nowait(_received(ignored))
+    frame_queue.put_nowait(_received(matched, received_at=2.0))
     sent: list[bytes] = []
     effects: list[str] = []
     reduced: list[tuple[bytes, str | None]] = []
@@ -71,7 +76,10 @@ async def test_executor_reduces_every_candidate_and_authorizes_only_completion(
         assert executor.active_request == descriptor.name
         sent.append(frame)
 
-    def reduce(frame: bytes, *, matched_request: str | None = None) -> None:
+    def reduce(
+        received: ReceivedFrame, *, matched_request: str | None = None
+    ) -> None:
+        frame = received.frame
         protocol.decode(frame)
         reduced.append((frame, matched_request))
 
@@ -112,14 +120,17 @@ async def test_executor_bounds_attempts_and_retains_ignored_evidence() -> None:
         _: float,
         *,
         interrupt_for_command: bool = False,
-    ) -> bytes:
+    ) -> ReceivedFrame:
         assert not interrupt_for_command
         candidate = next(candidates)
         if candidate is None:
             raise TimeoutError
-        return candidate
+        return _received(candidate)
 
-    def reduce(frame: bytes, *, matched_request: str | None = None) -> None:
+    def reduce(
+        received: ReceivedFrame, *, matched_request: str | None = None
+    ) -> None:
+        frame = received.frame
         assert matched_request is None
         protocol.decode(frame)
         reductions.append(frame)
@@ -163,7 +174,7 @@ async def test_next_frame_disconnect_wins_and_command_wake_is_optional() -> None
     loop = asyncio.get_running_loop()
 
     disconnected.set()
-    frame_queue.put_nowait(build_frame(b"\xaa\x01\x01"))
+    frame_queue.put_nowait(_received(build_frame(b"\xaa\x01\x01")))
     with pytest.raises(RuntimeError, match="link dropped"):
         await executor.async_next_frame(loop.time() + 1)
 

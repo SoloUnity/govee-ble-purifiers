@@ -55,4 +55,5 @@ async def async_get_config_entry_diagnostics(
             field: _diagnostic_value(getattr(state, field, None))
             for field in _STATE_FIELDS
         },
+        "custom_auto": coordinator.custom_auto_diagnostic_snapshot(),
     }

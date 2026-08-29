@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -27,6 +27,7 @@ from custom_components.govee_ble_air_purifier.bluetooth_profile import (
     bluetooth_settings_from_profile,
 )
 from custom_components.govee_ble_air_purifier.client import (
+    ClientStatus,
     ReliablePurifierClient,
     _Operation,
 )
@@ -35,9 +36,24 @@ from custom_components.govee_ble_air_purifier.models import (
     FanMode,
     Model,
     PurifierState,
+    QueryAirQuality,
     SetFanMode,
     SetNightLightColor,
     SetPower,
+)
+from custom_components.govee_ble_air_purifier.observations import (
+    AirQualityObservation,
+    CommandOrigin,
+    FanModeObservation,
+    ObservationPurpose,
+    ObservationSource,
+    ReceivedFrame,
+)
+from custom_components.govee_ble_air_purifier.operations import (
+    AirQualityQueryCancelled,
+    AirQualityQueryPreempted,
+    AirQualityQueryTimeout,
+    PurifierClientError,
 )
 from custom_components.govee_ble_air_purifier.profiles import DeviceProfile
 from custom_components.govee_ble_air_purifier.protocol import (
@@ -177,6 +193,14 @@ def test_old_generation_callbacks_are_ignored() -> None:
 
     assert client._frame_queue.empty()
     assert not client._disconnected.is_set()
+
+
+def test_connection_generation_is_exposed_read_only() -> None:
+    """Lifecycle consumers can tag controller events without private access."""
+    client = make_client()
+    client._session_generation = 7
+
+    assert client.connection_generation == 7
 
 
 def test_explicit_validation_budget_is_five_minutes() -> None:
@@ -484,13 +508,13 @@ async def test_cancelling_transaction_wait_cleans_up_child_tasks() -> None:
 
 @pytest.mark.asyncio
 async def test_cancelling_idle_wait_cleans_up_child_tasks() -> None:
-    """Idle-loop cancellation cleans up all three temporary wait tasks."""
+    """Idle-loop cancellation cleans up all temporary wait tasks."""
     client = make_client()
     before = set(asyncio.all_tasks())
     wait_task = asyncio.create_task(client._async_wait_for_ready_work(60))
     await asyncio.sleep(0)
     child_tasks = set(asyncio.all_tasks()) - before - {wait_task}
-    assert len(child_tasks) == 3
+    assert len(child_tasks) == 4
 
     wait_task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -1043,8 +1067,12 @@ async def test_transaction_applies_only_the_active_mode_selector_response() -> N
         descriptor.name: descriptor
         for descriptor in client._protocol.initialization_requests()
     }
-    client._frame_queue.put_nowait(build_frame(b"\xaa\x05\x00\x01\x03"))
-    client._frame_queue.put_nowait(build_frame(b"\xaa\x05\x03\x00\x00\x14"))
+    client._frame_queue.put_nowait(
+        ReceivedFrame(build_frame(b"\xaa\x05\x00\x01\x03"), 0, 1.0)
+    )
+    client._frame_queue.put_nowait(
+        ReceivedFrame(build_frame(b"\xaa\x05\x03\x00\x00\x14"), 0, 2.0)
+    )
 
     await client._async_execute_descriptor(
         descriptors["mode_data_03"],
@@ -1222,6 +1250,7 @@ async def test_periodic_poll_uses_three_attempts_on_existing_connection() -> Non
         *,
         attempts: int,
         is_periodic_poll: bool = False,
+        **_: object,
     ) -> tuple[bytes, ...]:
         calls.append((descriptor.name, attempts, is_periodic_poll))
         client._stopping.set()
@@ -1245,6 +1274,7 @@ async def test_periodic_poll_exhaustion_leaves_ready_loop_for_reconnect() -> Non
         *,
         attempts: int,
         is_periodic_poll: bool = False,
+        **_: object,
     ) -> tuple[bytes, ...]:
         assert descriptor.name == "device_state"
         assert attempts == 3
@@ -1698,6 +1728,641 @@ async def test_timeout_reports_zero_received_frames_per_attempt(
     assert "attempt 1/2: received=0" in message
     assert "attempt 2/2: received=0" in message
     assert "ignored_sample=none" in message
+
+
+@pytest.mark.asyncio
+async def test_semantic_observations_preserve_equal_events_and_exact_provenance(
+) -> None:
+    """Equal authoritative events get revisions and fan sources follow matching."""
+    client = make_client()
+    observations: list[AirQualityObservation | FanModeObservation] = []
+    client._observation_callback = observations.append
+    client._session_generation = 4
+    air = build_frame(b"\xaa\x19\x00\x00\x07\x00\x00\x64")
+
+    client._process_plaintext_frame(
+        air,
+        matched_request="QueryAirQuality",
+        purpose=ObservationPurpose.ONE_SHOT,
+        request_id=9,
+    )
+    client._process_plaintext_frame(
+        air,
+        matched_request="QueryAirQuality",
+        purpose=ObservationPurpose.ONE_SHOT,
+        request_id=10,
+    )
+
+    first, second = observations
+    assert isinstance(first, AirQualityObservation)
+    assert isinstance(second, AirQualityObservation)
+    assert first.pm25 == second.pm25 == 7
+    assert second.revision == first.revision + 1
+    assert (first.request_id, second.request_id) == (9, 10)
+    assert first.generation == 4
+    assert first.observed_at <= second.observed_at
+    with pytest.raises(FrozenInstanceError):
+        first.pm25 = 8  # type: ignore[misc]
+
+    operation = _Operation(
+        SetFanMode(FanMode.HIGH),
+        asyncio.get_running_loop().create_future(),
+        asyncio.get_running_loop().time() + 30,
+        operation_id=12,
+        origin=CommandOrigin.CUSTOM_AUTO,
+    )
+    client._active_operation = operation
+    client._process_plaintext_frame(
+        build_frame(b"\xee\x05\x01\x03"),
+        matched_request="SetFanMode",
+        purpose=ObservationPurpose.COMMAND,
+        operation_id=12,
+        command_origin=CommandOrigin.CUSTOM_AUTO,
+    )
+    client._process_plaintext_frame(
+        build_frame(b"\xee\x05\x01\x01"),
+        purpose=ObservationPurpose.COMMAND,
+        operation_id=12,
+        command_origin=CommandOrigin.CUSTOM_AUTO,
+    )
+
+    command, physical = observations[-2:]
+    assert isinstance(command, FanModeObservation)
+    assert command.source is ObservationSource.COMMAND
+    assert command.operation_id == 12
+    assert command.command_origin is CommandOrigin.CUSTOM_AUTO
+    assert isinstance(physical, FanModeObservation)
+    assert physical.source is ObservationSource.PHYSICAL
+    assert physical.operation_id is None
+    assert physical.command_origin is None
+    operation.future.cancel()
+
+
+@pytest.mark.asyncio
+async def test_startup_and_echo_observation_classification_and_stale_rejection(
+) -> None:
+    """Matched aa-05 is startup; 3a echoes and stale generations publish nothing."""
+    client = make_client()
+    observations: list[AirQualityObservation | FanModeObservation] = []
+    client._observation_callback = observations.append
+    client._session_generation = 5
+
+    client._process_plaintext_frame(
+        build_frame(b"\xaa\x05\x00\x01\x02"),
+        matched_request="mode_data_00",
+        generation=5,
+        purpose=ObservationPurpose.STARTUP,
+    )
+    client._process_plaintext_frame(build_frame(b"\x3a\x05\x01\x02"))
+    client._process_plaintext_frame(
+        build_frame(b"\xee\x05\x01\x03"), generation=4
+    )
+
+    assert len(observations) == 1
+    startup = observations[0]
+    assert isinstance(startup, FanModeObservation)
+    assert startup.source is ObservationSource.STARTUP
+    assert startup.mode is FanMode.MEDIUM
+
+
+@pytest.mark.asyncio
+async def test_one_shot_query_coalesces_one_send_and_preserves_poll_due() -> None:
+    """Concurrent callers share one aa-19 send without touching aa-01 cadence."""
+    client = make_client()
+    client._session_generation = 2
+    client.status = ClientStatus.READY
+    client._runner = asyncio.current_task()
+    due = asyncio.get_running_loop().time() + 60
+    client._next_poll_due = due
+
+    class AirChannel(SilentChannel):
+        async def async_send(self, frame: bytes) -> None:
+            await super().async_send(frame)
+            client._on_plaintext_frame(
+                2,
+                build_frame(b"\xaa\x19\x00\x00\x08\x00\x00\x63"),
+            )
+
+    channel = AirChannel()
+    client._channel = channel  # type: ignore[assignment]
+    ready = asyncio.create_task(client._async_ready_loop())
+    first = asyncio.create_task(client.async_query_air_quality())
+    second = asyncio.create_task(client.async_query_air_quality())
+
+    await asyncio.gather(first, second)
+    client._stopping.set()
+    client._air_quality_queries.event.set()
+    await ready
+
+    assert len(channel.writes) == 1
+    assert channel.writes[0][:2] == b"\xaa\x19"
+    assert client._next_poll_due == due
+
+
+@pytest.mark.asyncio
+async def test_active_one_shot_is_preempted_by_command_without_resume() -> None:
+    """A command wake immediately settles a silent one-shot as preempted."""
+    client = make_client()
+    client._session_generation = 3
+    client._channel = SilentChannel()  # type: ignore[assignment]
+    loop = asyncio.get_running_loop()
+    request = client._air_quality_queries.acquire(
+        loop=loop,
+        now=loop.time(),
+        timeout=30,
+        generation=3,
+    )
+    assert client._air_quality_queries.take(now=loop.time(), generation=3) is request
+    owner = asyncio.create_task(client._async_execute_air_quality_query(request))
+    while not client._channel.writes:  # type: ignore[union-attr]
+        await asyncio.sleep(0)
+
+    command = client._command_operations.enqueue(
+        SetPower(True), loop=loop, now=loop.time()
+    )
+    await owner
+
+    assert isinstance(request.future.exception(), AirQualityQueryPreempted)
+    assert len(client._channel.writes) == 1  # type: ignore[union-attr]
+    assert client._air_quality_queries.request is None
+    client._command_operations.cancel(command)
+
+
+@pytest.mark.asyncio
+async def test_one_shot_explicit_cancellation_pending_and_active() -> None:
+    """Deactivation settles both pending and in-flight requests without retries."""
+    client = make_client()
+    client._session_generation = 6
+    loop = asyncio.get_running_loop()
+    pending = client._air_quality_queries.acquire(
+        loop=loop, now=loop.time(), timeout=30, generation=6
+    )
+    await client.async_cancel_air_quality_query()
+    assert isinstance(pending.future.exception(), AirQualityQueryCancelled)
+
+    client._channel = SilentChannel()  # type: ignore[assignment]
+    observations: list[AirQualityObservation | FanModeObservation] = []
+    client._observation_callback = observations.append
+    active = client._air_quality_queries.acquire(
+        loop=loop, now=loop.time(), timeout=30, generation=6
+    )
+    assert client._air_quality_queries.take(now=loop.time(), generation=6) is active
+    owner = asyncio.create_task(client._async_execute_air_quality_query(active))
+    while not client._channel.writes:  # type: ignore[union-attr]
+        await asyncio.sleep(0)
+    await client.async_cancel_air_quality_query()
+    await owner
+
+    assert isinstance(active.future.exception(), AirQualityQueryCancelled)
+    assert len(client._channel.writes) == 1  # type: ignore[union-attr]
+
+    client._process_plaintext_frame(
+        build_frame(b"\xaa\x19\x00\x00\x09\x00\x00\x62"),
+        generation=6,
+    )
+    assert isinstance(observations[-1], AirQualityObservation)
+    assert observations[-1].pm25 == 9
+    assert isinstance(active.future.exception(), AirQualityQueryCancelled)
+
+
+@pytest.mark.asyncio
+async def test_one_shot_query_preempts_and_defers_active_refresh() -> None:
+    """The scheduler enforces one-shot priority over a silent refresh request."""
+    client = make_client()
+    _set_client_timings(client, transaction_timeout=30)
+    client._session_generation = 4
+    client._channel = SilentChannel()  # type: ignore[assignment]
+    descriptors = client._protocol.refresh_requests()
+    refresh = asyncio.create_task(client._async_run_refresh(descriptors))
+    while not client._channel.writes:  # type: ignore[union-attr]
+        await asyncio.sleep(0)
+
+    loop = asyncio.get_running_loop()
+    query = client._air_quality_queries.acquire(
+        loop=loop, now=loop.time(), timeout=30, generation=4
+    )
+    await asyncio.wait_for(refresh, 0.1)
+
+    assert client._refresh_pending
+    assert client._refresh_resume_requests == descriptors
+    assert len(client._channel.writes) == 1  # type: ignore[union-attr]
+    await client.async_cancel_air_quality_query()
+    assert isinstance(query.future.exception(), AirQualityQueryCancelled)
+
+
+@pytest.mark.asyncio
+async def test_one_shot_disconnect_shutdown_and_backoff_do_not_retain_or_wake(
+) -> None:
+    """Connection edges settle the lane, which never participates in recovery."""
+    client = make_client()
+    client._session_generation = 7
+    loop = asyncio.get_running_loop()
+    disconnected = client._air_quality_queries.acquire(
+        loop=loop, now=loop.time(), timeout=30, generation=7
+    )
+    client._on_disconnected(7, 7)
+    assert isinstance(disconnected.future.exception(), PurifierClientError)
+    assert client._air_quality_queries.request is None
+
+    shutdown = client._air_quality_queries.acquire(
+        loop=loop, now=loop.time(), timeout=30, generation=7
+    )
+    await client.async_shutdown()
+    assert isinstance(shutdown.future.exception(), PurifierClientError)
+
+    client = make_client()
+    client._session_generation = 8
+    backoff = asyncio.create_task(client._async_backoff(_backoff_plan(client, 60)))
+    await asyncio.sleep(0)
+    pending = client._air_quality_queries.acquire(
+        loop=loop, now=loop.time(), timeout=30, generation=8
+    )
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(asyncio.shield(backoff), 0.01)
+    backoff.cancel()
+    await asyncio.gather(backoff, return_exceptions=True)
+    await client.async_cancel_air_quality_query()
+    assert isinstance(pending.future.exception(), AirQualityQueryCancelled)
+
+
+@pytest.mark.asyncio
+async def test_received_envelope_preserves_receipt_time_and_rejects_stale_frames(
+) -> None:
+    """Queued observations retain immutable callback-time generation and time."""
+    client = make_client()
+    client._session_generation = 11
+    observations: list[AirQualityObservation | FanModeObservation] = []
+    client._observation_callback = observations.append
+    frame = build_frame(b"\xaa\x19\x00\x00\x0a\x00\x00\x61")
+
+    client._on_plaintext_frame(11, frame)
+    received = client._frame_queue.get_nowait()
+    assert isinstance(received, ReceivedFrame)
+    assert received.frame == frame
+    with pytest.raises(FrozenInstanceError):
+        received.generation = 12  # type: ignore[misc]
+
+    await asyncio.sleep(0)
+    client._process_plaintext_frame(received, matched_request="air_quality")
+    assert observations[-1].observed_at == received.received_at
+
+    client._process_plaintext_frame(
+        ReceivedFrame(frame, generation=10, received_at=received.received_at + 1)
+    )
+    assert len(observations) == 1
+
+    client._channel = SilentChannel()  # type: ignore[assignment]
+    stale = build_frame(b"\xaa\x19\x00\x00\x0c\x00\x00\x5f")
+    current = build_frame(b"\xaa\x19\x00\x00\x0d\x00\x00\x5e")
+    client._frame_queue.put_nowait(
+        ReceivedFrame(stale, generation=10, received_at=received.received_at + 2)
+    )
+    client._frame_queue.put_nowait(
+        ReceivedFrame(current, generation=11, received_at=received.received_at + 3)
+    )
+    await client._async_execute_descriptor(
+        client._protocol.command_request(QueryAirQuality()),
+        attempts=1,
+        purpose=ObservationPurpose.ONE_SHOT,
+        request_id=22,
+    )
+    latest = observations[-1]
+    assert isinstance(latest, AirQualityObservation)
+    assert latest.pm25 == 13
+    assert latest.request_id == 22
+    assert all(
+        not isinstance(observation, AirQualityObservation)
+        or observation.pm25 != 12
+        for observation in observations
+    )
+
+
+@pytest.mark.asyncio
+async def test_unmatched_events_never_inherit_active_request_metadata() -> None:
+    """One-shot context cannot label unsolicited air or physical fan events."""
+    client = make_client()
+    client._session_generation = 3
+    observations: list[AirQualityObservation | FanModeObservation] = []
+    client._observation_callback = observations.append
+    now = asyncio.get_running_loop().time()
+
+    client._process_plaintext_frame(
+        ReceivedFrame(
+            build_frame(b"\xee\x19\x00\x00\x0b\x00\x00\x60"), 3, now
+        ),
+        purpose=ObservationPurpose.ONE_SHOT,
+        request_id=41,
+        operation_id=42,
+        command_origin=CommandOrigin.CUSTOM_AUTO,
+    )
+    client._process_plaintext_frame(
+        ReceivedFrame(build_frame(b"\xee\x05\x01\x01"), 3, now + 0.1),
+        purpose=ObservationPurpose.ONE_SHOT,
+        request_id=41,
+        operation_id=42,
+        command_origin=CommandOrigin.CUSTOM_AUTO,
+    )
+
+    air, fan = observations
+    assert isinstance(air, AirQualityObservation)
+    assert air.request_id is air.operation_id is air.command_origin is None
+    assert isinstance(fan, FanModeObservation)
+    assert fan.source is ObservationSource.PHYSICAL
+    assert fan.request_id is fan.operation_id is fan.command_origin is None
+
+
+@pytest.mark.parametrize(
+    ("physical_frame", "physical_mode"),
+    [
+        ("ee 05 03 00 00 14", FanMode.AUTO),
+        ("ee 05 01 02 00 00", FanMode.MEDIUM),
+    ],
+)
+@pytest.mark.parametrize("old_ack_before_replacement", [True, False])
+@pytest.mark.asyncio
+async def test_physical_fan_supersedes_old_ack_and_forces_replacement_write(
+    physical_frame: str,
+    physical_mode: FanMode,
+    old_ack_before_replacement: bool,
+) -> None:
+    """Pre-send old echoes are ignored, while B's first echo confirms B."""
+    client = make_client()
+    client._session_generation = 8
+    channel = SilentChannel()
+    client._channel = channel  # type: ignore[assignment]
+    loop = asyncio.get_running_loop()
+    command = SetFanMode(FanMode.HIGH)
+    old = client._command_operations.enqueue(  # noqa: SLF001
+        command, loop=loop, now=loop.time()
+    )
+    assert client._command_operations.take_next(  # noqa: SLF001
+        now=loop.time(), generation=8
+    ) is old
+    old_task = asyncio.create_task(client._async_execute_operation(old))
+    while not channel.writes:
+        await asyncio.sleep(0)
+
+    client._on_plaintext_frame(8, build_frame(bytes.fromhex(physical_frame)))
+    old_exact_ack = client._protocol.command_request(command).frame
+    if old_ack_before_replacement:
+        # Exercise back-to-back callbacks before the transaction can dequeue
+        # and reduce the physical frame.
+        client._on_plaintext_frame(8, old_exact_ack)
+    await old_task
+    client._command_operations.release(old)  # noqa: SLF001
+    assert isinstance(old.future.exception(), client_module.CommandSuperseded)
+    assert old.quiesced.is_set()
+    assert client.state.fan_mode is physical_mode
+
+    assert client.state.fan_mode is physical_mode
+    replacement = client._command_operations.enqueue(  # noqa: SLF001
+        command, loop=loop, now=loop.time()
+    )
+    assert client._command_operations.take_next(  # noqa: SLF001
+        now=loop.time(), generation=8
+    ) is replacement
+    replacement_task = asyncio.create_task(
+        client._async_execute_operation(replacement)
+    )
+    while len(channel.writes) < 2:
+        await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert not replacement_task.done()
+    assert client.state.fan_mode is physical_mode
+    client._on_plaintext_frame(8, old_exact_ack)
+    await replacement_task
+    client._command_operations.release(replacement)  # noqa: SLF001
+    assert replacement.future.done() and replacement.future.exception() is None
+    assert client.state.fan_mode is FanMode.HIGH
+    assert channel.writes == [old_exact_ack, old_exact_ack]
+
+
+@pytest.mark.asyncio
+async def test_matching_ee_fan_ack_leaves_no_tombstone_for_later_command(
+) -> None:
+    """A correlated ee-05 must not steal a later command's first exact ack."""
+    client = make_client()
+    client._session_generation = 8
+    channel = SilentChannel()
+    client._channel = channel  # type: ignore[assignment]
+    loop = asyncio.get_running_loop()
+    command = SetFanMode(FanMode.HIGH)
+
+    current = client._command_operations.enqueue(  # noqa: SLF001
+        command, loop=loop, now=loop.time()
+    )
+    assert client._command_operations.take_next(  # noqa: SLF001
+        now=loop.time(), generation=8
+    ) is current
+    current_task = asyncio.create_task(client._async_execute_operation(current))
+    while not channel.writes:
+        await asyncio.sleep(0)
+    client._on_plaintext_frame(8, build_frame(b"\xee\x05\x01\x03"))
+    await current_task
+    client._command_operations.release(current)  # noqa: SLF001
+    assert client.state.fan_mode is FanMode.HIGH
+    assert not client._command_operations._superseded_fan_echoes  # noqa: SLF001
+
+    client._process_plaintext_frame(
+        ReceivedFrame(
+            build_frame(b"\xee\x05\x03\x00\x00\x14"),
+            generation=8,
+            received_at=loop.time(),
+        )
+    )
+    assert client.state.fan_mode is FanMode.AUTO
+
+    later = client._command_operations.enqueue(  # noqa: SLF001
+        command, loop=loop, now=loop.time()
+    )
+    assert client._command_operations.take_next(  # noqa: SLF001
+        now=loop.time(), generation=8
+    ) is later
+    later_task = asyncio.create_task(client._async_execute_operation(later))
+    while len(channel.writes) < 2:
+        await asyncio.sleep(0)
+    exact_ack = client._protocol.command_request(command).frame
+    client._on_plaintext_frame(8, exact_ack)
+    async with asyncio.timeout(0.1):
+        await later_task
+    client._command_operations.release(later)  # noqa: SLF001
+    assert later.future.done() and later.future.exception() is None
+    assert client.state.fan_mode is FanMode.HIGH
+
+
+@pytest.mark.asyncio
+async def test_same_mode_ee_immediately_after_exact_ack_is_physical(
+) -> None:
+    """Elapsed time cannot turn an unmatched same-mode ee into command provenance."""
+    client = make_client()
+    client._session_generation = 5
+    observations: list[AirQualityObservation | FanModeObservation] = []
+    client._observation_callback = observations.append
+
+    class EchoChannel(SilentChannel):
+        async def async_send(self, frame: bytes) -> None:
+            await super().async_send(frame)
+            client._on_plaintext_frame(5, frame)
+
+    client._channel = EchoChannel()  # type: ignore[assignment]
+    loop = asyncio.get_running_loop()
+    operation = _Operation(
+        SetFanMode(FanMode.HIGH),
+        loop.create_future(),
+        loop.time() + 30,
+        operation_id=71,
+        origin=CommandOrigin.HANDOFF,
+    )
+    client._active_operation = operation
+
+    await client._async_execute_operation(operation)
+
+    assert client.state.fan_mode is FanMode.HIGH
+    confirmed = observations[-1]
+    assert isinstance(confirmed, FanModeObservation)
+    assert confirmed.source is ObservationSource.COMMAND
+    assert confirmed.operation_id == 71
+    assert confirmed.command_origin is CommandOrigin.HANDOFF
+
+    client._process_plaintext_frame(
+        ReceivedFrame(
+            build_frame(b"\xee\x05\x01\x03"),
+            5,
+            confirmed.observed_at + 0.1,
+        )
+    )
+    late = observations[-1]
+    assert isinstance(late, FanModeObservation)
+    assert late.source is ObservationSource.PHYSICAL
+    assert late.operation_id is None
+    assert late.command_origin is None
+
+    client._process_plaintext_frame(
+        ReceivedFrame(
+            build_frame(b"\xee\x05\x01\x03"),
+            5,
+            confirmed.observed_at + 0.2,
+        )
+    )
+    assert observations[-1].source is ObservationSource.PHYSICAL
+
+
+@pytest.mark.asyncio
+async def test_matching_ee_fan_confirmation_does_not_publish_duplicate() -> None:
+    """The matched ee semantic event is not repeated after command application."""
+    client = make_client()
+    client._session_generation = 6
+    observations: list[AirQualityObservation | FanModeObservation] = []
+    client._observation_callback = observations.append
+
+    class FanEventChannel(SilentChannel):
+        async def async_send(self, frame: bytes) -> None:
+            await super().async_send(frame)
+            client._on_plaintext_frame(6, build_frame(b"\xee\x05\x01\x02"))
+
+    client._channel = FanEventChannel()  # type: ignore[assignment]
+    loop = asyncio.get_running_loop()
+    operation = _Operation(
+        SetFanMode(FanMode.MEDIUM),
+        loop.create_future(),
+        loop.time() + 30,
+        operation_id=72,
+        origin=CommandOrigin.CUSTOM_AUTO,
+    )
+    client._active_operation = operation
+
+    await client._async_execute_operation(operation)
+
+    fan_observations = [
+        observation
+        for observation in observations
+        if isinstance(observation, FanModeObservation)
+    ]
+    assert len(fan_observations) == 1
+    assert fan_observations[0].source is ObservationSource.COMMAND
+    assert fan_observations[0].operation_id == 72
+
+
+@pytest.mark.asyncio
+async def test_quiescent_cancel_allows_new_request_id_without_overlap() -> None:
+    """Immediate cancel then requery waits for teardown before allocating work."""
+    client = make_client()
+    client._session_generation = 9
+    client._channel = SilentChannel()  # type: ignore[assignment]
+    loop = asyncio.get_running_loop()
+    first = client._air_quality_queries.acquire(
+        loop=loop, now=loop.time(), timeout=30, generation=9
+    )
+    assert client._air_quality_queries.take(now=loop.time(), generation=9) is first
+    owner = asyncio.create_task(client._async_execute_air_quality_query(first))
+    while not client._channel.writes:  # type: ignore[union-attr]
+        await asyncio.sleep(0)
+
+    await client.async_cancel_air_quality_query()
+    await owner
+    second = client._air_quality_queries.acquire(
+        loop=loop, now=loop.time(), timeout=30, generation=9
+    )
+
+    assert first.quiesced.is_set()
+    assert second.request_id != first.request_id
+    assert not second.active
+    assert len(client._channel.writes) == 1  # type: ignore[union-attr]
+    await client.async_cancel_air_quality_query()
+
+
+@pytest.mark.asyncio
+async def test_generic_query_command_behavior_and_one_shot_error_containment() -> None:
+    """Generic queries stay in the command queue; low-priority faults do not escape."""
+    client = make_client()
+    client._runner = asyncio.current_task()
+    generic = asyncio.create_task(client.async_execute(QueryAirQuality()))
+    await asyncio.sleep(0)
+    assert isinstance(client._operations[0].command, QueryAirQuality)
+    assert client._air_quality_queries.request is None
+    generic.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await generic
+
+    class BrokenChannel(SilentChannel):
+        async def async_send(self, frame: bytes) -> None:
+            self.writes.append(frame)
+            raise RuntimeError("local low-priority fault")
+
+    client._session_generation = 10
+    client._channel = BrokenChannel()  # type: ignore[assignment]
+    loop = asyncio.get_running_loop()
+    request = client._air_quality_queries.acquire(
+        loop=loop, now=loop.time(), timeout=30, generation=10
+    )
+    assert client._air_quality_queries.take(now=loop.time(), generation=10) is request
+
+    await client._async_execute_air_quality_query(request)
+
+    error = request.future.exception()
+    assert isinstance(error, PurifierClientError)
+    assert "local low-priority fault" in str(error)
+    assert request.quiesced.is_set()
+    assert client._air_quality_queries.request is None
+
+    _set_client_timings(client, transaction_timeout=0.01)
+    client._channel = SilentChannel()  # type: ignore[assignment]
+    timeout_request = client._air_quality_queries.acquire(
+        loop=loop,
+        now=loop.time(),
+        timeout=client._timings.transaction_timeout,
+        generation=10,
+    )
+    assert (
+        client._air_quality_queries.take(now=loop.time(), generation=10)
+        is timeout_request
+    )
+
+    await client._async_execute_air_quality_query(timeout_request)
+
+    assert isinstance(timeout_request.future.exception(), AirQualityQueryTimeout)
+    assert len(client._channel.writes) == 1  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio

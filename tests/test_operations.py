@@ -18,7 +18,10 @@ from custom_components.govee_ble_air_purifier.models import (
     SetNightLightColor,
     SetPower,
 )
+from custom_components.govee_ble_air_purifier.observations import CommandOrigin
 from custom_components.govee_ble_air_purifier.operations import (
+    AirQualityQueryCancelled,
+    AirQualityQueryController,
     CommandDeadlineExceeded,
     CommandOperationController,
     CommandSuperseded,
@@ -105,6 +108,102 @@ async def test_active_command_is_not_superseded_and_only_one_can_be_taken() -> N
     assert controller.take_next(now=11.0, generation=1) is replacement
     active.future.cancel()
     replacement.future.cancel()
+
+
+@pytest.mark.asyncio
+async def test_physical_authority_forces_replacement_send_and_consumes_old_echo(
+) -> None:
+    controller, reducer = make_controller()
+    loop = asyncio.get_running_loop()
+    active = controller.enqueue(
+        SetFanMode(FanMode.HIGH), loop=loop, now=10.0
+    )
+    assert controller.take_next(now=10.0, generation=1) is active
+    controller.record_send(active, generation=1, now=10.1)
+
+    assert controller.supersede_active_fan_by_physical(generation=1)
+    assert isinstance(active.future.exception(), CommandSuperseded)
+    assert active.cancel_event.is_set()
+    reducer.replace_state(PurifierState(fan_mode=FanMode.HIGH))
+    replacement = controller.enqueue(
+        SetFanMode(FanMode.HIGH), loop=loop, now=11.0
+    )
+    assert replacement.force_fan_confirmation
+    assert controller.prepare_for_execution(
+        replacement, now=11.0, generation=1
+    )
+    assert not replacement.future.done()
+
+    echo = build_frame(bytes.fromhex("3a 05 01 03"))
+    assert controller.consume_superseded_fan_echo(
+        generation=1, frame=echo
+    )
+    assert not controller.consume_superseded_fan_echo(
+        generation=1, frame=echo
+    )
+    replacement.future.cancel()
+
+
+@pytest.mark.asyncio
+async def test_forced_replacement_send_retires_matching_old_echo() -> None:
+    """The first matching echo after replacement transmission belongs to it."""
+    controller, _ = make_controller()
+    loop = asyncio.get_running_loop()
+    command = SetFanMode(FanMode.HIGH)
+    active = controller.enqueue(command, loop=loop, now=10.0)
+    assert controller.take_next(now=10.0, generation=1) is active
+    controller.record_send(active, generation=1, now=10.1)
+    assert controller.supersede_active_fan_by_physical(generation=1)
+    controller.release(active)
+
+    replacement = controller.enqueue(command, loop=loop, now=11.0)
+    assert replacement.force_fan_confirmation
+    controller.record_send(replacement, generation=1, now=11.1)
+
+    echo = build_frame(bytes.fromhex("3a 05 01 03"))
+    assert not controller.consume_superseded_fan_echo(
+        generation=1, frame=echo
+    )
+    replacement.future.cancel()
+
+
+@pytest.mark.asyncio
+async def test_superseded_echoes_are_bounded_and_clear_at_generation_boundary(
+) -> None:
+    controller, _ = make_controller()
+    loop = asyncio.get_running_loop()
+    echo = build_frame(bytes.fromhex("3a 05 01 03"))
+
+    for index in range(12):
+        active = controller.enqueue(
+            SetFanMode(FanMode.HIGH), loop=loop, now=float(index)
+        )
+        assert controller.take_next(now=float(index), generation=index) is active
+        controller.record_send(
+            active, generation=index, now=float(index) + 0.1
+        )
+        assert controller.supersede_active_fan_by_physical(generation=index)
+        assert isinstance(active.future.exception(), CommandSuperseded)
+        controller.release(active)
+
+    consumed = sum(
+        controller.consume_superseded_fan_echo(generation=index, frame=echo)
+        for index in range(12)
+    )
+    assert consumed == 8
+
+    active = controller.enqueue(
+        SetFanMode(FanMode.HIGH), loop=loop, now=20.0
+    )
+    assert controller.take_next(now=20.0, generation=3) is active
+    controller.record_send(active, generation=3, now=20.1)
+    assert controller.supersede_active_fan_by_physical(generation=3)
+    assert isinstance(active.future.exception(), CommandSuperseded)
+    controller.clear_superseded_fan_echoes()
+    assert not controller.consume_superseded_fan_echo(
+        generation=3, frame=echo
+    )
+    controller.release(active)
 
 
 @pytest.mark.asyncio
@@ -235,3 +334,36 @@ async def test_shutdown_fails_captured_active_and_all_pending_commands() -> None
     assert isinstance(pending.future.exception(), PurifierClientError)
     assert not controller.pending
     assert controller.event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_command_identity_origin_and_one_shot_coalescing_are_immutable_data(
+) -> None:
+    """Commands get unique origins while one-shot callers share one request."""
+    controller, _ = make_controller()
+    loop = asyncio.get_running_loop()
+    first = controller.enqueue(
+        SetPower(True),
+        loop=loop,
+        now=1.0,
+        origin=CommandOrigin.HANDOFF,
+    )
+    second = controller.enqueue(
+        SetFanMode(FanMode.HIGH),
+        loop=loop,
+        now=2.0,
+        origin=CommandOrigin.CUSTOM_AUTO,
+    )
+    assert first.operation_id != second.operation_id
+    assert first.origin is CommandOrigin.HANDOFF
+    assert second.origin is CommandOrigin.CUSTOM_AUTO
+
+    lane = AirQualityQueryController()
+    query = lane.acquire(loop=loop, now=3.0, timeout=4.0, generation=5)
+    coalesced = lane.acquire(loop=loop, now=3.5, timeout=4.0, generation=5)
+    assert coalesced is query
+    assert query.deadline == 7.0
+    lane.cancel()
+    assert isinstance(query.future.exception(), AirQualityQueryCancelled)
+    first.future.cancel()
+    second.future.cancel()

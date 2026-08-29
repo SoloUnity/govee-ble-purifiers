@@ -3,7 +3,7 @@
 import asyncio
 import json
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -26,6 +26,13 @@ from custom_components.govee_ble_air_purifier import (
     setup_validation as setup_validation_module,
 )
 from custom_components.govee_ble_air_purifier.const import CONF_MODEL, DOMAIN
+from custom_components.govee_ble_air_purifier.custom_auto_options import (
+    CONF_CUSTOM_AUTO_DOWNSHIFT_DELAYS_MINUTES,
+    CONF_CUSTOM_AUTO_ENABLED,
+    CONF_CUSTOM_AUTO_PM25_BOUNDARIES,
+    CONF_CUSTOM_AUTO_UPSHIFT_CONFIRMATION_SECONDS,
+    CustomAutoOptionsError,
+)
 from custom_components.govee_ble_air_purifier.discovery import (
     DiscoveredPurifier,
     PurifierDiscoveryService,
@@ -273,6 +280,10 @@ async def test_user_flow_selects_discovered_purifier_without_address_entry(
             result["flow_id"],
             {CONF_ADDRESS: discovery.address},
         )
+        assert result["step_id"] == "enable_custom_auto"
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_CUSTOM_AUTO_ENABLED: False}
+        )
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == discovery.name
@@ -280,6 +291,7 @@ async def test_user_flow_selects_discovered_purifier_without_address_entry(
         CONF_ADDRESS: discovery.address,
         CONF_MODEL: "H7129",
     }
+    assert result["options"] == {CONF_CUSTOM_AUTO_ENABLED: False}
     validate.assert_awaited_once_with(
         address=discovery.address,
         model="H7129",
@@ -823,7 +835,6 @@ async def test_user_flow_requires_fresh_selected_device_advertisement(
             result["flow_id"],
             {CONF_ADDRESS: discovery.address},
         )
-
     assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {"base": "not_discovered"}
     process_advertisements.assert_awaited_once()
@@ -869,6 +880,9 @@ async def test_user_flow_retains_valid_name_when_fresh_packet_is_nameless(
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             {CONF_ADDRESS: discovery.address},
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_CUSTOM_AUTO_ENABLED: False}
         )
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
@@ -937,10 +951,293 @@ async def test_user_flow_accepts_fresh_cache_when_callback_is_deduplicated(
             result["flow_id"],
             {CONF_ADDRESS: discovery.address},
         )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_CUSTOM_AUTO_ENABLED: False}
+        )
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert cached_calls >= 2
     validate.assert_awaited_once()
+
+
+def _custom_auto_form_values(
+    boundaries: Sequence[object],
+    *,
+    upshift: object = 3,
+    downshifts: Sequence[object] | None = None,
+) -> dict[str, object]:
+    """Return scalar settings in the Home Assistant form shape."""
+    delays = downshifts or [7, 5, 5, 5]
+    return {
+        "pm25_boundary_sleep_low": boundaries[0],
+        "pm25_boundary_low_medium": boundaries[1],
+        "pm25_boundary_medium_high": boundaries[2],
+        "pm25_boundary_high_turbo": boundaries[3],
+        CONF_CUSTOM_AUTO_UPSHIFT_CONFIRMATION_SECONDS: upshift,
+        "downshift_low_sleep_minutes": delays[0],
+        "downshift_medium_low_minutes": delays[1],
+        "downshift_high_medium_minutes": delays[2],
+        "downshift_turbo_high_minutes": delays[3],
+    }
+
+
+@pytest.mark.parametrize(
+    ("model", "boundaries"),
+    [("H7124", [3, 5, 9, 15]), ("H7129", [7, 9, 13, 19])],
+)
+async def test_options_enable_uses_profile_defaults_and_normalizes_values(
+    hass: HomeAssistant, model: str, boundaries: list[int]
+) -> None:
+    """Both model baselines populate scalar forms and store only shared keys."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ADDRESS: "AA:BB:CC:DD:EE:FF", CONF_MODEL: model},
+        options={},
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] is FlowResultType.FORM
+    assert result["data_schema"]({}) == {}
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {CONF_CUSTOM_AUTO_ENABLED: True}
+    )
+    assert result["step_id"] == "custom_auto_settings"
+    defaults = result["data_schema"]({})
+    for key, value in zip(
+        (
+            "pm25_boundary_sleep_low",
+            "pm25_boundary_low_medium",
+            "pm25_boundary_medium_high",
+            "pm25_boundary_high_turbo",
+        ),
+        boundaries,
+        strict=True,
+    ):
+        assert defaults[key] == value
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], _custom_auto_form_values(boundaries)
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"] == {
+        CONF_CUSTOM_AUTO_ENABLED: True,
+        CONF_CUSTOM_AUTO_PM25_BOUNDARIES: boundaries,
+        CONF_CUSTOM_AUTO_UPSHIFT_CONFIRMATION_SECONDS: 3,
+        CONF_CUSTOM_AUTO_DOWNSHIFT_DELAYS_MINUTES: [7, 5, 5, 5],
+    }
+
+
+@pytest.mark.parametrize(
+    ("values", "error"),
+    [
+        (_custom_auto_form_values([3, 5, 5, 15]), "boundaries_not_ascending"),
+        (_custom_auto_form_values([3, 5.5, 9, 15]), "invalid_integer"),
+        (_custom_auto_form_values([3, 5, 9, 1000]), "value_out_of_range"),
+        (_custom_auto_form_values([3, 5, 9, 15], upshift=301), "value_out_of_range"),
+    ],
+)
+async def test_options_reject_invalid_custom_auto_settings(
+    hass: HomeAssistant, values: dict[str, object], error: str
+) -> None:
+    """The shared parser supplies stable localized validation outcomes."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ADDRESS: "AA:BB:CC:DD:EE:FF", CONF_MODEL: "H7124"},
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {CONF_CUSTOM_AUTO_ENABLED: True}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], values
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": error}
+
+
+def test_options_flow_error_keys_have_translations() -> None:
+    """Every error emitted by the options flow resolves in its namespace."""
+    strings_path = (
+        Path(__file__).parents[1]
+        / "custom_components"
+        / "govee_ble_air_purifier"
+        / "strings.json"
+    )
+    strings = json.loads(strings_path.read_text())
+
+    assert {
+        "boundaries_not_ascending",
+        "invalid_integer",
+        "value_out_of_range",
+        "invalid_custom_auto_settings",
+        "stored_options_invalid",
+    } <= strings["options"]["error"].keys()
+
+
+async def test_options_missing_enable_disables_and_clears_mutable_values(
+    hass: HomeAssistant,
+) -> None:
+    """Missing enable is disabled and writes one stable disabled shape."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ADDRESS: "AA:BB:CC:DD:EE:FF", CONF_MODEL: "H7129"},
+        options={
+            CONF_CUSTOM_AUTO_ENABLED: True,
+            CONF_CUSTOM_AUTO_PM25_BOUNDARIES: [8, 10, 14, 20],
+        },
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {}
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"] == {CONF_CUSTOM_AUTO_ENABLED: False}
+
+
+async def test_invalid_stored_options_can_be_repaired_by_disabling(
+    hass: HomeAssistant,
+) -> None:
+    """An unloaded invalid entry remains accessible for immediate disable."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ADDRESS: "AA:BB:CC:DD:EE:FF", CONF_MODEL: "H7124"},
+        options={
+            CONF_CUSTOM_AUTO_ENABLED: True,
+            CONF_CUSTOM_AUTO_PM25_BOUNDARIES: [3, 5, 5, 15],
+        },
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["errors"] == {"base": "stored_options_invalid"}
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {CONF_CUSTOM_AUTO_ENABLED: False}
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"] == {CONF_CUSTOM_AUTO_ENABLED: False}
+
+
+async def test_invalid_stored_options_can_be_replaced_completely(
+    hass: HomeAssistant,
+) -> None:
+    """Profile defaults seed a complete valid replacement without trapping."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ADDRESS: "AA:BB:CC:DD:EE:FF", CONF_MODEL: "H7129"},
+        options={
+            CONF_CUSTOM_AUTO_ENABLED: True,
+            CONF_CUSTOM_AUTO_PM25_BOUNDARIES: [7, 9, 9, 19],
+        },
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["errors"] == {"base": "stored_options_invalid"}
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {CONF_CUSTOM_AUTO_ENABLED: True}
+    )
+    assert result["errors"] == {"base": "stored_options_invalid"}
+    assert result["data_schema"]({})[
+        "pm25_boundary_sleep_low"
+    ] == 7
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], _custom_auto_form_values([8, 10, 14, 20])
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"] == {
+        CONF_CUSTOM_AUTO_ENABLED: True,
+        CONF_CUSTOM_AUTO_PM25_BOUNDARIES: [8, 10, 14, 20],
+        CONF_CUSTOM_AUTO_UPSHIFT_CONFIRMATION_SECONDS: 3,
+        CONF_CUSTOM_AUTO_DOWNSHIFT_DELAYS_MINUTES: [7, 5, 5, 5],
+    }
+
+
+@pytest.mark.parametrize(
+    ("model", "boundaries"),
+    [("H7124", [3, 5, 9, 15]), ("H7129", [7, 9, 13, 19])],
+)
+async def test_setup_enable_uses_profile_defaults_validates_and_normalizes(
+    hass: HomeAssistant, model: str, boundaries: list[int]
+) -> None:
+    """The complete setup opt-in leg uses each model's profile defaults."""
+    flow = config_flow_module.GoveeBleAirPurifierConfigFlow()
+    flow.hass = hass
+    flow._registry = get_profile_registry()  # noqa: SLF001
+    flow._pending_title = f"Test {model}"  # noqa: SLF001
+    flow._pending_data = {  # noqa: SLF001
+        CONF_ADDRESS: "AA:BB:CC:DD:EE:FF",
+        CONF_MODEL: model,
+    }
+
+    result = await flow.async_step_enable_custom_auto()
+    assert result["step_id"] == "enable_custom_auto"
+    result = await flow.async_step_enable_custom_auto(
+        {CONF_CUSTOM_AUTO_ENABLED: True}
+    )
+    assert result["step_id"] == "custom_auto_settings"
+    defaults = result["data_schema"]({})
+    assert [
+        defaults["pm25_boundary_sleep_low"],
+        defaults["pm25_boundary_low_medium"],
+        defaults["pm25_boundary_medium_high"],
+        defaults["pm25_boundary_high_turbo"],
+    ] == boundaries
+
+    result = await flow.async_step_custom_auto_settings(
+        _custom_auto_form_values([3, 5, 5, 15])
+    )
+    assert result["errors"] == {"base": "boundaries_not_ascending"}
+    result = await flow.async_step_custom_auto_settings(
+        _custom_auto_form_values(boundaries)
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["options"] == {
+        CONF_CUSTOM_AUTO_ENABLED: True,
+        CONF_CUSTOM_AUTO_PM25_BOUNDARIES: boundaries,
+        CONF_CUSTOM_AUTO_UPSHIFT_CONFIRMATION_SECONDS: 3,
+        CONF_CUSTOM_AUTO_DOWNSHIFT_DELAYS_MINUTES: [7, 5, 5, 5],
+    }
+
+
+async def test_flow_maps_unrecognized_parser_error_to_generic_key(
+    hass: HomeAssistant,
+) -> None:
+    """Unexpected shared-parser messages retain the stable generic mapping."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ADDRESS: "AA:BB:CC:DD:EE:FF", CONF_MODEL: "H7124"},
+        options={},
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {CONF_CUSTOM_AUTO_ENABLED: True}
+    )
+    original_parser = config_flow_module.parse_custom_auto_options
+
+    def parse_or_fail(raw, defaults):
+        if raw.get(CONF_CUSTOM_AUTO_ENABLED) is True:
+            raise CustomAutoOptionsError("unrecognized parser failure")
+        return original_parser(raw, defaults)
+
+    with patch.object(
+        config_flow_module,
+        "parse_custom_auto_options",
+        side_effect=parse_or_fail,
+    ):
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], _custom_auto_form_values([3, 5, 9, 15])
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "invalid_custom_auto_settings"}
 
 
 async def test_user_flow_aborts_when_no_supported_device_is_visible(

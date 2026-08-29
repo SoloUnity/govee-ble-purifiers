@@ -14,4 +14,5 @@ PLATFORMS: Final[list[Platform]] = [
     Platform.FAN,
     Platform.LIGHT,
     Platform.SENSOR,
+    Platform.SWITCH,
 ]
