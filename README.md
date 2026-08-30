@@ -81,10 +81,12 @@ should be updated as follows:
 
 Custom Auto is an optional Home Assistant policy that uses authoritative PM2.5
 observations to select the existing Sleep, Low, Medium, High, or Turbo mode. It
-is disabled by default and is not a new purifier mode. During initial setup,
-select **Enable Custom Auto** after purifier validation to review its settings.
-For an existing purifier, open **Settings > Devices & services**, select the
-integration, open the purifier's **Configure** flow, and enable it there.
+is disabled by default and is not a new purifier mode. The **Enable Custom
+Auto** option exposes and configures the feature and its switch; it does not
+turn the runtime switch ON. During initial setup, select the option after
+purifier validation to review its settings. For an existing purifier, open
+**Settings > Devices & services**, select the integration, open the purifier's
+**Configure** flow, and enable it there.
 
 The bundled profiles provide these initial settings:
 
@@ -134,13 +136,32 @@ Custom Auto has these runtime semantics:
   not attempted, and a command error is recorded as failed; the switch remains
   truthfully OFF rather than claiming policy ownership.
 
+The feature option and the switch's runtime selection are separate. The
+integration remembers only whether the Custom Auto switch is ON or OFF for each
+config entry. It never saves a fan speed, hysteresis band, PM2.5 sample or
+decision, target, timer, confirmation, prior command, or other policy history.
+After a normal reload or Home Assistant restart, remembered ON is armed and
+waiting: it sends no fan command until a valid authoritative PM2.5 observation
+arrives after activation on the current startup and connection. It then
+calculates the target from scratch. Turning the switch OFF and later ON uses the
+same fresh-reading barrier and never restores the prior fan speed.
+
+Weak signal, an unavailable purifier, or missing PM2.5 does not silently change
+the remembered ON selection. The switch entity follows normal availability,
+and the armed controller remains command-free until current data is usable.
+Normal integration reload, Home Assistant restart, and shutdown preserve the
+ON/OFF selection. Disabling and re-enabling the feature or config entry clears
+it and starts OFF. Hiding, disabling, or removing the switch entity also clears
+it as a safety policy; unhiding or re-enabling the entity leaves it OFF. Removing
+the config entry clears its memory.
+
 Saving Custom Auto options validates the complete setting set and reloads the
-entry once. Editing settings while policy is active first performs the same
-switch-off handoff; the reloaded controller starts inactive. Disabling the
-feature removes its switch and registry entry after a successful reload and
-clears the mutable settings. Re-enabling recreates the switch with the selected
-settings but does not restore its previous ON state or prior target. No Custom
-Auto state or policy history is persisted across reloads or restarts.
+entry once. An ordinary settings edit preserves the runtime ON/OFF selection,
+but any restored ON controller still starts behind a fresh-reading barrier.
+Disabling the feature removes its switch and registry entry after a successful
+reload and clears the mutable settings and remembered runtime selection. A
+completed switch transition is saved and read back before it is reported as
+successful; a storage failure is reported instead of claiming the transition.
 
 Custom Auto uses event-driven PM2.5 updates plus bounded, one-shot air-quality
 requests at activation and confirmation/downshift boundaries. It does not add a
@@ -596,11 +617,12 @@ retained cleanup task already owns that purifier address.
 | `state_reducer.py` | Synchronous cached-state authority, startup fan-mode assembly, command reconciliation, and state effects |
 | `custom_auto_options.py` / `custom_auto_policy.py` | Profile-backed option parsing and pure synchronous PM2.5 hysteresis |
 | `custom_auto_controller.py` | Custom Auto activation, freshness generations, timers, target deduplication, and coordinator callbacks |
+| `custom_auto_memory.py` | Strict per-entry Custom Auto ON/OFF storage, readback verification, and removal |
 | `recovery.py` | Deterministic recovery windows, circuit/backoff decisions, and recovery diagnostics |
 | `operations.py` | Command queue lifecycle, superseding, deadlines, reconciliation decisions, completion/failure, and bounded command evidence |
 | `transactions.py` | One-in-flight descriptor attempts, response matching, candidate-frame reduction, transaction wait arbitration, and bounded timeout evidence |
 | `client.py` | Single connection/session owner, initialization, notifications, polling and refresh policy, command use cases, callbacks, and asynchronous recovery scheduling |
-| `coordinator.py` | Cached push state and Home Assistant availability/error propagation |
+| `coordinator.py` | Cached push state, Custom Auto lifecycle/registry gating, and Home Assistant availability/error propagation |
 | `fan.py`, `light.py`, `sensor.py`, `switch.py` | Entity mappings only; no direct Bluetooth I/O |
 | `diagnostics.py` | Redacted config-entry and runtime diagnostics |
 

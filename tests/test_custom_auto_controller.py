@@ -822,3 +822,80 @@ async def test_shutdown_before_start_is_task_free() -> None:
     )
     await controller.shutdown()
     assert controller.snapshot.actor_tasks == 0
+
+
+@pytest.mark.asyncio
+async def test_connection_callback_time_accepts_immediate_fifo_telemetry() -> None:
+    callbacks = Callbacks()
+    clock = FakeClock(5)
+    controller = CustomAutoController(
+        _options(upshift=0),
+        request_sample=callbacks.request_sample,
+        cancel_sample=callbacks.cancel_sample,
+        send_fan_mode=callbacks.send_mode,
+        clock=clock,
+        sleep_until=clock.sleep_until,
+    )
+    await controller.start()
+    controller.set_connection(available=False, generation=1, observed_at=1)
+    controller.set_powered(True)
+    await controller.activate()
+
+    controller.set_connection(available=True, generation=1, observed_at=10)
+    controller.observe_air_quality(_air(1, 20, observed_at=11))
+    clock.advance(20)
+    await _flush()
+
+    assert controller.snapshot.last_pm25 == 20
+    assert callbacks.commands == [(FanMode.TURBO, CommandOrigin.CUSTOM_AUTO)]
+    await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_older_connection_time_cannot_move_activation_barrier_backward() -> None:
+    callbacks = Callbacks()
+    clock = FakeClock(20)
+    controller, callbacks, _clock = await _controller(
+        options=_options(upshift=0),
+        callbacks=callbacks,
+        clock=clock,
+    )
+    await controller.activate()
+
+    controller.set_connection(available=False, generation=1, observed_at=10)
+    controller.set_connection(available=True, generation=1, observed_at=10)
+    controller.observe_air_quality(_air(1, 20, observed_at=15))
+    await _flush()
+
+    assert controller.snapshot.last_pm25 is None
+    assert callbacks.commands == []
+
+    controller.observe_air_quality(_air(2, 20, observed_at=21))
+    await _flush()
+    assert controller.snapshot.last_pm25 == 20
+    assert callbacks.commands == [(FanMode.TURBO, CommandOrigin.CUSTOM_AUTO)]
+    await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fifo_observations_before_later_on_cannot_cross_activation() -> None:
+    controller, callbacks, _clock = await _controller(
+        options=_options(upshift=0)
+    )
+
+    controller.observe_air_quality(_air(1, 20, observed_at=1))
+    await controller.activate()
+    await _flush()
+    assert controller.snapshot.active
+    assert controller.snapshot.last_pm25 is None
+    assert callbacks.commands == []
+
+    controller.observe_fan_mode(
+        _fan(2, FanMode.HIGH, source=ObservationSource.PHYSICAL)
+    )
+    await controller.activate()
+    await _flush()
+    assert controller.snapshot.active
+    assert controller.snapshot.last_physical_fan is not None
+    assert controller.snapshot.last_physical_fan.mode is FanMode.HIGH
+    await controller.shutdown()

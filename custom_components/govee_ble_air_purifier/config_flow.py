@@ -19,6 +19,7 @@ from homeassistant.helpers import selector
 
 from .bluetooth import BluetoothUnavailableError
 from .const import CONF_MODEL, DOMAIN
+from .custom_auto_memory import CustomAutoMemory
 from .custom_auto_options import (
     CONF_CUSTOM_AUTO_DOWNSHIFT_DELAYS_MINUTES,
     CONF_CUSTOM_AUTO_ENABLED,
@@ -361,17 +362,24 @@ class GoveeBleAirPurifierOptionsFlow(OptionsFlow):
             _async_reload_after_persist
         )
 
-    async def _async_handoff_active_controller(self) -> bool:
+    async def _async_handoff_active_controller(
+        self, *, disabling: bool = False
+    ) -> bool:
         """Yield an active loaded controller before options are persisted."""
         entry = self.config_entry
         if entry.state is not ConfigEntryState.LOADED:
             return True
         coordinator = entry.runtime_data
         controller = coordinator.custom_auto_controller
-        if controller is None or not controller.snapshot.active:
+        if controller is None:
+            return True
+        if not disabling and not controller.snapshot.active:
             return True
         try:
-            await coordinator.async_deactivate_custom_auto()
+            if disabling:
+                await coordinator.async_disable_custom_auto_and_clear()
+            else:
+                await coordinator.async_quiesce_custom_auto()
         except Exception:  # noqa: BLE001
             _LOGGER.exception(
                 "Could not hand off active Custom Auto before saving options "
@@ -381,13 +389,33 @@ class GoveeBleAirPurifierOptionsFlow(OptionsFlow):
             try:
                 # Activation establishes a fresh-sample barrier, so a failed
                 # pre-commit edit cannot resume from stale cached PM2.5.
-                await coordinator.async_activate_custom_auto()
+                if not disabling:
+                    await coordinator.async_rearm_custom_auto_after_quiesce()
             except Exception:  # noqa: BLE001
                 _LOGGER.exception(
                     "Could not reactivate Custom Auto after an options handoff "
                     "failure for purifier model %s",
                     entry.data.get(CONF_MODEL, "unknown"),
                 )
+            return False
+        return True
+
+    async def _async_clear_unloaded_transition(self, *, enabling: bool) -> bool:
+        """Clear remembered runtime state before an unloaded enable transition."""
+        entry = self.config_entry
+        if entry.state is ConfigEntryState.LOADED:
+            return True
+        was_enabled = entry.options.get(CONF_CUSTOM_AUTO_ENABLED) is True
+        if was_enabled is enabling:
+            return True
+        try:
+            await CustomAutoMemory(self.hass, entry.entry_id).async_clear()
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception(
+                "Could not clear Custom Auto memory before changing feature "
+                "exposure for purifier model %s",
+                entry.data.get(CONF_MODEL, "unknown"),
+            )
             return False
         return True
 
@@ -418,7 +446,13 @@ class GoveeBleAirPurifierOptionsFlow(OptionsFlow):
             disabled_options = {CONF_CUSTOM_AUTO_ENABLED: False}
             if disabled_options == self.config_entry.options:
                 return self.async_create_entry(title="", data=disabled_options)
-            if not await self._async_handoff_active_controller():
+            if not await self._async_handoff_active_controller(disabling=True):
+                return self.async_show_form(
+                    step_id="init",
+                    data_schema=_enable_schema(effective.enabled),
+                    errors={"base": "custom_auto_handoff_failed"},
+                )
+            if not await self._async_clear_unloaded_transition(enabling=False):
                 return self.async_show_form(
                     step_id="init",
                     data_schema=_enable_schema(effective.enabled),
@@ -459,6 +493,12 @@ class GoveeBleAirPurifierOptionsFlow(OptionsFlow):
                 if normalized == self.config_entry.options:
                     return self.async_create_entry(title="", data=normalized)
                 if not await self._async_handoff_active_controller():
+                    return self.async_show_form(
+                        step_id="custom_auto_settings",
+                        data_schema=_settings_schema(replacement),
+                        errors={"base": "custom_auto_handoff_failed"},
+                    )
+                if not await self._async_clear_unloaded_transition(enabling=True):
                     return self.async_show_form(
                         step_id="custom_auto_settings",
                         data_schema=_settings_schema(replacement),

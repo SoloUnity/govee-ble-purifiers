@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from homeassistant.exceptions import HomeAssistantError
@@ -184,11 +184,14 @@ class FakeRuntimeClient:
         self.execute_gate: asyncio.Event | None = None
         self.start_check: Callable[[], None] | None = None
         self.shutdown_check: Callable[[], None] | None = None
+        self.start_error: Exception | None = None
 
     async def async_start(self) -> None:
         if self.start_check is not None:
             self.start_check()
         self.calls.append(("start",))
+        if self.start_error is not None:
+            raise self.start_error
 
     async def async_shutdown(self) -> None:
         if self.shutdown_check is not None:
@@ -221,7 +224,50 @@ class FakeRuntimeClient:
             raise self.execute_error
 
 
-def _runtime_coordinator(hass, *, enabled: bool):
+class FakeCustomAutoMemory:
+    """Coordinator-facing verified boolean memory fake."""
+
+    def __init__(self, active: bool = False) -> None:
+        self.active = active
+        self.calls: list[bool] = []
+        self.error_for: bool | None = None
+        self.block_for: bool | None = None
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.clear_calls = 0
+        self.block_clear = False
+        self.block_clear_call: int | None = None
+        self.clear_failures = 0
+        self.clear_started = asyncio.Event()
+        self.clear_release = asyncio.Event()
+
+    async def async_set_active(self, active: bool) -> None:
+        self.calls.append(active)
+        if self.block_for is active:
+            self.started.set()
+            await self.release.wait()
+        if self.error_for is active:
+            raise HomeAssistantError("injected memory failure")
+        self.active = active
+
+    async def async_clear(self) -> None:
+        self.clear_calls += 1
+        if self.block_clear or self.block_clear_call == self.clear_calls:
+            self.clear_started.set()
+            await self.clear_release.wait()
+        if self.clear_failures:
+            self.clear_failures -= 1
+            raise HomeAssistantError("injected clear failure")
+        self.active = False
+
+
+def _runtime_coordinator(
+    hass,
+    *,
+    enabled: bool,
+    memory: FakeCustomAutoMemory | None = None,
+    restore: bool = False,
+):
     profile = DeviceProfile.for_model(Model.H7124)
     coordinator = GoveeDataUpdateCoordinator(
         hass,
@@ -229,6 +275,8 @@ def _runtime_coordinator(hass, *, enabled: bool):
         profile=profile,
         bluetooth_settings=bluetooth_settings_from_profile(profile),
         custom_auto_options=_enabled_options(profile) if enabled else None,
+        custom_auto_memory=memory,  # type: ignore[arg-type]
+        restore_custom_auto=restore,
     )
     client = FakeRuntimeClient()
     coordinator.client = client  # type: ignore[assignment]
@@ -446,6 +494,802 @@ async def test_enabled_runtime_starts_ingress_before_client_and_shuts_down_first
     await coordinator.async_shutdown()
     assert client.calls.count(("shutdown",)) == 1
     assert controller.snapshot.actor_tasks == 0
+
+
+@pytest.mark.asyncio
+async def test_restore_off_stays_inactive_and_restore_on_arms_before_client(
+    hass,
+) -> None:
+    off_memory = FakeCustomAutoMemory(False)
+    off, off_client = _runtime_coordinator(
+        hass, enabled=True, memory=off_memory, restore=False
+    )
+    await off.async_start()
+    assert not off.custom_auto_snapshot.active  # type: ignore[union-attr]
+    assert off_client.calls == [("start",)]
+    await off.async_shutdown()
+
+    on_memory = FakeCustomAutoMemory(True)
+    on, on_client = _runtime_coordinator(
+        hass, enabled=True, memory=on_memory, restore=True
+    )
+    on.data = PurifierState(power=True, pm25=999)
+
+    def assert_armed_before_start() -> None:
+        snapshot = on.custom_auto_snapshot
+        assert snapshot is not None and snapshot.active
+        assert snapshot.last_pm25 is None
+        assert not any(call[0] == "execute" for call in on_client.calls)
+        on_client.is_ready = True
+        on_client.state = on.data
+        on._availability_updated(True, None)
+        on._state_updated(on.data)
+        on._observation_updated(
+            AirQualityObservation(
+                revision=1,
+                generation=1,
+                observed_at=asyncio.get_running_loop().time(),
+                source=ObservationSource.DEVICE,
+                purpose=ObservationPurpose.UNSOLICITED,
+                pm25=2,
+                filter_life=90,
+            )
+        )
+
+    on_client.start_check = assert_armed_before_start
+    await on.async_start()
+    assert on_memory.calls == []
+    assert not any(call[0] == "execute" for call in on_client.calls)
+    await _flush()
+    execute = next(call for call in on_client.calls if call[0] == "execute")
+    assert execute[1] == SetFanMode(FanMode.SLEEP)
+    await on.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_persistence_failures_preserve_pretransaction_runtime(hass) -> None:
+    memory = FakeCustomAutoMemory(False)
+    memory.error_for = True
+    coordinator, client = _runtime_coordinator(
+        hass, enabled=True, memory=memory
+    )
+    await coordinator.async_start()
+
+    with pytest.raises(HomeAssistantError, match="memory failure"):
+        await coordinator.async_activate_custom_auto()
+    assert not coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+
+    memory.error_for = None
+    await coordinator.async_activate_custom_auto()
+    memory.error_for = False
+    coordinator.data = PurifierState(power=True)
+    client.is_ready = True
+    coordinator._client_available = True
+    calls_before = list(client.calls)
+    with pytest.raises(HomeAssistantError, match="memory failure"):
+        await coordinator.async_deactivate_custom_auto()
+    assert coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+    assert client.calls == calls_before
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_transaction_settles_before_propagating(hass) -> None:
+    memory = FakeCustomAutoMemory(False)
+    memory.block_for = True
+    coordinator, _client = _runtime_coordinator(
+        hass, enabled=True, memory=memory
+    )
+    await coordinator.async_start()
+
+    activate = asyncio.create_task(coordinator.async_activate_custom_auto())
+    await memory.started.wait()
+    activate.cancel()
+    await _flush()
+    assert not activate.done()
+    assert not coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+
+    memory.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await activate
+    assert memory.active
+    assert coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_off_transaction_finishes_handoff_before_propagating(
+    hass,
+) -> None:
+    memory = FakeCustomAutoMemory(True)
+    coordinator, client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    coordinator.data = PurifierState(power=True)
+    await coordinator.async_start()
+    client.is_ready = True
+    coordinator._client_available = True
+    client.execute_gate = asyncio.Event()
+
+    deactivate = asyncio.create_task(coordinator.async_deactivate_custom_auto())
+    while not any(
+        call[0] == "execute" and call[1] == SetFanMode(FanMode.AUTO)
+        for call in client.calls
+    ):
+        await asyncio.sleep(0)
+    deactivate.cancel()
+    await _flush()
+    assert not deactivate.done()
+    assert not memory.active
+    assert not coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+
+    client.execute_gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await deactivate
+    assert coordinator.custom_auto_handoff.state == "confirmed"
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_toggles_last_verified_transaction_wins(hass) -> None:
+    memory = FakeCustomAutoMemory(False)
+    memory.block_for = True
+    coordinator, _client = _runtime_coordinator(
+        hass, enabled=True, memory=memory
+    )
+    await coordinator.async_start()
+
+    activate = asyncio.create_task(coordinator.async_activate_custom_auto())
+    await memory.started.wait()
+    deactivate = asyncio.create_task(coordinator.async_deactivate_custom_auto())
+    await _flush()
+    assert memory.calls == [True]
+    memory.release.set()
+    await asyncio.gather(activate, deactivate)
+
+    assert memory.calls == [True, False]
+    assert not memory.active
+    assert not coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_quiesce_rearm_and_shutdown_do_not_change_memory(hass) -> None:
+    memory = FakeCustomAutoMemory(True)
+    coordinator, _client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    await coordinator.async_start()
+
+    assert await coordinator.async_quiesce_custom_auto()
+    assert not coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+    assert memory.calls == []
+    await coordinator.async_rearm_custom_auto_after_quiesce()
+    assert coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+    assert memory.calls == []
+    await coordinator.async_shutdown()
+    assert memory.calls == []
+
+
+@pytest.mark.asyncio
+async def test_physical_override_persistence_cannot_overtake_later_on(hass) -> None:
+    memory = FakeCustomAutoMemory(True)
+    memory.block_for = False
+    coordinator, _client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    await coordinator.async_start()
+    coordinator._observation_updated(
+        FanModeObservation(
+            revision=1,
+            generation=1,
+            observed_at=1,
+            source=ObservationSource.PHYSICAL,
+            purpose=ObservationPurpose.UNSOLICITED,
+            mode=FanMode.HIGH,
+        )
+    )
+    await memory.started.wait()
+    reactivate = asyncio.create_task(coordinator.async_activate_custom_auto())
+    await _flush()
+    assert memory.calls == [False]
+
+    memory.release.set()
+    await reactivate
+    assert memory.calls == [False, True]
+    assert memory.active
+    assert coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_registry_block_is_synchronous_then_clears_and_stays_off(hass) -> None:
+    memory = FakeCustomAutoMemory(True)
+    coordinator, client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    await coordinator.async_start()
+    coordinator.data = PurifierState(power=True)
+    coordinator._client_available = True
+    client.is_ready = True
+
+    coordinator.set_custom_auto_registry_allowed(False)
+    with pytest.raises(HomeAssistantError, match="entity is unavailable"):
+        await coordinator.async_activate_custom_auto()
+    with pytest.raises(HomeAssistantError, match="command blocked"):
+        await coordinator._async_custom_auto_fan_mode(  # noqa: SLF001
+            FanMode.HIGH, CommandOrigin.CUSTOM_AUTO
+        )
+    assert not any(call[0] == "execute" for call in client.calls)
+
+    await _flush()
+    assert not coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+    assert memory.clear_calls == 1
+    assert not memory.active
+    assert coordinator.custom_auto_handoff.state == "confirmed"
+    assert client.calls[-1] == (
+        "execute",
+        SetFanMode(FanMode.AUTO),
+        CommandOrigin.HANDOFF,
+    )
+
+    coordinator.set_custom_auto_registry_allowed(True)
+    await _flush()
+    assert not coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+    assert memory.calls == []
+    await coordinator.async_activate_custom_auto()
+    assert memory.active
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_registry_cleanup_settles_before_reenable_and_later_on(hass) -> None:
+    memory = FakeCustomAutoMemory(True)
+    memory.block_clear = True
+    coordinator, _client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    await coordinator.async_start()
+
+    coordinator.set_custom_auto_registry_allowed(False)
+    await memory.clear_started.wait()
+    coordinator.set_custom_auto_registry_allowed(True)
+    with pytest.raises(HomeAssistantError, match="entity is unavailable"):
+        await coordinator.async_activate_custom_auto()
+
+    memory.clear_release.set()
+    cleanup = coordinator._custom_auto_registry_cleanup_task  # noqa: SLF001
+    assert cleanup is not None
+    await cleanup
+    await coordinator.async_activate_custom_auto()
+
+    assert memory.clear_calls == 2
+    assert memory.calls == [True]
+    assert memory.active
+    assert coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_terminal_disable_cannot_reopen_or_wake_waiting_activation(
+    hass,
+) -> None:
+    memory = FakeCustomAutoMemory(True)
+    coordinator, _client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    await coordinator.async_start()
+
+    await coordinator._custom_auto_control_lock.acquire()  # noqa: SLF001
+    activation = asyncio.create_task(coordinator.async_activate_custom_auto())
+    await _flush()
+    disable = asyncio.create_task(coordinator.async_disable_custom_auto_and_clear())
+    await _flush()
+    coordinator.set_custom_auto_registry_allowed(True)
+    coordinator._custom_auto_control_lock.release()  # noqa: SLF001
+
+    with pytest.raises(HomeAssistantError, match="entity is unavailable"):
+        await activation
+    await disable
+    with pytest.raises(HomeAssistantError, match="entity is unavailable"):
+        await coordinator.async_activate_custom_auto()
+    assert not coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+    assert not memory.active
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_terminal_disable_keeps_cleanup_ownership_while_lock_waits(
+    hass,
+) -> None:
+    memory = FakeCustomAutoMemory(True)
+    coordinator, _client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    await coordinator.async_start()
+    await coordinator._custom_auto_control_lock.acquire()  # noqa: SLF001
+
+    disable = asyncio.create_task(coordinator.async_disable_custom_auto_and_clear())
+    await _flush()
+    disable.cancel()
+    await _flush()
+
+    assert not disable.done()
+    assert memory.clear_calls == 0
+    with pytest.raises(HomeAssistantError, match="entity is unavailable"):
+        await coordinator.async_activate_custom_auto()
+
+    coordinator._custom_auto_control_lock.release()  # noqa: SLF001
+    with pytest.raises(asyncio.CancelledError):
+        await disable
+    assert memory.clear_calls == 1
+    assert not memory.active
+    assert not coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_rearm_racing_registry_cleanup_is_rejected_and_stays_off(hass) -> None:
+    memory = FakeCustomAutoMemory(True)
+    memory.block_clear = True
+    coordinator, _client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    await coordinator.async_start()
+
+    coordinator.set_custom_auto_registry_allowed(False)
+    await memory.clear_started.wait()
+    with pytest.raises(HomeAssistantError, match="entity is unavailable"):
+        await coordinator.async_rearm_custom_auto_after_quiesce()
+
+    memory.clear_release.set()
+    cleanup = coordinator._custom_auto_registry_cleanup_task  # noqa: SLF001
+    assert cleanup is not None
+    await cleanup
+    assert not coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+    assert not memory.active
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_registry_clear_retries_before_unhide_and_later_on(
+    hass, monkeypatch
+) -> None:
+    memory = FakeCustomAutoMemory(True)
+    memory.clear_failures = 1
+    coordinator, _client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    await coordinator.async_start()
+    retry_waiting = asyncio.Event()
+    retry_release = asyncio.Event()
+
+    async def controlled_sleep(_: float) -> None:
+        retry_waiting.set()
+        await retry_release.wait()
+
+    monkeypatch.setattr(
+        coordinator, "_async_registry_cleanup_sleep", controlled_sleep
+    )
+    coordinator.set_custom_auto_registry_allowed(False)
+    await retry_waiting.wait()
+    coordinator.set_custom_auto_registry_allowed(True)
+    with pytest.raises(HomeAssistantError, match="entity is unavailable"):
+        await coordinator.async_activate_custom_auto()
+
+    retry_release.set()
+    cleanup = coordinator._custom_auto_registry_cleanup_task  # noqa: SLF001
+    assert cleanup is not None
+    await cleanup
+    await coordinator.async_activate_custom_auto()
+
+    assert memory.clear_calls == 2
+    assert memory.calls == [True]
+    assert memory.active
+    assert coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_same_blocked_state_reschedules_exhausted_cleanup(
+    hass, monkeypatch
+) -> None:
+    memory = FakeCustomAutoMemory(True)
+    memory.clear_failures = 3
+    coordinator, _client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    await coordinator.async_start()
+    monkeypatch.setattr(
+        coordinator,
+        "_async_registry_cleanup_sleep",
+        AsyncMock(),
+    )
+
+    coordinator.set_custom_auto_registry_allowed(False)
+    failed = coordinator._custom_auto_registry_cleanup_task  # noqa: SLF001
+    assert failed is not None
+    with pytest.raises(HomeAssistantError, match="clear failure"):
+        await failed
+    await _flush()
+
+    coordinator.set_custom_auto_registry_allowed(False)
+    retried = coordinator._custom_auto_registry_cleanup_task  # noqa: SLF001
+    assert retried is not None and retried is not failed
+    await retried
+    coordinator.set_custom_auto_registry_allowed(True)
+    await coordinator.async_activate_custom_auto()
+    assert memory.clear_calls == 4
+    assert memory.active
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_repeated_block_during_final_attempt_gets_fresh_retry_budget(
+    hass, monkeypatch
+) -> None:
+    memory = FakeCustomAutoMemory(True)
+    memory.clear_failures = 3
+    memory.block_clear_call = 3
+    coordinator, _client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    await coordinator.async_start()
+    monkeypatch.setattr(
+        coordinator,
+        "_async_registry_cleanup_sleep",
+        AsyncMock(),
+    )
+
+    coordinator.set_custom_auto_registry_allowed(False)
+    cleanup = coordinator._custom_auto_registry_cleanup_task  # noqa: SLF001
+    assert cleanup is not None
+    await memory.clear_started.wait()
+    coordinator.set_custom_auto_registry_allowed(False)
+    memory.clear_release.set()
+    await cleanup
+
+    assert memory.clear_calls == 4
+    assert not memory.active
+    with pytest.raises(HomeAssistantError, match="entity is unavailable"):
+        await coordinator.async_activate_custom_auto()
+    coordinator.set_custom_auto_registry_allowed(True)
+    await coordinator.async_activate_custom_auto()
+    assert memory.active
+    await _flush()
+    assert memory.clear_calls == 4
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_unhide_after_final_failure_before_done_callback_owns_fresh_retry(
+    hass, monkeypatch
+) -> None:
+    memory = FakeCustomAutoMemory(True)
+    memory.clear_failures = 3
+    coordinator, _client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    await coordinator.async_start()
+    monkeypatch.setattr(
+        coordinator,
+        "_async_registry_cleanup_sleep",
+        AsyncMock(),
+    )
+
+    coordinator.set_custom_auto_registry_allowed(False)
+    failed = coordinator._custom_auto_registry_cleanup_task  # noqa: SLF001
+    assert failed is not None
+    assert (
+        failed.remove_done_callback(coordinator._custom_auto_registry_cleanup_done)  # noqa: SLF001
+        == 1
+    )
+    with pytest.raises(HomeAssistantError, match="clear failure"):
+        await failed
+
+    coordinator.set_custom_auto_registry_allowed(True)
+    with pytest.raises(HomeAssistantError, match="entity is unavailable"):
+        await coordinator.async_activate_custom_auto()
+    coordinator._custom_auto_registry_cleanup_done(failed)  # noqa: SLF001
+    retried = coordinator._custom_auto_registry_cleanup_task  # noqa: SLF001
+    assert retried is not None and retried is not failed
+    await retried
+    await coordinator.async_activate_custom_auto()
+
+    assert memory.clear_calls == 4
+    assert memory.active
+    await _flush()
+    assert memory.clear_calls == 4
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_unhide_after_success_before_done_callback_opens_settled_gate(
+    hass,
+) -> None:
+    memory = FakeCustomAutoMemory(True)
+    coordinator, _client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    await coordinator.async_start()
+
+    coordinator.set_custom_auto_registry_allowed(False)
+    cleanup = coordinator._custom_auto_registry_cleanup_task  # noqa: SLF001
+    assert cleanup is not None
+    assert (
+        cleanup.remove_done_callback(coordinator._custom_auto_registry_cleanup_done)  # noqa: SLF001
+        == 1
+    )
+    await cleanup
+    assert not coordinator._custom_auto_command_gate  # noqa: SLF001
+
+    coordinator.set_custom_auto_registry_allowed(True)
+    assert not coordinator._custom_auto_command_gate  # noqa: SLF001
+    coordinator._custom_auto_registry_cleanup_done(cleanup)  # noqa: SLF001
+    await coordinator.async_activate_custom_auto()
+
+    assert memory.active
+    assert coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_surfaces_final_required_clear_after_closing_client(
+    hass, monkeypatch
+) -> None:
+    memory = FakeCustomAutoMemory(True)
+    memory.clear_failures = 4
+    coordinator, client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    await coordinator.async_start()
+    monkeypatch.setattr(
+        coordinator,
+        "_async_registry_cleanup_sleep",
+        AsyncMock(),
+    )
+    coordinator.set_custom_auto_registry_allowed(False)
+    failed = coordinator._custom_auto_registry_cleanup_task  # noqa: SLF001
+    assert failed is not None
+    with pytest.raises(HomeAssistantError, match="clear failure"):
+        await failed
+    await _flush()
+
+    with pytest.raises(HomeAssistantError, match="clear failure"):
+        await coordinator.async_shutdown()
+    assert client.calls[-1] == ("shutdown",)
+    assert coordinator._shutdown  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_registry_gate_closing_during_command_dispatch_prevents_send(
+    hass, monkeypatch
+) -> None:
+    memory = FakeCustomAutoMemory(True)
+    coordinator, client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    await coordinator.async_start()
+    dispatch_entered = asyncio.Event()
+    dispatch_release = asyncio.Event()
+    original_execute = coordinator._async_execute  # noqa: SLF001
+
+    async def delayed_execute(*args, **kwargs) -> None:
+        dispatch_entered.set()
+        await dispatch_release.wait()
+        await original_execute(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator, "_async_execute", delayed_execute)
+    command = asyncio.create_task(
+        coordinator._async_custom_auto_fan_mode(  # noqa: SLF001
+            FanMode.HIGH, CommandOrigin.CUSTOM_AUTO
+        )
+    )
+    await dispatch_entered.wait()
+
+    coordinator.set_custom_auto_registry_allowed(False)
+    dispatch_release.set()
+
+    with pytest.raises(HomeAssistantError, match="command blocked"):
+        await command
+    assert not any(call[0] == "execute" for call in client.calls)
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_registry_rename_allowed_reread_does_not_deactivate(hass) -> None:
+    memory = FakeCustomAutoMemory(True)
+    coordinator, _client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    await coordinator.async_start()
+
+    coordinator.set_custom_auto_registry_allowed(True)
+    await _flush()
+
+    assert coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+    assert memory.clear_calls == 0
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_ha_override_persists_off_before_manual_command(hass) -> None:
+    memory = FakeCustomAutoMemory(True)
+    coordinator, client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    await coordinator.async_start()
+
+    await coordinator.async_apply_ha_fan_mode(FanMode.MEDIUM, power_on=False)
+
+    assert memory.calls == [False]
+    assert not memory.active
+    assert not coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+    assert client.calls[-1] == (
+        "execute",
+        SetFanMode(FanMode.MEDIUM),
+        CommandOrigin.HOME_ASSISTANT,
+    )
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_ha_override_persistence_failure_keeps_ownership_and_sends_nothing(
+    hass,
+) -> None:
+    memory = FakeCustomAutoMemory(True)
+    memory.error_for = False
+    coordinator, client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    await coordinator.async_start()
+
+    with pytest.raises(HomeAssistantError, match="memory failure"):
+        await coordinator.async_apply_ha_fan_mode(
+            FanMode.HIGH, power_on=True
+        )
+
+    assert coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+    assert not any(call[0] == "execute" for call in client.calls)
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_ha_override_settles_off_without_manual_command(hass) -> None:
+    memory = FakeCustomAutoMemory(True)
+    memory.block_for = False
+    coordinator, client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    await coordinator.async_start()
+
+    override = asyncio.create_task(
+        coordinator.async_apply_ha_fan_mode(FanMode.MEDIUM, power_on=True)
+    )
+    await memory.started.wait()
+    override.cancel()
+    await _flush()
+    assert not override.done()
+    assert coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+
+    memory.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await override
+    assert not memory.active
+    assert not coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+    assert not any(call[0] == "execute" for call in client.calls)
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_activation_reports_incomplete_rollback(hass, monkeypatch) -> None:
+    memory = FakeCustomAutoMemory(False)
+    coordinator, _client = _runtime_coordinator(
+        hass, enabled=True, memory=memory
+    )
+    await coordinator.async_start()
+    controller = coordinator.custom_auto_controller
+    assert controller is not None
+    monkeypatch.setattr(
+        controller,
+        "activate",
+        AsyncMock(side_effect=RuntimeError("activation failed")),
+    )
+    monkeypatch.setattr(
+        controller,
+        "deactivate",
+        AsyncMock(side_effect=RuntimeError("deactivation failed")),
+    )
+    memory.error_for = False
+
+    with pytest.raises(HomeAssistantError, match="rollback was incomplete"):
+        await coordinator.async_activate_custom_auto()
+
+    assert memory.calls == [True, False]
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_restored_startup_settles_complete_cleanup(
+    hass, monkeypatch
+) -> None:
+    memory = FakeCustomAutoMemory(True)
+    coordinator, client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    controller = coordinator.custom_auto_controller
+    assert controller is not None
+    original_invalidate = controller._invalidate_operational  # noqa: SLF001
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_invalidate(*args, **kwargs) -> None:
+        entered.set()
+        await release.wait()
+        await original_invalidate(*args, **kwargs)
+
+    monkeypatch.setattr(controller, "_invalidate_operational", blocked_invalidate)
+    startup = asyncio.create_task(coordinator.async_start())
+    await entered.wait()
+    startup.cancel()
+    await _flush()
+    assert not startup.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await startup
+    assert controller.snapshot.actor_tasks == 0
+    assert coordinator._custom_auto_observation_remove is None
+    assert coordinator._custom_auto_state_remove is None
+    assert coordinator._custom_auto_persistence_tasks == set()
+    assert client.calls == [("shutdown",)]
+    assert memory.calls == []
+
+
+@pytest.mark.asyncio
+async def test_client_start_failure_cleans_actor_listeners_and_client(hass) -> None:
+    memory = FakeCustomAutoMemory(True)
+    coordinator, client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    client.start_error = RuntimeError("client start failed")
+    controller = coordinator.custom_auto_controller
+    assert controller is not None
+
+    with pytest.raises(RuntimeError, match="client start failed"):
+        await coordinator.async_start()
+
+    assert controller.snapshot.actor_tasks == 0
+    assert coordinator._custom_auto_observation_remove is None
+    assert coordinator._custom_auto_state_remove is None
+    assert client.calls == [("start",), ("shutdown",)]
+    assert memory.calls == []
+
+
+@pytest.mark.asyncio
+async def test_client_start_failure_drains_registry_cleanup_task(hass) -> None:
+    memory = FakeCustomAutoMemory(True)
+    memory.block_clear = True
+    coordinator, client = _runtime_coordinator(
+        hass, enabled=True, memory=memory, restore=True
+    )
+    client.start_check = lambda: coordinator.set_custom_auto_registry_allowed(
+        False
+    )
+    client.start_error = RuntimeError("client start failed")
+
+    startup = asyncio.create_task(coordinator.async_start())
+    await memory.clear_started.wait()
+    await _flush()
+    assert not startup.done()
+
+    memory.clear_release.set()
+    with pytest.raises(RuntimeError, match="client start failed"):
+        await startup
+
+    assert coordinator._custom_auto_registry_cleanup_task is None  # noqa: SLF001
+    assert coordinator.custom_auto_snapshot.actor_tasks == 0  # type: ignore[union-attr]
+    assert client.calls == [("start",), ("shutdown",)]
 
 
 @pytest.mark.asyncio

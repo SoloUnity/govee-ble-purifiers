@@ -14,14 +14,14 @@
       },
       "enable_custom_auto": {
         "title": "Enable Custom Auto",
-        "description": "Custom Auto uses PM2.5 readings to select the purifier's fan level. It is disabled by default and can be enabled later in the integration settings.",
+        "description": "Expose a Custom Auto switch that uses PM2.5 readings to select the purifier's fan level. This option configures the feature but does not turn the runtime switch on. It is disabled by default and can be enabled later in the integration settings.",
         "data": {
           "custom_auto_enabled": "Enable Custom Auto"
         }
       },
       "custom_auto_settings": {
         "title": "Custom Auto settings",
-        "description": "Set the PM2.5 boundaries and the time required before Custom Auto changes fan levels.",
+        "description": "Set the PM2.5 boundaries and the time required before Custom Auto changes fan levels. The runtime switch remembers ON/OFF, but it never restores a prior fan speed and requires a fresh PM2.5 reading after each activation.",
         "data": {
           "pm25_boundary_sleep_low": "Sleep to Low PM2.5 boundary",
           "pm25_boundary_low_medium": "Low to Medium PM2.5 boundary",
@@ -55,14 +55,14 @@
     "step": {
       "init": {
         "title": "Enable Custom Auto",
-        "description": "Custom Auto uses PM2.5 readings to select the purifier's fan level.",
+        "description": "Expose a Custom Auto switch that uses PM2.5 readings to select the purifier's fan level. This option configures the feature but does not turn the runtime switch on.",
         "data": {
           "custom_auto_enabled": "Enable Custom Auto"
         }
       },
       "custom_auto_settings": {
         "title": "Custom Auto settings",
-        "description": "Set the PM2.5 boundaries and the time required before Custom Auto changes fan levels.",
+        "description": "Set the PM2.5 boundaries and the time required before Custom Auto changes fan levels. The runtime switch remembers ON/OFF, but it never restores a prior fan speed and requires a fresh PM2.5 reading after each activation.",
         "data": {
           "pm25_boundary_sleep_low": "Sleep to Low PM2.5 boundary",
           "pm25_boundary_low_medium": "Low to Medium PM2.5 boundary",

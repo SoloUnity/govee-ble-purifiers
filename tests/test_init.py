@@ -7,20 +7,25 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
+from homeassistant.config_entries import ConfigEntryDisabler
 from homeassistant.const import CONF_ADDRESS, EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryError
+from homeassistant.helpers import entity_registry as er
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.govee_ble_air_purifier import (
     _async_cleanup_address,
     _async_options_updated,
     async_remove_entry,
+    async_setup,
     async_setup_entry,
     async_unload_entry,
 )
 from custom_components.govee_ble_air_purifier.bluetooth.ownership import (
     ADDRESS_OWNERSHIP,
 )
-from custom_components.govee_ble_air_purifier.const import CONF_MODEL, PLATFORMS
+from custom_components.govee_ble_air_purifier.const import CONF_MODEL, DOMAIN, PLATFORMS
 from custom_components.govee_ble_air_purifier.custom_auto_options import (
     CONF_CUSTOM_AUTO_ENABLED,
     CONF_CUSTOM_AUTO_PM25_BOUNDARIES,
@@ -30,11 +35,27 @@ from custom_components.govee_ble_air_purifier.profiles import ProfileError
 
 
 @pytest.fixture(autouse=True)
-def _mock_entity_registry():
+def _mock_entity_registry(request):
     """Keep lifecycle unit tests independent from Home Assistant storage."""
-    with patch(
-        "custom_components.govee_ble_air_purifier.er.async_get",
-        return_value=MagicMock(),
+    if "hass" in request.fixturenames:
+        yield
+        return
+    registry = MagicMock()
+    registry.async_get_entity_id.return_value = None
+    memory = SimpleNamespace(
+        async_load_active=AsyncMock(return_value=False),
+        async_set_active=AsyncMock(),
+        async_clear=AsyncMock(),
+    )
+    with (
+        patch(
+            "custom_components.govee_ble_air_purifier.er.async_get",
+            return_value=registry,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.CustomAutoMemory",
+            return_value=memory,
+        ),
     ):
         yield
 
@@ -46,14 +67,21 @@ def _setup_objects() -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace]
         async_shutdown=AsyncMock(),
         custom_auto_controller=None,
         async_deactivate_custom_auto=AsyncMock(),
+        async_quiesce_custom_auto=AsyncMock(),
+        async_disable_custom_auto_and_clear=AsyncMock(),
+        set_custom_auto_registry_allowed=Mock(),
+        set_custom_auto_registry_listener_remover=Mock(),
     )
     config_entries = SimpleNamespace(
         async_forward_entry_setups=AsyncMock(),
         async_unload_platforms=AsyncMock(return_value=True),
         async_reload=AsyncMock(return_value=True),
     )
-    bus = SimpleNamespace(async_listen_once=Mock(return_value=Mock()))
-    hass = SimpleNamespace(config_entries=config_entries, bus=bus)
+    bus = SimpleNamespace(
+        async_listen_once=Mock(return_value=Mock()),
+        async_listen=Mock(return_value=Mock()),
+    )
+    hass = SimpleNamespace(config_entries=config_entries, bus=bus, data={})
     entry = SimpleNamespace(
         data={
             CONF_ADDRESS: "AA:BB:CC:DD:EE:FF",
@@ -66,6 +94,15 @@ def _setup_objects() -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace]
         add_update_listener=Mock(return_value=Mock()),
     )
     return coordinator, hass, entry
+
+
+def _visible_custom_auto_registry() -> MagicMock:
+    registry = MagicMock()
+    registry.async_get_entity_id.return_value = "switch.custom_auto"
+    registry.async_get.return_value = SimpleNamespace(
+        disabled_by=None, hidden_by=None
+    )
+    return registry
 
 
 async def test_setup_cleans_address_before_start_and_registers_stop() -> None:
@@ -243,6 +280,683 @@ async def test_setup_passes_effective_options_to_coordinator(enabled: bool) -> N
     )
 
 
+async def test_enabled_setup_loads_memory_before_coordinator_construction() -> None:
+    coordinator, hass, entry = _setup_objects()
+    entry.options = {CONF_CUSTOM_AUTO_ENABLED: True}
+    order: list[str] = []
+    memory = SimpleNamespace(
+        async_load_active=AsyncMock(side_effect=lambda: order.append("load") or True),
+        async_set_active=AsyncMock(),
+        async_clear=AsyncMock(),
+    )
+
+    def construct(*args, **kwargs):
+        order.append("construct")
+        assert kwargs["custom_auto_memory"] is memory
+        assert kwargs["restore_custom_auto"] is True
+        return coordinator
+
+    with (
+        patch(
+            "custom_components.govee_ble_air_purifier.CustomAutoMemory",
+            return_value=memory,
+        ) as memory_class,
+        patch(
+            "custom_components.govee_ble_air_purifier._async_cleanup_address",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.GoveeDataUpdateCoordinator",
+            side_effect=construct,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.er.async_get",
+            return_value=_visible_custom_auto_registry(),
+        ),
+    ):
+        assert await async_setup_entry(hass, entry)  # type: ignore[arg-type]
+
+    assert order == ["load", "construct"]
+    memory_class.assert_called_once_with(hass, "entry-id")
+    memory.async_load_active.assert_awaited_once_with()
+    memory.async_set_active.assert_not_awaited()
+
+
+async def test_disabled_setup_does_not_restore_remembered_on() -> None:
+    coordinator, hass, entry = _setup_objects()
+    memory = SimpleNamespace(
+        async_load_active=AsyncMock(return_value=True), async_clear=AsyncMock()
+    )
+
+    with (
+        patch(
+            "custom_components.govee_ble_air_purifier.CustomAutoMemory",
+            return_value=memory,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier._async_cleanup_address",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.GoveeDataUpdateCoordinator",
+            return_value=coordinator,
+        ) as coordinator_class,
+    ):
+        assert await async_setup_entry(hass, entry)  # type: ignore[arg-type]
+
+    memory.async_load_active.assert_not_awaited()
+    assert coordinator_class.call_args.kwargs["restore_custom_auto"] is False
+
+
+@pytest.mark.parametrize("registry_state", ["missing", "hidden", "disabled"])
+async def test_blocked_registry_state_clears_memory_and_starts_off(
+    registry_state: str,
+) -> None:
+    coordinator, hass, entry = _setup_objects()
+    entry.options = {CONF_CUSTOM_AUTO_ENABLED: True}
+    memory = SimpleNamespace(
+        async_load_active=AsyncMock(return_value=True), async_clear=AsyncMock()
+    )
+    registry = MagicMock()
+    if registry_state == "missing":
+        registry.async_get_entity_id.return_value = None
+    else:
+        registry.async_get_entity_id.return_value = "switch.custom_auto"
+        registry.async_get.return_value = SimpleNamespace(
+            disabled_by=("user" if registry_state == "disabled" else None),
+            hidden_by=("user" if registry_state == "hidden" else None),
+        )
+
+    with (
+        patch(
+            "custom_components.govee_ble_air_purifier.CustomAutoMemory",
+            return_value=memory,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.er.async_get",
+            return_value=registry,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier._async_cleanup_address",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.GoveeDataUpdateCoordinator",
+            return_value=coordinator,
+        ) as coordinator_class,
+    ):
+        assert await async_setup_entry(hass, entry)  # type: ignore[arg-type]
+
+    memory.async_load_active.assert_not_awaited()
+    memory.async_clear.assert_awaited_once_with()
+    assert coordinator_class.call_args.kwargs["restore_custom_auto"] is False
+    assert coordinator_class.call_args.kwargs[
+        "custom_auto_registry_allowed"
+    ] is False
+
+
+async def test_registry_listener_precedes_start_and_reread_closes_race() -> None:
+    coordinator, hass, entry = _setup_objects()
+    entry.options = {CONF_CUSTOM_AUTO_ENABLED: True}
+    memory = SimpleNamespace(
+        async_load_active=AsyncMock(return_value=True), async_clear=AsyncMock()
+    )
+    registry = MagicMock()
+    registry.async_get_entity_id.return_value = "switch.custom_auto"
+    registry.async_get.side_effect = [
+        SimpleNamespace(disabled_by=None, hidden_by=None),
+        None,
+    ]
+
+    async def start() -> None:
+        hass.bus.async_listen.assert_called_once()
+        coordinator.set_custom_auto_registry_listener_remover.assert_called_once()
+        coordinator.set_custom_auto_registry_allowed.assert_called_once_with(False)
+
+    coordinator.async_start.side_effect = start
+    with (
+        patch(
+            "custom_components.govee_ble_air_purifier.CustomAutoMemory",
+            return_value=memory,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.er.async_get",
+            return_value=registry,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier._async_cleanup_address",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.GoveeDataUpdateCoordinator",
+            return_value=coordinator,
+        ),
+    ):
+        assert await async_setup_entry(hass, entry)  # type: ignore[arg-type]
+
+    memory.async_load_active.assert_awaited_once_with()
+    memory.async_clear.assert_awaited_once_with()
+
+
+@pytest.mark.parametrize(
+    "clear_error",
+    [RuntimeError("clear failed"), asyncio.CancelledError()],
+)
+async def test_second_registry_read_clear_failure_releases_all_owners(
+    clear_error: BaseException,
+) -> None:
+    coordinator, hass, entry = _setup_objects()
+    entry.options = {CONF_CUSTOM_AUTO_ENABLED: True}
+    memory = SimpleNamespace(
+        async_load_active=AsyncMock(return_value=True),
+        async_clear=AsyncMock(side_effect=clear_error),
+    )
+    registry = MagicMock()
+    registry.async_get_entity_id.return_value = "switch.custom_auto"
+    registry.async_get.side_effect = [
+        SimpleNamespace(disabled_by=None, hidden_by=None),
+        None,
+    ]
+    remove_listener = Mock()
+    hass.bus.async_listen.return_value = remove_listener
+
+    with (
+        patch(
+            "custom_components.govee_ble_air_purifier.CustomAutoMemory",
+            return_value=memory,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.er.async_get",
+            return_value=registry,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier._async_cleanup_address",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.GoveeDataUpdateCoordinator",
+            return_value=coordinator,
+        ),
+        pytest.raises(type(clear_error)),
+    ):
+        await async_setup_entry(hass, entry)  # type: ignore[arg-type]
+
+    remove_listener.assert_called_once_with()
+    coordinator.async_start.assert_not_awaited()
+    coordinator.async_shutdown.assert_awaited_once_with()
+
+
+async def test_registry_listener_rereads_stable_identity_for_runtime_changes() -> None:
+    coordinator, hass, entry = _setup_objects()
+    entry.options = {CONF_CUSTOM_AUTO_ENABLED: True}
+    registry = _visible_custom_auto_registry()
+
+    with (
+        patch(
+            "custom_components.govee_ble_air_purifier.er.async_get",
+            return_value=registry,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier._async_cleanup_address",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.GoveeDataUpdateCoordinator",
+            return_value=coordinator,
+        ),
+    ):
+        assert await async_setup_entry(hass, entry)  # type: ignore[arg-type]
+
+    _, listener = hass.bus.async_listen.call_args.args
+    coordinator.set_custom_auto_registry_allowed.reset_mock()
+
+    with patch(
+        "custom_components.govee_ble_air_purifier.er.async_get",
+        return_value=registry,
+    ):
+        registry.async_get.return_value = SimpleNamespace(
+            disabled_by="user", hidden_by=None
+        )
+        listener(SimpleNamespace())
+        registry.async_get.return_value = SimpleNamespace(
+            disabled_by=None, hidden_by="user"
+        )
+        listener(SimpleNamespace())
+        registry.async_get_entity_id.return_value = None
+        listener(SimpleNamespace())
+        registry.async_get_entity_id.return_value = "switch.renamed_custom_auto"
+        registry.async_get.return_value = SimpleNamespace(
+            disabled_by=None, hidden_by=None
+        )
+        listener(SimpleNamespace())
+
+    assert [
+        call.args
+        for call in coordinator.set_custom_auto_registry_allowed.call_args_list
+    ] == [
+        (False,),
+        (False,),
+        (False,),
+        (True,),
+    ]
+    assert all(
+        call.args
+        == (
+            "switch",
+            "govee_ble_air_purifier",
+            "aa:bb:cc:dd:ee:ff_custom_auto",
+        )
+        for call in registry.async_get_entity_id.call_args_list
+    )
+
+
+async def test_runtime_registry_listener_processes_real_ha_bus_event(
+    hass: HomeAssistant,
+) -> None:
+    coordinator, _fake_hass, entry = _setup_objects()
+    entry.options = {CONF_CUSTOM_AUTO_ENABLED: True}
+    registry = _visible_custom_auto_registry()
+
+    with (
+        patch(
+            "custom_components.govee_ble_air_purifier.er.async_get",
+            return_value=registry,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier._async_cleanup_address",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.GoveeDataUpdateCoordinator",
+            return_value=coordinator,
+        ),
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_setups",
+            new_callable=AsyncMock,
+        ),
+    ):
+        assert await async_setup_entry(hass, entry)  # type: ignore[arg-type]
+        coordinator.set_custom_auto_registry_allowed.reset_mock()
+        registry.async_get.return_value = SimpleNamespace(
+            disabled_by="user", hidden_by=None
+        )
+        hass.bus.async_fire("entity_registry_updated", {"action": "update"})
+        await hass.async_block_till_done()
+
+    coordinator.set_custom_auto_registry_allowed.assert_called_once_with(False)
+
+
+async def test_disabled_unloaded_entry_registry_event_clears_memory(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(
+        domain="govee_ble_air_purifier",
+        data={CONF_ADDRESS: "AA:BB:CC:DD:EE:FF", CONF_MODEL: Model.H7124.value},
+        options={CONF_CUSTOM_AUTO_ENABLED: True},
+    )
+    entry.add_to_hass(hass)
+    registry_entry = SimpleNamespace(
+        platform="govee_ble_air_purifier",
+        unique_id="aa:bb:cc:dd:ee:ff_custom_auto",
+        config_entry_id=entry.entry_id,
+        disabled_by=None,
+    )
+    registry = MagicMock()
+    registry.async_get.return_value = registry_entry
+    memory = SimpleNamespace(async_clear=AsyncMock())
+
+    with (
+        patch(
+            "custom_components.govee_ble_air_purifier.er.async_get",
+            return_value=registry,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.CustomAutoMemory",
+            return_value=memory,
+        ) as memory_class,
+    ):
+        assert await async_setup(hass, {})
+        hass.bus.async_fire(
+            "entity_registry_updated",
+            {"action": "update", "entity_id": "switch.custom_auto"},
+        )
+        await hass.async_block_till_done()
+        memory.async_clear.assert_not_awaited()
+
+        entry.disabled_by = ConfigEntryDisabler.USER
+        registry_entry.disabled_by = er.RegistryEntryDisabler.CONFIG_ENTRY
+        hass.bus.async_fire(
+            "entity_registry_updated",
+            {
+                "action": "update",
+                "entity_id": "switch.custom_auto",
+                "changes": {"entity_id": "switch.old_custom_auto"},
+            },
+        )
+        await hass.async_block_till_done()
+        memory.async_clear.assert_not_awaited()
+
+        hass.bus.async_fire(
+            "entity_registry_updated",
+            {
+                "action": "update",
+                "entity_id": "switch.custom_auto",
+                "changes": {"disabled_by": None},
+            },
+        )
+        await hass.async_block_till_done()
+
+    memory_class.assert_called_once_with(hass, entry.entry_id)
+    memory.async_clear.assert_awaited_once_with()
+
+
+async def test_immediate_reenable_setup_joins_required_clear_before_restore(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ADDRESS: "AA:BB:CC:DD:EE:FF", CONF_MODEL: Model.H7124.value},
+        options={CONF_CUSTOM_AUTO_ENABLED: True},
+        title="Bedroom purifier",
+    )
+    entry.add_to_hass(hass)
+    registry = er.async_get(hass)
+    registry.async_get_or_create(
+        "switch",
+        DOMAIN,
+        "aa:bb:cc:dd:ee:ff_custom_auto",
+        suggested_object_id="custom_auto",
+        config_entry=entry,
+    )
+    clear_started = asyncio.Event()
+    clear_release = asyncio.Event()
+    memory = SimpleNamespace(active=True, clear_calls=0)
+
+    async def clear() -> None:
+        memory.clear_calls += 1
+        clear_started.set()
+        await clear_release.wait()
+        memory.active = False
+
+    async def load() -> bool:
+        return memory.active
+
+    async def set_active(active: bool) -> None:
+        memory.active = active
+
+    memory.async_clear = AsyncMock(side_effect=clear)
+    memory.async_load_active = AsyncMock(side_effect=load)
+    memory.async_set_active = AsyncMock(side_effect=set_active)
+    coordinator, _fake_hass, _fake_entry = _setup_objects()
+
+    with (
+        patch(
+            "custom_components.govee_ble_air_purifier.CustomAutoMemory",
+            return_value=memory,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier._async_cleanup_address",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.GoveeDataUpdateCoordinator",
+            return_value=coordinator,
+        ) as coordinator_class,
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_setups",
+            new_callable=AsyncMock,
+        ),
+        patch.object(
+            hass.config_entries,
+            "async_reload",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+    ):
+        assert await async_setup(hass, {})
+        assert await hass.config_entries.async_set_disabled_by(
+            entry.entry_id, ConfigEntryDisabler.USER
+        )
+        await clear_started.wait()
+        assert await hass.config_entries.async_set_disabled_by(entry.entry_id, None)
+
+        setup_task = asyncio.create_task(async_setup_entry(hass, entry))
+        await asyncio.sleep(0)
+        assert not setup_task.done()
+        memory.async_load_active.assert_not_awaited()
+        coordinator_class.assert_not_called()
+
+        clear_release.set()
+        assert await setup_task
+        assert coordinator_class.call_args.kwargs["restore_custom_auto"] is False
+        assert memory.clear_calls == 1
+
+        await memory.async_set_active(True)
+        await hass.async_block_till_done()
+        assert memory.active
+        assert memory.clear_calls == 1
+
+
+async def test_exhausted_required_clear_blocks_setup_until_verified_retry(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ADDRESS: "AA:BB:CC:DD:EE:FF", CONF_MODEL: Model.H7124.value},
+        options={CONF_CUSTOM_AUTO_ENABLED: True},
+        title="Bedroom purifier",
+    )
+    entry.add_to_hass(hass)
+    er.async_get(hass).async_get_or_create(
+        "switch",
+        DOMAIN,
+        "aa:bb:cc:dd:ee:ff_custom_auto",
+        suggested_object_id="custom_auto",
+        config_entry=entry,
+    )
+    memory = SimpleNamespace(failing=True, active=True, clear_calls=0)
+
+    async def clear() -> None:
+        memory.clear_calls += 1
+        if memory.failing:
+            raise RuntimeError("storage failed")
+        memory.active = False
+
+    memory.async_clear = AsyncMock(side_effect=clear)
+    memory.async_load_active = AsyncMock(side_effect=lambda: memory.active)
+    memory.async_set_active = AsyncMock()
+    coordinator, _fake_hass, _fake_entry = _setup_objects()
+
+    with (
+        patch(
+            "custom_components.govee_ble_air_purifier.CustomAutoMemory",
+            return_value=memory,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier._CONFIG_ENTRY_CLEAR_BACKOFF",
+            (0, 0),
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier._async_cleanup_address",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.GoveeDataUpdateCoordinator",
+            return_value=coordinator,
+        ) as coordinator_class,
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_setups",
+            new_callable=AsyncMock,
+        ),
+        patch.object(
+            hass.config_entries,
+            "async_reload",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+    ):
+        assert await async_setup(hass, {})
+        assert await hass.config_entries.async_set_disabled_by(
+            entry.entry_id, ConfigEntryDisabler.USER
+        )
+        await hass.async_block_till_done()
+        assert await hass.config_entries.async_set_disabled_by(entry.entry_id, None)
+
+        with pytest.raises(ConfigEntryError, match="safely clear"):
+            await async_setup_entry(hass, entry)
+        memory.async_load_active.assert_not_awaited()
+        coordinator_class.assert_not_called()
+        assert memory.clear_calls == 6
+
+        memory.failing = False
+        assert await async_setup_entry(hass, entry)
+        assert memory.clear_calls == 7
+        assert coordinator_class.call_args.kwargs["restore_custom_auto"] is False
+
+
+async def test_restart_reenable_event_reconstructs_required_clear_before_reload(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ADDRESS: "AA:BB:CC:DD:EE:FF", CONF_MODEL: Model.H7124.value},
+        options={CONF_CUSTOM_AUTO_ENABLED: True},
+        title="Bedroom purifier",
+    )
+    entry.add_to_hass(hass)
+    er.async_get(hass).async_get_or_create(
+        "switch",
+        DOMAIN,
+        "aa:bb:cc:dd:ee:ff_custom_auto",
+        suggested_object_id="custom_auto",
+        config_entry=entry,
+    )
+    memory = SimpleNamespace(failing=True, active=True, clear_calls=0)
+
+    async def clear() -> None:
+        memory.clear_calls += 1
+        if memory.failing:
+            raise RuntimeError("storage failed")
+        memory.active = False
+
+    async def set_active(active: bool) -> None:
+        memory.active = active
+
+    memory.async_clear = AsyncMock(side_effect=clear)
+    memory.async_load_active = AsyncMock(side_effect=lambda: memory.active)
+    memory.async_set_active = AsyncMock(side_effect=set_active)
+    coordinator, _fake_hass, _fake_entry = _setup_objects()
+    state_key = f"{DOMAIN}.custom_auto_required_clear"
+
+    with (
+        patch(
+            "custom_components.govee_ble_air_purifier.CustomAutoMemory",
+            return_value=memory,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier._CONFIG_ENTRY_CLEAR_BACKOFF",
+            (0, 0),
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier._async_cleanup_address",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.GoveeDataUpdateCoordinator",
+            return_value=coordinator,
+        ) as coordinator_class,
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_setups",
+            new_callable=AsyncMock,
+        ),
+        patch.object(
+            hass.config_entries,
+            "async_reload",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as reload_mock,
+    ):
+        assert await async_setup(hass, {})
+        assert await hass.config_entries.async_set_disabled_by(
+            entry.entry_id, ConfigEntryDisabler.USER
+        )
+        await hass.async_block_till_done()
+        assert memory.clear_calls == 3
+
+        # Model a fresh Home Assistant process: integration-owned memory and
+        # its bus subscription are gone, while the entity registry still
+        # records CONFIG_ENTRY as the entity's previous disabled owner.
+        old_state = hass.data.pop(state_key)
+        assert old_state.remove_listener is not None
+        old_state.remove_listener()
+        assert await async_setup(hass, {})
+
+        async def reload_into_setup(_entry_id: str) -> bool:
+            return await async_setup_entry(hass, entry)
+
+        reload_mock.side_effect = reload_into_setup
+        with pytest.raises(ConfigEntryError, match="safely clear"):
+            await hass.config_entries.async_set_disabled_by(entry.entry_id, None)
+
+        memory.async_load_active.assert_not_awaited()
+        coordinator_class.assert_not_called()
+        assert memory.clear_calls == 6
+
+        with pytest.raises(ConfigEntryError, match="safely clear"):
+            await async_setup_entry(hass, entry)
+        assert memory.clear_calls == 9
+        memory.async_load_active.assert_not_awaited()
+
+        memory.failing = False
+        assert await async_setup_entry(hass, entry)
+        assert memory.clear_calls == 10
+        assert coordinator_class.call_args.kwargs["restore_custom_auto"] is False
+
+        await memory.async_set_active(True)
+        await hass.async_block_till_done()
+        assert memory.active
+        assert memory.clear_calls == 10
+
+
+async def test_startup_failure_does_not_overwrite_remembered_state() -> None:
+    coordinator, hass, entry = _setup_objects()
+    entry.options = {CONF_CUSTOM_AUTO_ENABLED: True}
+    coordinator.async_start.side_effect = RuntimeError("startup failed")
+    memory = SimpleNamespace(
+        async_load_active=AsyncMock(return_value=True),
+        async_set_active=AsyncMock(),
+        async_clear=AsyncMock(),
+    )
+
+    with (
+        patch(
+            "custom_components.govee_ble_air_purifier.CustomAutoMemory",
+            return_value=memory,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier._async_cleanup_address",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.GoveeDataUpdateCoordinator",
+            return_value=coordinator,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier.er.async_get",
+            return_value=_visible_custom_auto_registry(),
+        ),
+        pytest.raises(RuntimeError, match="startup failed"),
+    ):
+        await async_setup_entry(hass, entry)  # type: ignore[arg-type]
+
+    memory.async_load_active.assert_awaited_once_with()
+    memory.async_set_active.assert_not_awaited()
+
+
 def _runtime_entry(
     *, enabled: bool, active: bool = False
 ) -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace]:
@@ -255,6 +969,8 @@ def _runtime_entry(
     coordinator = SimpleNamespace(
         custom_auto_controller=controller,
         async_deactivate_custom_auto=AsyncMock(),
+        async_quiesce_custom_auto=AsyncMock(),
+        async_disable_custom_auto_and_clear=AsyncMock(),
         async_set_fan_mode=AsyncMock(),
     )
     config_entries = SimpleNamespace(async_reload=AsyncMock(return_value=True))
@@ -296,9 +1012,11 @@ async def test_options_update_reloads_exactly_once(change: str) -> None:
 
     hass.config_entries.async_reload.assert_awaited_once_with("entry-id")
     if change == "enable":
-        coordinator.async_deactivate_custom_auto.assert_not_awaited()
+        coordinator.async_quiesce_custom_auto.assert_not_awaited()
+    elif change == "disable":
+        coordinator.async_disable_custom_auto_and_clear.assert_awaited_once_with()
     else:
-        coordinator.async_deactivate_custom_auto.assert_awaited_once_with()
+        coordinator.async_quiesce_custom_auto.assert_awaited_once_with()
     coordinator.async_set_fan_mode.assert_not_awaited()
 
 
@@ -307,7 +1025,7 @@ async def test_active_disable_handoff_precedes_reload_and_registry_removal() -> 
     coordinator, hass, entry = _runtime_entry(enabled=True, active=True)
     entry.options = {CONF_CUSTOM_AUTO_ENABLED: False}
     order: list[str] = []
-    coordinator.async_deactivate_custom_auto.side_effect = lambda: order.append(
+    coordinator.async_disable_custom_auto_and_clear.side_effect = lambda: order.append(
         "handoff"
     )
     hass.config_entries.async_reload.side_effect = lambda _: order.append(
@@ -362,22 +1080,23 @@ async def test_invalid_updated_options_do_not_handoff_or_reload() -> None:
     with pytest.raises(ConfigEntryError, match="Stored Custom Auto options"):
         await _async_options_updated(hass, entry)  # type: ignore[arg-type]
 
-    coordinator.async_deactivate_custom_auto.assert_not_awaited()
+    coordinator.async_quiesce_custom_auto.assert_not_awaited()
     hass.config_entries.async_reload.assert_not_awaited()
 
 
-async def test_external_update_handoff_failure_still_reloads_once() -> None:
-    """A post-persistence writer cannot leave runtime on the old options."""
+async def test_external_disable_cleanup_failure_does_not_reload() -> None:
+    """A failed required cleanup cannot claim a successful reload."""
     coordinator, hass, entry = _runtime_entry(enabled=True, active=True)
     entry.options = {CONF_CUSTOM_AUTO_ENABLED: False}
-    coordinator.async_deactivate_custom_auto.side_effect = RuntimeError(
+    coordinator.async_disable_custom_auto_and_clear.side_effect = RuntimeError(
         "purifier unavailable"
     )
 
-    await _async_options_updated(hass, entry)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="purifier unavailable"):
+        await _async_options_updated(hass, entry)  # type: ignore[arg-type]
 
-    coordinator.async_deactivate_custom_auto.assert_awaited_once_with()
-    hass.config_entries.async_reload.assert_awaited_once_with("entry-id")
+    coordinator.async_disable_custom_auto_and_clear.assert_awaited_once_with()
+    hass.config_entries.async_reload.assert_not_awaited()
 
 
 async def test_disabled_restart_removes_stale_switch_only_after_forward() -> None:
@@ -469,13 +1188,35 @@ async def test_unload_shuts_down_after_platforms_unload() -> None:
         entry, PLATFORMS
     )
     coordinator.async_shutdown.assert_awaited_once_with()
+    coordinator.async_disable_custom_auto_and_clear.assert_not_awaited()
+
+
+async def test_config_entry_disable_clears_before_unload() -> None:
+    coordinator, hass, entry = _setup_objects()
+    entry.runtime_data = coordinator
+    entry.disabled_by = "user"
+    order: list[str] = []
+    coordinator.async_disable_custom_auto_and_clear.side_effect = (
+        lambda: order.append("clear")
+    )
+    hass.config_entries.async_unload_platforms.side_effect = (
+        lambda *_: order.append("platforms") or True
+    )
+    coordinator.async_shutdown.side_effect = lambda: order.append("shutdown")
+
+    assert await async_unload_entry(hass, entry)  # type: ignore[arg-type]
+
+    assert order == ["clear", "platforms", "shutdown"]
 
 
 async def test_remove_entry_closes_stale_connection() -> None:
     """Removal performs address cleanup even after runtime data is gone."""
     address = "AA:BB:CC:DD:EE:FF"
     hass = SimpleNamespace()
-    entry = SimpleNamespace(data={CONF_ADDRESS: address})
+    entry = SimpleNamespace(
+        data={CONF_ADDRESS: address, CONF_MODEL: Model.H7129.value},
+        entry_id="entry-id",
+    )
 
     with patch(
         "custom_components.govee_ble_air_purifier.async_close_stale_connections",
@@ -484,6 +1225,84 @@ async def test_remove_entry_closes_stale_connection() -> None:
         await async_remove_entry(hass, entry)  # type: ignore[arg-type]
 
     cleanup.assert_awaited_once_with(address, reason="entry_removed")
+
+
+async def test_remove_entry_runs_address_cleanup_when_memory_clear_fails() -> None:
+    address = "AA:BB:CC:DD:EE:FF"
+    hass = SimpleNamespace()
+    entry = SimpleNamespace(
+        data={CONF_ADDRESS: address, CONF_MODEL: Model.H7129.value},
+        entry_id="entry-id",
+    )
+    memory = SimpleNamespace(
+        async_clear=AsyncMock(side_effect=RuntimeError("storage failed"))
+    )
+
+    with (
+        patch(
+            "custom_components.govee_ble_air_purifier.CustomAutoMemory",
+            return_value=memory,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier._async_cleanup_address",
+            new_callable=AsyncMock,
+        ) as cleanup,
+        pytest.raises(RuntimeError, match="storage failed"),
+    ):
+        await async_remove_entry(hass, entry)  # type: ignore[arg-type]
+
+    cleanup.assert_awaited_once()
+
+
+async def test_remove_entry_cancellation_settles_address_cleanup_then_propagates(
+) -> None:
+    address = "AA:BB:CC:DD:EE:FF"
+    hass = SimpleNamespace()
+    entry = SimpleNamespace(
+        data={CONF_ADDRESS: address, CONF_MODEL: Model.H7129.value},
+        entry_id="entry-id",
+    )
+    clear_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+
+    async def clear() -> None:
+        clear_started.set()
+        await asyncio.Event().wait()
+
+    async def cleanup(*args, **kwargs) -> None:
+        cleanup_started.set()
+        await cleanup_release.wait()
+
+    memory = SimpleNamespace(async_clear=AsyncMock(side_effect=clear))
+    with (
+        patch(
+            "custom_components.govee_ble_air_purifier.CustomAutoMemory",
+            return_value=memory,
+        ),
+        patch(
+            "custom_components.govee_ble_air_purifier._async_cleanup_address",
+            side_effect=cleanup,
+        ) as cleanup_mock,
+    ):
+        removal = asyncio.create_task(async_remove_entry(hass, entry))  # type: ignore[arg-type]
+        await clear_started.wait()
+        removal.cancel()
+        await cleanup_started.wait()
+        removal.cancel()
+        await asyncio.sleep(0)
+        assert not removal.done()
+
+        cleanup_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await removal
+
+    cleanup_mock.assert_awaited_once_with(
+        address,
+        reason="entry_removed",
+        timeout=5.0,
+        cancellation_timeout=1.0,
+    )
 
 
 async def test_standalone_cleanup_defers_to_existing_address_owner() -> None:

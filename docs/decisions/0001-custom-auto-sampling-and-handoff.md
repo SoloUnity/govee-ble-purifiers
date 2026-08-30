@@ -22,3 +22,28 @@ When it is off, the integration clears Custom Auto intent without powering the
 purifier on. Unknown power or temporary unavailability leaves the truthful OFF
 state with handoff not attempted; command failure is retained as a failed
 handoff.
+
+## Runtime selection memory
+
+Feature exposure and runtime ownership are separate. The config-entry option
+controls whether the Custom Auto switch exists; an integration-owned Home
+Assistant `Store` remembers only that switch's runtime ON/OFF selection. Storage
+version 1 uses key `govee_ble_air_purifier.custom_auto.<entry_id>` and payload
+exactly `{"active": true}` or `{"active": false}`. A fresh-store readback must
+verify every save, and removal must verify absence. Failure is reported rather
+than claiming a successful user-requested controller transition.
+
+No speed, PM2.5 value or decision, policy band, target, timer, confirmation,
+command, or policy history is stored. Restored ON and every OFF→ON activation
+start a new activation/sample barrier and wait for a valid authoritative PM2.5
+observation from the current connection before calculating a target. Bluetooth
+loss preserves remembered ON but cannot issue a command without current data.
+
+Normal unload, reload, Home Assistant restart, and shutdown preserve the
+boolean. Feature or config-entry disable and config-entry removal clear it. A
+missing, hidden, disabled, or removed stable switch registry entry closes the
+command gate and runs serialized, generation-scoped deactivate/remove/handoff
+cleanup; unhide or re-enable remains OFF. Activation and connection generations,
+the lifecycle lock, final gate checks, and bounded cleanup ownership reject stale
+work. This memory policy adds no polling and does not change Home Assistant's
+shared Bluetooth route ownership.

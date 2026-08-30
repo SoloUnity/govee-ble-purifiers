@@ -1164,6 +1164,89 @@ async def test_invalid_stored_options_can_be_replaced_completely(
     }
 
 
+@pytest.mark.parametrize(
+    "state",
+    [
+        ConfigEntryState.NOT_LOADED,
+        ConfigEntryState.SETUP_RETRY,
+        ConfigEntryState.SETUP_ERROR,
+    ],
+)
+async def test_unloaded_disable_then_reenable_clears_memory_before_each_commit(
+    hass: HomeAssistant, state: ConfigEntryState
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ADDRESS: "AA:BB:CC:DD:EE:FF", CONF_MODEL: "H7124"},
+        options={CONF_CUSTOM_AUTO_ENABLED: True},
+    )
+    entry.add_to_hass(hass)
+    entry.mock_state(hass, state, "not loaded")
+    memory = SimpleNamespace(async_clear=AsyncMock())
+
+    with (
+        patch(
+            "custom_components.govee_ble_air_purifier.config_flow.CustomAutoMemory",
+            return_value=memory,
+        ) as memory_class,
+        patch.object(
+            hass.config_entries,
+            "async_reload",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+    ):
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {CONF_CUSTOM_AUTO_ENABLED: False}
+        )
+        await hass.async_block_till_done()
+        assert result["type"] is FlowResultType.CREATE_ENTRY
+
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {CONF_CUSTOM_AUTO_ENABLED: True}
+        )
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], _custom_auto_form_values([3, 5, 9, 15])
+        )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert memory.async_clear.await_count == 2
+    assert memory_class.call_count == 2
+    assert all(
+        item.args == (hass, entry.entry_id)
+        for item in memory_class.call_args_list
+    )
+
+
+async def test_unloaded_feature_transition_clear_failure_keeps_form_open(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ADDRESS: "AA:BB:CC:DD:EE:FF", CONF_MODEL: "H7124"},
+        options={CONF_CUSTOM_AUTO_ENABLED: True},
+    )
+    entry.add_to_hass(hass)
+    memory = SimpleNamespace(
+        async_clear=AsyncMock(side_effect=RuntimeError("storage failed"))
+    )
+
+    with patch(
+        "custom_components.govee_ble_air_purifier.config_flow.CustomAutoMemory",
+        return_value=memory,
+    ):
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {CONF_CUSTOM_AUTO_ENABLED: False}
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "custom_auto_handoff_failed"}
+    assert entry.options == {CONF_CUSTOM_AUTO_ENABLED: True}
+
+
 @pytest.mark.parametrize("replacement_enabled", [False, True])
 async def test_setup_error_options_repair_reloads_once_then_uses_normal_listener(
     hass: HomeAssistant, replacement_enabled: bool
@@ -1291,8 +1374,10 @@ async def test_active_options_handoff_failure_keeps_form_open_then_retry_commits
 
     coordinator = SimpleNamespace(
         custom_auto_controller=controller,
-        async_deactivate_custom_auto=AsyncMock(side_effect=handoff),
-        async_activate_custom_auto=AsyncMock(side_effect=reactivate),
+        async_quiesce_custom_auto=AsyncMock(side_effect=handoff),
+        async_disable_custom_auto_and_clear=AsyncMock(side_effect=handoff),
+        async_rearm_custom_auto_after_quiesce=AsyncMock(side_effect=reactivate),
+        async_shutdown=AsyncMock(),
     )
     entry.runtime_data = coordinator
     entry.add_update_listener(_async_options_updated)
@@ -1326,7 +1411,10 @@ async def test_active_options_handoff_failure_keeps_form_open_then_retry_commits
         assert entry.options == old_options
         reload_mock.assert_not_awaited()
         remove_switch.assert_not_called()
-        coordinator.async_activate_custom_auto.assert_awaited_once_with()
+        if change == "edit":
+            coordinator.async_rearm_custom_auto_after_quiesce.assert_awaited_once_with()
+        else:
+            coordinator.async_rearm_custom_auto_after_quiesce.assert_not_awaited()
 
         result = await hass.config_entries.options.async_configure(
             result["flow_id"], submission
@@ -1334,7 +1422,7 @@ async def test_active_options_handoff_failure_keeps_form_open_then_retry_commits
         await hass.async_block_till_done()
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert handoff_attempts == 2
+    assert handoff_attempts == (3 if change == "disable" else 2)
     reload_mock.assert_awaited_once_with(entry.entry_id)
     if change == "disable":
         remove_switch.assert_called_once()
@@ -1362,8 +1450,8 @@ async def test_active_unchanged_settings_do_not_handoff_or_reload(
     controller = SimpleNamespace(snapshot=SimpleNamespace(active=True))
     coordinator = SimpleNamespace(
         custom_auto_controller=controller,
-        async_deactivate_custom_auto=AsyncMock(),
-        async_activate_custom_auto=AsyncMock(),
+        async_quiesce_custom_auto=AsyncMock(),
+        async_rearm_custom_auto_after_quiesce=AsyncMock(),
     )
     entry.runtime_data = coordinator
     entry.add_update_listener(_async_options_updated)
@@ -1386,8 +1474,8 @@ async def test_active_unchanged_settings_do_not_handoff_or_reload(
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert entry.options == options
     assert controller.snapshot.active
-    coordinator.async_deactivate_custom_auto.assert_not_awaited()
-    coordinator.async_activate_custom_auto.assert_not_awaited()
+    coordinator.async_quiesce_custom_auto.assert_not_awaited()
+    coordinator.async_rearm_custom_auto_after_quiesce.assert_not_awaited()
     reload_mock.assert_not_awaited()
 
 
@@ -1405,7 +1493,7 @@ async def test_unchanged_disabled_options_do_not_handoff_or_reload(
     entry.mock_state(hass, ConfigEntryState.LOADED)
     coordinator = SimpleNamespace(
         custom_auto_controller=None,
-        async_deactivate_custom_auto=AsyncMock(),
+        async_quiesce_custom_auto=AsyncMock(),
     )
     entry.runtime_data = coordinator
     entry.add_update_listener(_async_options_updated)
@@ -1424,7 +1512,7 @@ async def test_unchanged_disabled_options_do_not_handoff_or_reload(
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert entry.options == options
-    coordinator.async_deactivate_custom_auto.assert_not_awaited()
+    coordinator.async_quiesce_custom_auto.assert_not_awaited()
     reload_mock.assert_not_awaited()
 
 

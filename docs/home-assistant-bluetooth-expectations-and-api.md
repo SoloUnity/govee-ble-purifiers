@@ -1115,13 +1115,52 @@ The Govee purifier integration applies the general model as follows:
   The switch remains truthfully OFF for pending, deferred, and failed handoff.
 - Saving options validates before one atomic reload. An active old controller
   yields ownership using the same handoff before reload. The replacement starts
-  inactive. Disabling removes the stable `custom_auto` switch registry entry
-  after successful reload; re-enabling creates one switch but restores no prior
-  activation or target. Phase 3 persists no controller state or policy history.
-  Exactly one config-entry update listener is registered. Unload and failed
-  setup remove observation/entity listeners, stop and await the controller actor
-  and workers before client shutdown, and leave no one-shot request owned by a
-  replacement generation.
+  with no policy history and restores only the remembered runtime ON/OFF
+  selection. Feature exposure remains a separate config-entry option: enabling
+  it creates the stable `custom_auto` switch but does not turn that switch ON.
+  Disabling removes the switch registry entry after successful reload and clears
+  remembered runtime selection. Exactly one config-entry update listener is
+  registered. Unload and failed setup remove observation/entity listeners, stop
+  and await the controller actor and workers before client shutdown, and leave
+  no one-shot request owned by a replacement generation.
+- Runtime selection uses an integration-owned Home Assistant `Store`, not
+  config-entry options or `RestoreEntity`. Storage version 1 uses key
+  `govee_ble_air_purifier.custom_auto.<entry_id>` and an exact payload of either
+  `{"active": true}` or `{"active": false}`. The entry ID prevents a removed
+  and re-added purifier from inheriting selection. No fan speed, hysteresis
+  band, PM2.5 sample or decision, target, timer, confirmation, prior command, or
+  policy history is persisted. Missing, malformed, non-boolean, unreadable, or
+  incompatible data fails safely to OFF.
+- A mutation is serialized and awaited under the memory owner. After an atomic
+  save, a fresh `Store` reads back and strictly validates the exact payload
+  before controller state changes; removal is likewise read back as absent.
+  Cancellation waits for an in-flight mutation to settle. A failed save,
+  readback, or removal raises a storage-specific Home Assistant error and does
+  not claim a successful user-requested transition. Autonomous ownership loss
+  remains inactive and logs a persistence failure; registry safety keeps its
+  gate closed and owns bounded cleanup retries. The coordinator's lifecycle lock
+  serializes persistence, activation/deactivation, Home Assistant ownership,
+  and handoff; the controller actor separately serializes policy evaluation.
+- Startup loads memory before Bluetooth ownership and attaches controller and
+  observation listeners before the client starts. Restored ON creates a new
+  activation generation and is armed without sending a command. Only a valid
+  authoritative PM2.5 revision newer than the activation barrier and belonging
+  to the current startup epoch and connection generation can compute a fresh
+  target. OFF→ON establishes the same barrier. No speed or policy history can
+  influence either path. Unavailable Bluetooth, weak signal, or missing PM2.5
+  preserves remembered ON internally while the switch follows availability and
+  remains command-free.
+- Normal reload, Home Assistant restart, and shutdown preserve the boolean.
+  Feature disable/re-enable, config-entry disable, and config-entry removal
+  clear it; re-enable starts OFF. A missing, hidden, disabled, or removed stable
+  switch registry entry synchronously closes the activation and automatic-command
+  gate, then generation-scoped bounded cleanup deactivates policy, removes
+  memory, and performs the normal handoff where possible. Unhide/re-enable opens
+  the gate only after cleanup and remains OFF. Activation and connection
+  generations, final pre-send gate checks, cancellation-settled lifecycle work,
+  and stale-task rejection prevent old work from commanding or clearing a newer
+  runtime. Cleanup failure keeps the gate closed, uses bounded owned retries,
+  and is surfaced if final shutdown cleanup cannot establish safe storage.
 - Physical-control notifications update cached state without waiting for a poll.
 - Diagnostics retain recent connection failures, Home Assistant reachability,
   essential initialization batch/attempt counts, and GATT operation deadline,

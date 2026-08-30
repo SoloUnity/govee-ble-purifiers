@@ -62,6 +62,7 @@ class _Control:
 class _Connection:
     available: bool
     generation: int
+    observed_at: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,9 +310,21 @@ class CustomAutoController:
         await self._actor_task
         self._actor_task = None
 
-    def set_connection(self, *, available: bool, generation: int) -> None:
+    def set_connection(
+        self,
+        *,
+        available: bool,
+        generation: int,
+        observed_at: float | None = None,
+    ) -> None:
         """Synchronously enqueue availability and connection generation."""
-        self._enqueue(_Connection(available, generation))
+        self._enqueue(
+            _Connection(
+                available,
+                generation,
+                self._clock() if observed_at is None else observed_at,
+            )
+        )
 
     def set_powered(self, powered: bool) -> None:
         """Synchronously enqueue authoritative power state."""
@@ -417,7 +430,10 @@ class CustomAutoController:
                 self._last_seen_air_revision = None
             self._connection_generation = event.generation
             self._available = event.available
-            await self._invalidate_operational(reset_policy=True)
+            await self._invalidate_operational(
+                reset_policy=True,
+                barrier_observed_at=event.observed_at,
+            )
             await self._request_fresh_if_usable()
             return
         self._available = event.available
@@ -609,10 +625,27 @@ class CustomAutoController:
                 lambda: self._sleep_until_callback(deadline),
             )
 
-    async def _invalidate_operational(self, *, reset_policy: bool) -> None:
+    async def _invalidate_operational(
+        self,
+        *,
+        reset_policy: bool,
+        barrier_observed_at: float | None = None,
+    ) -> None:
         self._activation_generation += 1
         self._sample_barrier_revision = self._last_seen_air_revision
-        self._sample_barrier_observed_at = self._clock()
+        candidate_barrier_observed_at = (
+            self._clock()
+            if barrier_observed_at is None
+            else barrier_observed_at
+        )
+        self._sample_barrier_observed_at = (
+            candidate_barrier_observed_at
+            if self._sample_barrier_observed_at is None
+            else max(
+                self._sample_barrier_observed_at,
+                candidate_barrier_observed_at,
+            )
+        )
         await self._cancel_kinds(*self._WORK_KINDS)
         if reset_policy:
             self._policy = initial_policy_state(None, self._options)

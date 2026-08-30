@@ -21,6 +21,7 @@ from .bluetooth import (
 )
 from .client import PurifierClientError, ReliablePurifierClient
 from .custom_auto_controller import CustomAutoController, CustomAutoSnapshot
+from .custom_auto_memory import CustomAutoMemory
 from .custom_auto_options import CustomAutoOptions, parse_custom_auto_options
 from .models import (
     FanMode,
@@ -43,23 +44,27 @@ from .protocol import GoveePurifierProtocol
 
 _LOGGER = logging.getLogger(__name__)
 
+_CUSTOM_AUTO_REGISTRY_CLEANUP_BACKOFF = (0.01, 0.05)
+
 
 async def _complete_despite_cancellation(
     awaitable: Coroutine[Any, Any, None],
 ) -> None:
     """Finish one state transition before propagating caller cancellation."""
     task = asyncio.create_task(awaitable)
-    cancelled: asyncio.CancelledError | None = None
-    while True:
-        try:
-            await asyncio.shield(task)
-            break
-        except asyncio.CancelledError as err:
-            if task.cancelled():
-                raise
-            cancelled = err
-    if cancelled is not None:
-        raise cancelled
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:  # noqa: BLE001
+                break
+        if not task.cancelled():
+            task.exception()
+        raise
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +88,9 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
         bluetooth_settings: BluetoothRuntimeSettings,
         name: str | None = None,
         custom_auto_options: CustomAutoOptions | None = None,
+        custom_auto_memory: CustomAutoMemory | None = None,
+        restore_custom_auto: bool = False,
+        custom_auto_registry_allowed: bool = True,
     ) -> None:
         self.address = address
         self.profile = profile
@@ -111,6 +119,19 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
         ] = set()
         self._custom_auto_handoff = CustomAutoHandoffSnapshot()
         self._custom_auto_control_lock = asyncio.Lock()
+        self._custom_auto_memory = custom_auto_memory
+        self._restore_custom_auto = restore_custom_auto
+        self._custom_auto_last_active = False
+        self._custom_auto_suppress_ownership_loss = False
+        self._custom_auto_persistence_tasks: set[asyncio.Task[None]] = set()
+        self._custom_auto_registry_allowed = custom_auto_registry_allowed
+        self._custom_auto_command_gate = custom_auto_registry_allowed
+        self._custom_auto_terminal_blocked = False
+        self._custom_auto_registry_cleanup_generation = 0
+        self._custom_auto_registry_cleanup_served_generation = 0
+        self._custom_auto_registry_cleanup_required = False
+        self._custom_auto_registry_cleanup_task: asyncio.Task[None] | None = None
+        self._custom_auto_registry_listener_remove: Callable[[], None] | None = None
         self._custom_auto_options = custom_auto_options or parse_custom_auto_options(
             {}, profile.custom_auto_defaults
         )
@@ -148,34 +169,100 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
         if self._shutdown:
             raise RuntimeError("Purifier coordinator is already shut down")
         controller = self.custom_auto_controller
-        if controller is not None:
-            await controller.start()
-            self._custom_auto_state_remove = controller.add_state_listener(
-                self._custom_auto_state_updated
-            )
-            self._custom_auto_observation_remove = self.add_observation_listener(
-                self._route_custom_auto_observation
-            )
-            controller.set_connection(
-                available=self._client_available,
-                generation=self.client.connection_generation,
-            )
-            if self.data.power is not None:
-                controller.set_powered(self.data.power)
-        self._started = True
         try:
-            await self.client.async_start()
-        except Exception:
-            self._started = False
-            if self._custom_auto_observation_remove is not None:
-                self._custom_auto_observation_remove()
-                self._custom_auto_observation_remove = None
             if controller is not None:
-                await controller.shutdown()
-            if self._custom_auto_state_remove is not None:
-                self._custom_auto_state_remove()
-                self._custom_auto_state_remove = None
+                await controller.start()
+                self._custom_auto_state_remove = controller.add_state_listener(
+                    self._custom_auto_state_updated
+                )
+                self._custom_auto_observation_remove = (
+                    self.add_observation_listener(
+                        self._route_custom_auto_observation
+                    )
+                )
+                controller.set_connection(
+                    available=self._client_available,
+                    generation=self.client.connection_generation,
+                    observed_at=asyncio.get_running_loop().time(),
+                )
+                if self.data.power is not None:
+                    controller.set_powered(self.data.power)
+            self._started = True
+            if self._custom_auto_registry_cleanup_required:
+                await self._async_registry_cleanup_loop()
+            if (
+                controller is not None
+                and self._restore_custom_auto
+                and self._custom_auto_command_gate
+            ):
+                await controller.activate()
+            await self.client.async_start()
+        except BaseException as startup_error:
+            try:
+                await _complete_despite_cancellation(
+                    self._async_cleanup_failed_start(controller)
+                )
+            except BaseException as cleanup_error:
+                if isinstance(startup_error, asyncio.CancelledError):
+                    _LOGGER.error(
+                        "Purifier startup cancellation cleanup failed for %s: %s",
+                        self.name,
+                        type(cleanup_error).__name__,
+                    )
+                    raise startup_error from cleanup_error
+                raise HomeAssistantError(
+                    f"Purifier startup failed and cleanup was incomplete for "
+                    f"{self.name}: {type(cleanup_error).__name__}"
+                ) from cleanup_error
             raise
+
+    async def _async_cleanup_failed_start(
+        self, controller: CustomAutoController | None
+    ) -> None:
+        """Settle all partially started owners and owned safety work."""
+        self._started = False
+        self._remove_custom_auto_registry_listener()
+        cleanup_errors: list[Exception] = []
+        registry_cleanup = self._custom_auto_registry_cleanup_task
+        if registry_cleanup is not None:
+            await asyncio.gather(registry_cleanup, return_exceptions=True)
+        if self._custom_auto_registry_cleanup_required:
+            try:
+                async with self._custom_auto_control_lock:
+                    await self._async_registry_cleanup_transaction()
+                    self._custom_auto_registry_cleanup_required = False
+            except Exception as err:  # noqa: BLE001
+                cleanup_errors.append(err)
+        self._shutdown = True
+        if self._custom_auto_observation_remove is not None:
+            self._custom_auto_observation_remove()
+            self._custom_auto_observation_remove = None
+        if self._custom_auto_persistence_tasks:
+            await asyncio.gather(
+                *tuple(self._custom_auto_persistence_tasks),
+                return_exceptions=True,
+            )
+        if controller is not None:
+            self._custom_auto_suppress_ownership_loss = True
+            try:
+                await controller.shutdown()
+            except Exception as err:  # noqa: BLE001
+                cleanup_errors.append(err)
+            finally:
+                self._custom_auto_suppress_ownership_loss = False
+        if self._custom_auto_state_remove is not None:
+            self._custom_auto_state_remove()
+            self._custom_auto_state_remove = None
+        try:
+            await self.client.async_shutdown()
+        except Exception as err:  # noqa: BLE001
+            cleanup_errors.append(err)
+        if cleanup_errors:
+            error_types = ", ".join(type(err).__name__ for err in cleanup_errors)
+            raise HomeAssistantError(
+                f"Purifier startup cleanup was incomplete for {self.name}: "
+                f"{error_types}"
+            ) from cleanup_errors[0]
 
     async def async_wait_until_ready(self) -> None:
         """Wait for essential state during explicit setup validation."""
@@ -408,20 +495,54 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
         """Cancel recovery and close any active BLE connection."""
         if self._shutdown:
             return
+        self._remove_custom_auto_registry_listener()
+        cleanup_error: Exception | None = None
+        registry_cleanup = self._custom_auto_registry_cleanup_task
+        if registry_cleanup is not None:
+            results = await asyncio.gather(registry_cleanup, return_exceptions=True)
+            if results and isinstance(results[0], Exception):
+                cleanup_error = results[0]
+        if self._custom_auto_registry_cleanup_required:
+            try:
+                async with self._custom_auto_control_lock:
+                    await _complete_despite_cancellation(
+                        self._async_registry_cleanup_transaction()
+                    )
+                    self._custom_auto_registry_cleanup_required = False
+            except Exception as err:  # noqa: BLE001
+                cleanup_error = err
         self._shutdown = True
         if self._custom_auto_observation_remove is not None:
             self._custom_auto_observation_remove()
             self._custom_auto_observation_remove = None
         self._started = False
+        if self._custom_auto_persistence_tasks:
+            await asyncio.gather(
+                *tuple(self._custom_auto_persistence_tasks),
+                return_exceptions=True,
+            )
         controller = self.custom_auto_controller
         if controller is not None:
-            await controller.shutdown()
+            async with self._custom_auto_control_lock:
+                self._custom_auto_suppress_ownership_loss = True
+                try:
+                    await controller.shutdown()
+                finally:
+                    self._custom_auto_suppress_ownership_loss = False
         if self._custom_auto_state_remove is not None:
             self._custom_auto_state_remove()
             self._custom_auto_state_remove = None
         self._custom_auto_listeners.clear()
-        await self.client.async_shutdown()
-        await super().async_shutdown()
+        shutdown_error: Exception | None = None
+        try:
+            await self.client.async_shutdown()
+            await super().async_shutdown()
+        except Exception as err:  # noqa: BLE001
+            shutdown_error = err
+        if cleanup_error is not None:
+            raise cleanup_error
+        if shutdown_error is not None:
+            raise shutdown_error
 
     async def _async_update_data(self) -> PurifierState:
         """Return cached push state without introducing another poll."""
@@ -471,24 +592,215 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
         async with self._custom_auto_control_lock:
             controller = self.custom_auto_controller
             if controller is not None:
-                await controller.ha_override()
-                self._custom_auto_handoff = CustomAutoHandoffSnapshot(
-                    state="superseded",
-                    reason="ownership_yielded_to_ha",
+                await _complete_despite_cancellation(
+                    self._async_apply_ha_override_transaction(controller)
                 )
-                self._publish_custom_auto_state()
             if power_on:
                 await self._async_execute(SetPower(True))
             await self._async_execute(SetFanMode(FanMode(mode)))
+
+    async def _async_apply_ha_override_transaction(
+        self, controller: CustomAutoController
+    ) -> None:
+        """Persist OFF before yielding ownership to an explicit HA command."""
+        if self._custom_auto_memory is not None and self._custom_auto_command_gate:
+            await self._custom_auto_memory.async_set_active(False)
+        self._custom_auto_suppress_ownership_loss = True
+        try:
+            await controller.ha_override()
+        finally:
+            self._custom_auto_suppress_ownership_loss = False
+        self._custom_auto_handoff = CustomAutoHandoffSnapshot(
+            state="superseded",
+            reason="ownership_yielded_to_ha",
+        )
+        self._publish_custom_auto_state()
 
     async def async_activate_custom_auto(self) -> None:
         """Activate policy ownership without relying on cached PM2.5."""
         controller = self.custom_auto_controller
         if controller is None:
             raise HomeAssistantError("Custom Auto is not enabled for this purifier")
+        self._ensure_custom_auto_activation_allowed()
         async with self._custom_auto_control_lock:
-            self._custom_auto_handoff = CustomAutoHandoffSnapshot()
-            await controller.activate()
+            self._ensure_custom_auto_activation_allowed()
+            await _complete_despite_cancellation(
+                self._async_activate_custom_auto_transaction(controller)
+            )
+
+    def _ensure_custom_auto_activation_allowed(self) -> None:
+        """Reject activation once registry or terminal lifecycle safety blocks."""
+        if self._custom_auto_terminal_blocked or not self._custom_auto_command_gate:
+            raise HomeAssistantError(
+                "Custom Auto is blocked because its entity is unavailable"
+            )
+
+    def set_custom_auto_registry_listener_remover(
+        self, remove_listener: Callable[[], None]
+    ) -> None:
+        """Own registry-listener cleanup across setup failure and unload."""
+        self._custom_auto_registry_listener_remove = remove_listener
+
+    def set_custom_auto_registry_allowed(self, allowed: bool) -> None:
+        """Synchronously gate policy and schedule blocked-state cleanup."""
+        if self._shutdown or self._custom_auto_terminal_blocked:
+            return
+        self._custom_auto_registry_allowed = allowed
+        if self._custom_auto_registry_cleanup_required:
+            self._custom_auto_registry_cleanup_generation += 1
+        if allowed:
+            if (
+                not self._custom_auto_registry_cleanup_required
+                and self._custom_auto_registry_cleanup_task is None
+            ):
+                self._custom_auto_command_gate = True
+            elif self._started and self._custom_auto_registry_cleanup_task is None:
+                self._schedule_custom_auto_registry_cleanup()
+            return
+        self._custom_auto_command_gate = False
+        if not self._custom_auto_registry_cleanup_required:
+            self._custom_auto_registry_cleanup_generation += 1
+        self._custom_auto_registry_cleanup_required = True
+        if self._started and self._custom_auto_registry_cleanup_task is None:
+            self._schedule_custom_auto_registry_cleanup()
+
+    def _schedule_custom_auto_registry_cleanup(self) -> None:
+        """Create the one owned coalescing registry cleanup task."""
+        task = asyncio.create_task(
+            self._async_registry_cleanup_loop(),
+            name="govee-custom-auto-registry-cleanup",
+        )
+        self._custom_auto_registry_cleanup_task = task
+        task.add_done_callback(self._custom_auto_registry_cleanup_done)
+
+    async def async_disable_custom_auto_and_clear(self) -> None:
+        """Synchronously block, drain policy, and remove remembered intent."""
+        self._custom_auto_terminal_blocked = True
+        self._custom_auto_registry_allowed = False
+        self._custom_auto_command_gate = False
+        self._custom_auto_registry_cleanup_generation += 1
+        generation = self._custom_auto_registry_cleanup_generation
+        self._custom_auto_registry_cleanup_required = True
+        try:
+            await _complete_despite_cancellation(
+                self._async_terminal_custom_auto_cleanup(generation)
+            )
+        except BaseException:
+            if (
+                self._custom_auto_registry_cleanup_required
+                and self._started
+                and self._custom_auto_registry_cleanup_task is None
+            ):
+                self._schedule_custom_auto_registry_cleanup()
+            raise
+
+    async def _async_terminal_custom_auto_cleanup(self, generation: int) -> None:
+        """Acquire lifecycle ownership and settle terminal disable cleanup."""
+        async with self._custom_auto_control_lock:
+            await self._async_registry_cleanup_transaction()
+            self._custom_auto_registry_cleanup_served_generation = max(
+                self._custom_auto_registry_cleanup_served_generation,
+                generation,
+            )
+            if generation == self._custom_auto_registry_cleanup_generation:
+                self._custom_auto_registry_cleanup_required = False
+
+    async def _async_registry_cleanup_loop(self) -> None:
+        """Retry bounded cleanup and coalesce newer blocked generations."""
+        while self._custom_auto_registry_cleanup_required and not self._shutdown:
+            generation = self._custom_auto_registry_cleanup_generation
+            for attempt in range(len(_CUSTOM_AUTO_REGISTRY_CLEANUP_BACKOFF) + 1):
+                try:
+                    async with self._custom_auto_control_lock:
+                        await self._async_registry_cleanup_transaction()
+                except Exception:
+                    if attempt >= len(_CUSTOM_AUTO_REGISTRY_CLEANUP_BACKOFF):
+                        self._custom_auto_registry_cleanup_served_generation = max(
+                            self._custom_auto_registry_cleanup_served_generation,
+                            generation,
+                        )
+                        if generation != self._custom_auto_registry_cleanup_generation:
+                            break
+                        raise
+                    await self._async_registry_cleanup_sleep(
+                        _CUSTOM_AUTO_REGISTRY_CLEANUP_BACKOFF[attempt]
+                    )
+                    if generation != self._custom_auto_registry_cleanup_generation:
+                        break
+                    continue
+                if generation == self._custom_auto_registry_cleanup_generation:
+                    self._custom_auto_registry_cleanup_required = False
+                self._custom_auto_registry_cleanup_served_generation = max(
+                    self._custom_auto_registry_cleanup_served_generation,
+                    generation,
+                )
+                break
+        if (
+            self._custom_auto_registry_allowed
+            and not self._custom_auto_terminal_blocked
+            and not self._custom_auto_registry_cleanup_required
+            and not self._shutdown
+        ):
+            self._custom_auto_command_gate = True
+
+    async def _async_registry_cleanup_sleep(self, delay: float) -> None:
+        """Sleep between bounded registry cleanup attempts."""
+        await asyncio.sleep(delay)
+
+    async def _async_registry_cleanup_transaction(self) -> None:
+        """Drain controller, clear memory, and attempt the normal handoff."""
+        controller = self.custom_auto_controller
+        handoff_error: Exception | None = None
+        if controller is not None and self._started:
+            try:
+                await self._async_deactivate_and_handoff(
+                    controller, persist=False
+                )
+            except Exception as err:  # noqa: BLE001
+                handoff_error = err
+        if self._custom_auto_memory is not None:
+            await self._custom_auto_memory.async_clear()
+        if handoff_error is not None:
+            raise handoff_error
+
+    def _custom_auto_registry_cleanup_done(
+        self, task: asyncio.Task[None]
+    ) -> None:
+        """Observe registry cleanup and open only after successful settlement."""
+        if self._custom_auto_registry_cleanup_task is task:
+            self._custom_auto_registry_cleanup_task = None
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self._custom_auto_registry_cleanup_required = True
+            _LOGGER.error(
+                "Custom Auto registry safety cleanup failed for %s: %s",
+                self.name,
+                type(error).__name__,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+        elif (
+            self._custom_auto_registry_allowed
+            and not self._custom_auto_terminal_blocked
+            and not self._custom_auto_registry_cleanup_required
+            and not self._shutdown
+        ):
+            self._custom_auto_command_gate = True
+        if (
+            self._custom_auto_registry_cleanup_required
+            and not self._shutdown
+            and self._custom_auto_registry_cleanup_generation
+            > self._custom_auto_registry_cleanup_served_generation
+            and self._custom_auto_registry_cleanup_task is None
+        ):
+            self._schedule_custom_auto_registry_cleanup()
+
+    def _remove_custom_auto_registry_listener(self) -> None:
+        """Remove the integration-owned entity-registry listener once."""
+        if self._custom_auto_registry_listener_remove is not None:
+            self._custom_auto_registry_listener_remove()
+            self._custom_auto_registry_listener_remove = None
 
     async def async_deactivate_custom_auto(self) -> None:
         """Clear policy intent, then hand powered-on hardware to Auto."""
@@ -496,63 +808,128 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
         if controller is None:
             raise HomeAssistantError("Custom Auto is not enabled for this purifier")
         async with self._custom_auto_control_lock:
+            await _complete_despite_cancellation(
+                self._async_deactivate_custom_auto_transaction(controller)
+            )
+
+    async def async_quiesce_custom_auto(self) -> bool:
+        """Drain enabled policy for reload without changing remembered intent."""
+        controller = self.custom_auto_controller
+        if controller is None:
+            return False
+        async with self._custom_auto_control_lock:
             was_active = controller.snapshot.active
-            retrying_not_attempted = (
-                not was_active
-                and self._custom_auto_handoff.state
-                in {
-                    "not_attempted_unknown_power",
-                    "not_attempted_unavailable",
-                }
+            await _complete_despite_cancellation(
+                self._async_deactivate_and_handoff(controller, persist=False)
             )
-            await controller.deactivate()
-            if not was_active and not retrying_not_attempted:
-                self._custom_auto_handoff = CustomAutoHandoffSnapshot(
-                    state="superseded",
-                    reason="ownership_already_yielded",
-                )
-                self._publish_custom_auto_state()
-                return
-            if self.data.power is False:
-                self._custom_auto_handoff = CustomAutoHandoffSnapshot(
-                    state="not_required",
-                    reason="powered_off",
-                )
-                self._publish_custom_auto_state()
-                return
-            if self.data.power is None:
-                self._custom_auto_handoff = CustomAutoHandoffSnapshot(
-                    state="not_attempted_unknown_power",
-                    reason="power_unknown",
-                )
-                self._publish_custom_auto_state()
-                return
-            if not self._client_available or not self.client.is_ready:
-                self._custom_auto_handoff = CustomAutoHandoffSnapshot(
-                    state="not_attempted_unavailable",
-                    reason="unavailable",
-                )
-                self._publish_custom_auto_state()
-                return
-            self._custom_auto_handoff = CustomAutoHandoffSnapshot(state="pending")
-            self._publish_custom_auto_state()
+            return was_active
+
+    async def async_rearm_custom_auto_after_quiesce(self) -> None:
+        """Re-arm remembered policy after an aborted temporary edit."""
+        controller = self.custom_auto_controller
+        if controller is None:
+            return
+        self._ensure_custom_auto_activation_allowed()
+        async with self._custom_auto_control_lock:
+            self._ensure_custom_auto_activation_allowed()
+            await _complete_despite_cancellation(controller.activate())
+
+    async def _async_activate_custom_auto_transaction(
+        self, controller: CustomAutoController
+    ) -> None:
+        """Persist ON before establishing a fresh policy barrier."""
+        if self._custom_auto_memory is not None:
+            await self._custom_auto_memory.async_set_active(True)
+        self._custom_auto_handoff = CustomAutoHandoffSnapshot()
+        try:
+            await controller.activate()
+        except Exception:
+            rollback_errors: list[Exception] = []
+            self._custom_auto_suppress_ownership_loss = True
             try:
-                await self._async_execute(
-                    SetFanMode(FanMode.AUTO),
-                    origin=CommandOrigin.HANDOFF,
+                try:
+                    await controller.deactivate()
+                except Exception as err:  # noqa: BLE001
+                    rollback_errors.append(err)
+                if self._custom_auto_memory is not None:
+                    try:
+                        await self._custom_auto_memory.async_set_active(False)
+                    except Exception as err:  # noqa: BLE001
+                        rollback_errors.append(err)
+            finally:
+                self._custom_auto_suppress_ownership_loss = False
+            if rollback_errors:
+                rollback_types = ", ".join(
+                    type(err).__name__ for err in rollback_errors
                 )
-            except Exception as err:
-                cause = err.__cause__ or err
-                self._custom_auto_handoff = CustomAutoHandoffSnapshot(
-                    state="failed",
-                    error_type=type(cause).__name__,
-                )
-                self._publish_custom_auto_state()
-                raise
+                raise HomeAssistantError(
+                    "Custom Auto activation failed and rollback was incomplete "
+                    f"for {self.name}: {rollback_types}"
+                ) from rollback_errors[0]
+            raise
+
+    async def _async_deactivate_custom_auto_transaction(
+        self, controller: CustomAutoController
+    ) -> None:
+        """Persist OFF before yielding policy and hardware ownership."""
+        await self._async_deactivate_and_handoff(controller, persist=True)
+
+    async def _async_deactivate_and_handoff(
+        self, controller: CustomAutoController, *, persist: bool
+    ) -> None:
+        """Deactivate and perform the existing bounded hardware handoff."""
+        if persist and self._custom_auto_memory is not None:
+            await self._custom_auto_memory.async_set_active(False)
+        was_active = controller.snapshot.active
+        retrying_not_attempted = (
+            not was_active
+            and self._custom_auto_handoff.state
+            in {"not_attempted_unknown_power", "not_attempted_unavailable"}
+        )
+        self._custom_auto_suppress_ownership_loss = True
+        try:
+            await controller.deactivate()
+        finally:
+            self._custom_auto_suppress_ownership_loss = False
+        if not was_active and not retrying_not_attempted:
             self._custom_auto_handoff = CustomAutoHandoffSnapshot(
-                state="confirmed"
+                state="superseded", reason="ownership_already_yielded"
             )
             self._publish_custom_auto_state()
+            return
+        if self.data.power is False:
+            self._custom_auto_handoff = CustomAutoHandoffSnapshot(
+                state="not_required", reason="powered_off"
+            )
+            self._publish_custom_auto_state()
+            return
+        if self.data.power is None:
+            self._custom_auto_handoff = CustomAutoHandoffSnapshot(
+                state="not_attempted_unknown_power", reason="power_unknown"
+            )
+            self._publish_custom_auto_state()
+            return
+        if not self._client_available or not self.client.is_ready:
+            self._custom_auto_handoff = CustomAutoHandoffSnapshot(
+                state="not_attempted_unavailable", reason="unavailable"
+            )
+            self._publish_custom_auto_state()
+            return
+        self._custom_auto_handoff = CustomAutoHandoffSnapshot(state="pending")
+        self._publish_custom_auto_state()
+        try:
+            await self._async_execute(
+                SetFanMode(FanMode.AUTO), origin=CommandOrigin.HANDOFF
+            )
+        except Exception as err:
+            cause = err.__cause__ or err
+            self._custom_auto_handoff = CustomAutoHandoffSnapshot(
+                state="failed", error_type=type(cause).__name__
+            )
+            self._publish_custom_auto_state()
+            raise
+        self._custom_auto_handoff = CustomAutoHandoffSnapshot(state="confirmed")
+        self._publish_custom_auto_state()
 
     async def async_query_air_quality(self) -> None:
         """Request one coalesced, preemptible air-quality observation."""
@@ -606,10 +983,22 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
         if self._publishing_observation:
             raise RuntimeError("Observation listeners cannot issue nested I/O")
         try:
+            # This is the final synchronous safety check before entering the
+            # client command path. Registry ownership can close while a policy
+            # callback is being dispatched, after its earlier ingress check.
+            if (
+                origin is CommandOrigin.CUSTOM_AUTO
+                and not self._custom_auto_command_gate
+            ):
+                raise HomeAssistantError(
+                    "Custom Auto command blocked because its entity is unavailable"
+                )
             if origin is CommandOrigin.HOME_ASSISTANT:
                 await self.client.async_execute(command)
             else:
                 await self.client.async_execute(command, origin=origin)
+        except HomeAssistantError:
+            raise
         except (PurifierClientError, ValueError) as err:
             _LOGGER.error(
                 "Purifier control failed: name=%s command=%s error=%s",
@@ -627,6 +1016,10 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
         """Route policy output through the existing reliable command path."""
         if origin is not CommandOrigin.CUSTOM_AUTO:
             raise ValueError("Custom Auto controller used an invalid command origin")
+        if not self._custom_auto_command_gate:
+            raise HomeAssistantError(
+                "Custom Auto command blocked because its entity is unavailable"
+            )
         await self.async_set_fan_mode(mode, origin=origin)
 
     def _state_updated(self, state: PurifierState) -> None:
@@ -646,6 +1039,7 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
             controller.set_connection(
                 available=available,
                 generation=self.client.connection_generation,
+                observed_at=asyncio.get_running_loop().time(),
             )
         if available:
             self.async_set_updated_data(self.client.state)
@@ -680,15 +1074,65 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
             controller.set_connection(
                 available=False,
                 generation=current_generation,
+                observed_at=asyncio.get_running_loop().time(),
             )
         if isinstance(observation, AirQualityObservation):
             controller.observe_air_quality(observation)
         elif isinstance(observation, FanModeObservation):
             controller.observe_fan_mode(observation)
 
-    def _custom_auto_state_updated(self, _: CustomAutoSnapshot) -> None:
+    def _custom_auto_state_updated(self, snapshot: CustomAutoSnapshot) -> None:
         """Fan out controller cached-state changes synchronously."""
+        was_active = self._custom_auto_last_active
+        self._custom_auto_last_active = snapshot.active
+        if (
+            was_active
+            and not snapshot.active
+            and self._started
+            and not self._shutdown
+            and not self._custom_auto_suppress_ownership_loss
+        ):
+            task = asyncio.create_task(
+                self._async_persist_autonomous_ownership_loss(),
+                name="govee-custom-auto-persist-ownership-loss",
+            )
+            self._custom_auto_persistence_tasks.add(task)
+            task.add_done_callback(self._custom_auto_persistence_tasks.discard)
         self._publish_custom_auto_state()
+
+    async def _async_persist_autonomous_ownership_loss(self) -> None:
+        """Persist an actor-originated OFF without overtaking a later ON."""
+        try:
+            async with self._custom_auto_control_lock:
+                controller = self.custom_auto_controller
+                if (
+                    controller is None
+                    or controller.snapshot.active
+                    or not self._custom_auto_command_gate
+                ):
+                    return
+                await self._async_persist_ownership_loss("physical_override")
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception(
+                "Unexpected Custom Auto ownership-loss persistence failure for %s",
+                self.name,
+            )
+
+    async def _async_persist_ownership_loss(self, reason: str) -> None:
+        """Best-effort persist a safety OFF while keeping policy inactive."""
+        if self._custom_auto_memory is None:
+            return
+        try:
+            await self._custom_auto_memory.async_set_active(False)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception(
+                "Could not persist Custom Auto OFF after %s for %s; policy "
+                "remains inactive",
+                reason,
+                self.name,
+            )
 
     def _publish_custom_auto_state(self) -> None:
         snapshot = self.custom_auto_snapshot
