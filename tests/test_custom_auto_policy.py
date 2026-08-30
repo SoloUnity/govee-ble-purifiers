@@ -20,6 +20,7 @@ from custom_components.govee_ble_air_purifier.custom_auto_policy import (
     level_for_pm25,
     mark_command_failed,
     rebase_confirmed_mode,
+    reconcile_deferred_observation,
 )
 from custom_components.govee_ble_air_purifier.models import FanMode, Model
 from custom_components.govee_ble_air_purifier.profiles import get_profile_registry
@@ -161,8 +162,9 @@ def test_pending_command_sample_cancels_incompatible_retained_dwell() -> None:
     confirmed_low = confirm_pending_target(
         medium_air.state, FanMode.LOW, options
     )
+    reconciled = reconcile_deferred_observation(confirmed_low, options)
     seven_minutes = evaluate_observation(
-        confirmed_low, options, pm25=0, revision=4, observed_at=420
+        reconciled.state, options, pm25=0, revision=4, observed_at=420
     )
 
     assert seven_minutes.target is None
@@ -275,7 +277,7 @@ def test_command_failure_waits_for_new_revision_before_retry() -> None:
     )
     state = initial_policy_state(FanMode.SLEEP, options)
     emitted = evaluate_observation(state, options, pm25=10, revision=4, observed_at=0)
-    failed = mark_command_failed(emitted.state)
+    failed = mark_command_failed(emitted.state, options)
     stale = evaluate_observation(failed, options, pm25=10, revision=4, observed_at=1)
     retried = evaluate_observation(
         stale.state, options, pm25=10, revision=5, observed_at=2
@@ -285,6 +287,114 @@ def test_command_failure_waits_for_new_revision_before_retry() -> None:
     assert stale.state == failed
     assert retried.target is FanMode.HIGH
     assert retried.state.confirmed_level == 1
+
+
+def test_deferred_newer_target_reconciles_sequentially_after_success() -> None:
+    options = _options(
+        overrides={CONF_CUSTOM_AUTO_UPSHIFT_CONFIRMATION_SECONDS: 0}
+    )
+    state = initial_policy_state(FanMode.SLEEP, options)
+    high = evaluate_observation(state, options, pm25=10, revision=1, observed_at=0)
+    deferred = evaluate_observation(
+        high.state, options, pm25=20, revision=2, observed_at=1
+    )
+
+    confirmed = confirm_pending_target(deferred.state, FanMode.HIGH, options)
+    turbo = reconcile_deferred_observation(confirmed, options)
+
+    assert high.target is FanMode.HIGH
+    assert deferred.target is None
+    assert turbo.target is FanMode.TURBO
+    assert turbo.state.deferred_observation is None
+
+
+def test_deferred_observation_starts_positive_delay_confirmation() -> None:
+    options = _options()
+    state = initial_policy_state(None, options)
+    high = evaluate_observation(state, options, pm25=10, revision=1, observed_at=10)
+    deferred = evaluate_observation(
+        high.state, options, pm25=20, revision=2, observed_at=11
+    )
+
+    confirmed = confirm_pending_target(deferred.state, FanMode.HIGH, options)
+    first = reconcile_deferred_observation(confirmed, options)
+    boundary = evaluate_boundary(first.state, options, now=14)
+    turbo = evaluate_observation(
+        boundary.state, options, pm25=20, revision=3, observed_at=14
+    )
+
+    assert first.target is None
+    assert first.state.upshift is not None
+    assert first.state.upshift.revision == 2
+    assert boundary.request_sample
+    assert turbo.target is FanMode.TURBO
+
+
+def test_deferred_observation_is_not_replayed_after_command_failure() -> None:
+    options = _options(
+        overrides={CONF_CUSTOM_AUTO_UPSHIFT_CONFIRMATION_SECONDS: 0}
+    )
+    state = initial_policy_state(FanMode.SLEEP, options)
+    high = evaluate_observation(state, options, pm25=10, revision=1, observed_at=0)
+    deferred = evaluate_observation(
+        high.state, options, pm25=20, revision=2, observed_at=1
+    )
+
+    failed = mark_command_failed(deferred.state, options)
+    replay = reconcile_deferred_observation(failed, options)
+
+    assert replay.target is None
+    assert replay.state == failed
+    assert failed.deferred_observation is None
+
+
+def test_failed_downshift_retries_matured_target_not_lower_unmatured_target() -> None:
+    options = _options(
+        overrides={CONF_CUSTOM_AUTO_DOWNSHIFT_DELAYS_MINUTES: [7, 5, 5, 5]}
+    )
+    state = initial_policy_state(FanMode.TURBO, options)
+    started = evaluate_observation(state, options, pm25=0, revision=1, observed_at=0)
+    low = evaluate_observation(
+        started.state, options, pm25=0, revision=2, observed_at=300
+    )
+    failed = mark_command_failed(low.state, options)
+    retried = evaluate_observation(
+        failed, options, pm25=0, revision=3, observed_at=301
+    )
+    confirmed = confirm_pending_target(retried.state, FanMode.LOW, options)
+    reconciled = reconcile_deferred_observation(confirmed, options)
+    before_sleep = evaluate_observation(
+        reconciled.state, options, pm25=0, revision=4, observed_at=419
+    )
+    sleep = evaluate_observation(
+        before_sleep.state, options, pm25=0, revision=5, observed_at=420
+    )
+
+    assert low.target is FanMode.LOW
+    assert retried.target is FanMode.LOW
+    assert before_sleep.target is None
+    assert sleep.target is FanMode.SLEEP
+
+
+def test_failed_downshift_does_not_waive_upshift_confirmation() -> None:
+    options = _options(
+        overrides={CONF_CUSTOM_AUTO_DOWNSHIFT_DELAYS_MINUTES: [7, 5, 5, 5]}
+    )
+    state = initial_policy_state(FanMode.HIGH, options)
+    started = evaluate_observation(state, options, pm25=0, revision=1, observed_at=0)
+    low = evaluate_observation(
+        started.state, options, pm25=0, revision=2, observed_at=300
+    )
+    failed = mark_command_failed(low.state, options)
+
+    worse = evaluate_observation(
+        failed, options, pm25=20, revision=3, observed_at=301
+    )
+
+    assert low.target is FanMode.LOW
+    assert worse.target is None
+    assert worse.state.upshift is not None
+    assert worse.state.upshift.revision == 3
 
 
 def test_rebase_clears_pending_ownership_and_hysteresis() -> None:

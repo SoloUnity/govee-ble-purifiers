@@ -16,6 +16,7 @@ from .custom_auto_policy import (
     initial_policy_state,
     invalidate_policy_ownership,
     mark_command_failed,
+    reconcile_deferred_observation,
 )
 from .models import FanMode
 from .observations import (
@@ -32,7 +33,13 @@ SleepUntil = Callable[[float], Awaitable[None]]
 
 _WorkKind = Literal["sample", "timer", "command"]
 _ControlAction = Literal[
-    "activate", "deactivate", "override", "reconfigure", "shutdown"
+    "activate",
+    "deactivate",
+    "override",
+    "begin_power_off",
+    "finish_power_off",
+    "reconfigure",
+    "shutdown",
 ]
 
 
@@ -48,6 +55,7 @@ class _Control:
     action: _ControlAction
     future: asyncio.Future[None]
     options: CustomAutoOptions | None = None
+    powered: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +180,7 @@ class CustomAutoController:
         self._active = False
         self._available = False
         self._powered = False
+        self._power_transition = False
         self._configuration_generation = 0
         self._activation_generation = 0
         self._connection_generation = 0
@@ -201,7 +210,10 @@ class CustomAutoController:
             active=self._active,
             available=self._available,
             powered=self._powered,
-            suspended=self._active and not (self._available and self._powered),
+            suspended=self._active
+            and not (
+                self._available and self._powered and not self._power_transition
+            ),
             configuration_generation=self._configuration_generation,
             activation_generation=self._activation_generation,
             connection_generation=self._connection_generation,
@@ -275,6 +287,14 @@ class CustomAutoController:
         """Atomically yield ownership before a Home Assistant command."""
         await self._control("override")
 
+    async def begin_power_off(self) -> None:
+        """Quiesce automatic work before an acknowledged power-off command."""
+        await self._control("begin_power_off")
+
+    async def finish_power_off(self, powered: bool | None) -> None:
+        """End a power-off transition using authoritative cached power."""
+        await self._control("finish_power_off", powered=powered)
+
     async def reconfigure(self, options: CustomAutoOptions) -> None:
         """Invalidate old configuration work and apply enabled options."""
         if not options.enabled:
@@ -306,12 +326,16 @@ class CustomAutoController:
         self._enqueue(observation)
 
     async def _control(
-        self, action: _ControlAction, options: CustomAutoOptions | None = None
+        self,
+        action: _ControlAction,
+        options: CustomAutoOptions | None = None,
+        *,
+        powered: bool | None = None,
     ) -> None:
         if self._actor_task is None or self._actor_task.done():
             raise RuntimeError("Custom Auto controller is not started")
         future = asyncio.get_running_loop().create_future()
-        self._queue.put_nowait(_Control(action, future, options))
+        self._queue.put_nowait(_Control(action, future, options, powered))
         await future
 
     def _enqueue(self, event: object) -> None:
@@ -353,12 +377,24 @@ class CustomAutoController:
     async def _handle_control(self, event: _Control) -> bool:
         if event.action == "activate":
             self._active = True
+            self._power_transition = False
             await self._invalidate_operational(reset_policy=True)
             await self._request_fresh_if_usable()
             return False
         if event.action in {"deactivate", "override"}:
             self._active = False
+            self._power_transition = False
             await self._invalidate_operational(reset_policy=True)
+            return False
+        if event.action == "begin_power_off":
+            self._power_transition = True
+            await self._invalidate_operational(reset_policy=True)
+            return False
+        if event.action == "finish_power_off":
+            self._power_transition = False
+            self._powered = bool(event.powered)
+            await self._invalidate_operational(reset_policy=True)
+            await self._request_fresh_if_usable()
             return False
         if event.action == "reconfigure":
             assert event.options is not None
@@ -402,7 +438,12 @@ class CustomAutoController:
         ):
             return
         self._last_seen_air_revision = observation.revision
-        if not self._active or not self._available or not self._powered:
+        if (
+            not self._active
+            or not self._available
+            or not self._powered
+            or self._power_transition
+        ):
             return
         if (
             self._sample_barrier_revision is not None
@@ -501,15 +542,20 @@ class CustomAutoController:
             )
             self._command_state = "confirmed"
             self._last_error_type = None
-            if self._auto_redirect_state == "pending":
+            if self._auto_redirect_state in {"pending", "failed"}:
                 self._auto_redirect_state = "confirmed"
+            reconciled = reconcile_deferred_observation(
+                self._policy, self._options
+            )
+            self._policy = reconciled.state
+            await self._apply_policy_result(reconciled)
             boundary = evaluate_boundary(
                 self._policy, self._options, now=self._clock()
             )
             self._policy = boundary.state
             await self._apply_policy_result(boundary)
             return
-        self._policy = mark_command_failed(self._policy)
+        self._policy = mark_command_failed(self._policy, self._options)
         self._command_state = "failed"
         self._last_error_type = event.error_type
         if self._auto_redirect_state == "pending":
@@ -524,6 +570,7 @@ class CustomAutoController:
             or not self._active
             or not self._available
             or not self._powered
+            or self._power_transition
         ):
             return
         self._command_state = "sending"
@@ -538,7 +585,11 @@ class CustomAutoController:
 
     async def _apply_policy_result(self, result: CustomAutoPolicyResult) -> None:
         await self._cancel_kinds("timer")
-        if result.target is not None and "command" not in self._workers:
+        if (
+            result.target is not None
+            and "command" not in self._workers
+            and not self._power_transition
+        ):
             target = result.target
             self._command_state = "sending"
             self._last_error_type = None
@@ -571,7 +622,12 @@ class CustomAutoController:
         self._last_error_type = None
 
     async def _request_fresh_if_usable(self) -> None:
-        if self._active and self._available and self._powered:
+        if (
+            self._active
+            and self._available
+            and self._powered
+            and not self._power_transition
+        ):
             self._request_sample()
 
     def _request_sample(self) -> None:

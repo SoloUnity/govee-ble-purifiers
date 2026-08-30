@@ -81,6 +81,7 @@
       "invalid_integer": "Enter whole numbers for all Custom Auto settings.",
       "value_out_of_range": "One or more Custom Auto values are outside the allowed range.",
       "invalid_custom_auto_settings": "The Custom Auto settings are invalid.",
+      "custom_auto_handoff_failed": "Could not return the purifier to its built-in Auto mode. The saved settings were not changed. Make sure the purifier is available and try again.",
       "stored_options_invalid": "The saved Custom Auto settings are invalid. Disable Custom Auto or enable it and save a complete replacement configuration."
     }
   },

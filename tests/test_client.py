@@ -47,6 +47,7 @@ from custom_components.govee_ble_air_purifier.observations import (
     FanModeObservation,
     ObservationPurpose,
     ObservationSource,
+    PurifierObservation,
     ReceivedFrame,
 )
 from custom_components.govee_ble_air_purifier.operations import (
@@ -1184,6 +1185,24 @@ async def test_initialization_retries_essential_state_on_same_session() -> None:
     assert client._transport.disconnects == 0  # type: ignore[attr-defined]
 
 
+def test_initializing_client_publishes_physical_fan_observation() -> None:
+    client = make_client()
+    client.status = client_module.ClientStatus.INITIALIZING
+    client._session_generation = 4
+    observations: list[AirQualityObservation | FanModeObservation] = []
+    client._observation_callback = observations.append
+
+    client._process_plaintext_frame(
+        build_frame(b"\xee\x05\x01\x02"), generation=4
+    )
+
+    observation = observations[-1]
+    assert isinstance(observation, FanModeObservation)
+    assert observation.source is ObservationSource.PHYSICAL
+    assert observation.mode is FanMode.MEDIUM
+    assert observation.generation == 4
+
+
 @pytest.mark.asyncio
 async def test_initialization_recycles_after_three_silent_essential_batches(
     monkeypatch: pytest.MonkeyPatch,
@@ -1885,7 +1904,7 @@ async def test_active_one_shot_is_preempted_by_command_without_resume() -> None:
     assert isinstance(request.future.exception(), AirQualityQueryPreempted)
     assert len(client._channel.writes) == 1  # type: ignore[union-attr]
     assert client._air_quality_queries.request is None
-    client._command_operations.cancel(command)
+    client._command_operations.cancel(command, generation=3)
 
 
 @pytest.mark.asyncio
@@ -2189,6 +2208,60 @@ async def test_matching_ee_fan_ack_leaves_no_tombstone_for_later_command(
     client._command_operations.release(later)  # noqa: SLF001
     assert later.future.done() and later.future.exception() is None
     assert client.state.fan_mode is FanMode.HIGH
+
+
+@pytest.mark.asyncio
+async def test_cancelled_fan_duplicate_late_echoes_never_become_physical() -> None:
+    """All exact late echoes remain quarantined until a replacement send."""
+    client = make_client()
+    client._session_generation = 8
+    channel = SilentChannel()
+    client._channel = channel  # type: ignore[assignment]
+    observations: list[PurifierObservation] = []
+    client._observation_callback = observations.append
+    loop = asyncio.get_running_loop()
+    command = SetFanMode(FanMode.HIGH)
+    operation = client._command_operations.enqueue(  # noqa: SLF001
+        command, loop=loop, now=loop.time()
+    )
+    assert client._command_operations.take_next(  # noqa: SLF001
+        now=loop.time(), generation=8
+    ) is operation
+    operation_task = asyncio.create_task(client._async_execute_operation(operation))
+    while not channel.writes:
+        await asyncio.sleep(0)
+
+    client._command_operations.cancel(operation, generation=8)  # noqa: SLF001
+    await operation_task
+    client._command_operations.release(operation)  # noqa: SLF001
+    echo = client._protocol.command_request(command).frame
+    client._on_plaintext_frame(8, echo)
+    client._on_plaintext_frame(8, echo)
+
+    assert client._frame_queue.empty()
+    assert observations == []
+    assert client.state.fan_mode is None
+
+    replacement = client._command_operations.enqueue(  # noqa: SLF001
+        command, loop=loop, now=loop.time()
+    )
+    assert client._command_operations.take_next(  # noqa: SLF001
+        now=loop.time(), generation=8
+    ) is replacement
+    replacement_task = asyncio.create_task(
+        client._async_execute_operation(replacement)
+    )
+    while len(channel.writes) < 2:
+        await asyncio.sleep(0)
+    client._on_plaintext_frame(8, echo)
+    await replacement_task
+    client._command_operations.release(replacement)  # noqa: SLF001
+
+    assert replacement.future.done() and replacement.future.exception() is None
+    assert client.state.fan_mode is FanMode.HIGH
+    assert len(observations) == 1
+    assert isinstance(observations[0], FanModeObservation)
+    assert observations[0].source is ObservationSource.COMMAND
 
 
 @pytest.mark.asyncio

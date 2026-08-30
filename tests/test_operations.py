@@ -111,6 +111,69 @@ async def test_active_command_is_not_superseded_and_only_one_can_be_taken() -> N
 
 
 @pytest.mark.asyncio
+async def test_cancelled_sent_fan_reserves_late_exact_echo_as_stale() -> None:
+    controller, _ = make_controller()
+    loop = asyncio.get_running_loop()
+    operation = controller.enqueue(
+        SetFanMode(FanMode.HIGH), loop=loop, now=10.0
+    )
+    assert controller.take_next(now=10.0, generation=4) is operation
+    controller.record_send(operation, generation=4, now=10.1)
+
+    controller.cancel(operation, generation=4)
+    controller.release(operation)
+    echo = controller._protocol.command_request(operation.command).frame  # noqa: SLF001
+
+    assert controller.consume_superseded_fan_echo(generation=4, frame=echo)
+    assert controller.consume_superseded_fan_echo(generation=4, frame=echo)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_multi_attempt_fan_quarantine_retires_on_replacement_send(
+) -> None:
+    controller, _ = make_controller(Model.H7129)
+    loop = asyncio.get_running_loop()
+    command = SetFanMode(FanMode.HIGH)
+    cancelled = controller.enqueue(command, loop=loop, now=10.0)
+    assert controller.take_next(now=10.0, generation=4) is cancelled
+    controller.record_send(cancelled, generation=4, now=10.1)
+    controller.record_send(cancelled, generation=4, now=10.2)
+    controller.cancel(cancelled, generation=4)
+    controller.release(cancelled)
+    echo = controller._protocol.command_request(command).frame  # noqa: SLF001
+
+    assert controller.consume_superseded_fan_echo(generation=4, frame=echo)
+    assert controller.consume_superseded_fan_echo(generation=4, frame=echo)
+
+    replacement = controller.enqueue(command, loop=loop, now=11.0)
+    assert controller.take_next(now=11.0, generation=4) is replacement
+    controller.record_send(replacement, generation=4, now=11.1)
+    assert not controller.consume_superseded_fan_echo(generation=4, frame=echo)
+    replacement.future.cancel()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_fan_quarantines_are_bounded_and_lifecycle_cleared() -> None:
+    controller, _ = make_controller()
+    loop = asyncio.get_running_loop()
+
+    modes = list(FanMode)
+    for index in range(12):
+        mode = modes[index % len(modes)]
+        operation = controller.enqueue(
+            SetFanMode(mode), loop=loop, now=float(index)
+        )
+        assert controller.take_next(now=float(index), generation=index) is operation
+        controller.record_send(operation, generation=index, now=index + 0.1)
+        controller.cancel(operation, generation=index)
+        controller.release(operation)
+
+    assert len(controller._cancelled_fan_echoes) <= 8  # noqa: SLF001
+    controller.clear_superseded_fan_echoes()
+    assert not controller._cancelled_fan_echoes  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_physical_authority_forces_replacement_send_and_consumes_old_echo(
 ) -> None:
     controller, reducer = make_controller()

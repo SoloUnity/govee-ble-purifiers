@@ -11,11 +11,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import voluptuous as vol
 from homeassistant import config_entries
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.govee_ble_air_purifier import (
+    _async_options_updated,
+)
 from custom_components.govee_ble_air_purifier import (
     config_flow as config_flow_module,
 )
@@ -1073,6 +1077,7 @@ def test_options_flow_error_keys_have_translations() -> None:
         "invalid_integer",
         "value_out_of_range",
         "invalid_custom_auto_settings",
+        "custom_auto_handoff_failed",
         "stored_options_invalid",
     } <= strings["options"]["error"].keys()
 
@@ -1157,6 +1162,270 @@ async def test_invalid_stored_options_can_be_replaced_completely(
         CONF_CUSTOM_AUTO_UPSHIFT_CONFIRMATION_SECONDS: 3,
         CONF_CUSTOM_AUTO_DOWNSHIFT_DELAYS_MINUTES: [7, 5, 5, 5],
     }
+
+
+@pytest.mark.parametrize("replacement_enabled", [False, True])
+async def test_setup_error_options_repair_reloads_once_then_uses_normal_listener(
+    hass: HomeAssistant, replacement_enabled: bool
+) -> None:
+    """A real options commit repairs setup once without retaining its listener."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ADDRESS: "AA:BB:CC:DD:EE:FF", CONF_MODEL: "H7124"},
+        options={
+            CONF_CUSTOM_AUTO_ENABLED: True,
+            CONF_CUSTOM_AUTO_PM25_BOUNDARIES: [3, 5, 5, 15],
+        },
+    )
+    entry.add_to_hass(hass)
+    entry.mock_state(hass, ConfigEntryState.SETUP_ERROR, "invalid options")
+    normal_updates = 0
+
+    async def normal_listener(_hass, _entry) -> None:
+        nonlocal normal_updates
+        normal_updates += 1
+
+    async def reload_entry(_entry_id: str) -> bool:
+        entry.mock_state(hass, ConfigEntryState.LOADED)
+        entry.add_update_listener(normal_listener)
+        return True
+
+    with patch.object(
+        hass.config_entries,
+        "async_reload",
+        side_effect=reload_entry,
+    ) as reload_mock:
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        if replacement_enabled:
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"], {CONF_CUSTOM_AUTO_ENABLED: True}
+            )
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"], _custom_auto_form_values([3, 5, 9, 15])
+            )
+        else:
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"], {CONF_CUSTOM_AUTO_ENABLED: False}
+            )
+        await hass.async_block_till_done()
+
+        assert result["type"] is FlowResultType.CREATE_ENTRY
+        assert entry.state is ConfigEntryState.LOADED
+        reload_mock.assert_awaited_once_with(entry.entry_id)
+
+        hass.config_entries.async_update_entry(
+            entry,
+            options={CONF_CUSTOM_AUTO_ENABLED: not replacement_enabled},
+        )
+        await hass.async_block_till_done()
+
+    assert normal_updates == 1
+    reload_mock.assert_awaited_once()
+    entry.mock_state(hass, ConfigEntryState.NOT_LOADED)
+
+
+async def test_invalid_repair_submission_does_not_install_reload_listener(
+    hass: HomeAssistant,
+) -> None:
+    """Invalid replacement values neither persist nor schedule repair reload."""
+    original = {
+        CONF_CUSTOM_AUTO_ENABLED: True,
+        CONF_CUSTOM_AUTO_PM25_BOUNDARIES: [3, 5, 5, 15],
+    }
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ADDRESS: "AA:BB:CC:DD:EE:FF", CONF_MODEL: "H7124"},
+        options=original,
+    )
+    entry.add_to_hass(hass)
+    entry.mock_state(hass, ConfigEntryState.SETUP_ERROR, "invalid options")
+
+    with patch.object(
+        hass.config_entries, "async_reload", new_callable=AsyncMock
+    ) as reload_mock:
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {CONF_CUSTOM_AUTO_ENABLED: True}
+        )
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], _custom_auto_form_values([3, 5, 5, 15])
+        )
+        hass.config_entries.async_update_entry(entry, options=dict(entry.options))
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.FORM
+    assert entry.options == original
+    reload_mock.assert_not_awaited()
+
+
+@pytest.mark.parametrize("change", ["edit", "disable"])
+async def test_active_options_handoff_failure_keeps_form_open_then_retry_commits(
+    hass: HomeAssistant, change: str
+) -> None:
+    """Loaded active edits hand off before persistence and can retry safely."""
+    old_options = {
+        CONF_CUSTOM_AUTO_ENABLED: True,
+        CONF_CUSTOM_AUTO_PM25_BOUNDARIES: [3, 5, 9, 15],
+        CONF_CUSTOM_AUTO_UPSHIFT_CONFIRMATION_SECONDS: 3,
+        CONF_CUSTOM_AUTO_DOWNSHIFT_DELAYS_MINUTES: [7, 5, 5, 5],
+    }
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ADDRESS: "AA:BB:CC:DD:EE:FF", CONF_MODEL: "H7124"},
+        options=old_options,
+    )
+    entry.add_to_hass(hass)
+    entry.mock_state(hass, ConfigEntryState.LOADED)
+    controller = SimpleNamespace(snapshot=SimpleNamespace(active=True))
+    handoff_attempts = 0
+
+    async def handoff() -> None:
+        nonlocal handoff_attempts
+        handoff_attempts += 1
+        if handoff_attempts == 1:
+            raise RuntimeError("purifier unavailable")
+        controller.snapshot.active = False
+
+    async def reactivate() -> None:
+        controller.snapshot.active = True
+
+    coordinator = SimpleNamespace(
+        custom_auto_controller=controller,
+        async_deactivate_custom_auto=AsyncMock(side_effect=handoff),
+        async_activate_custom_auto=AsyncMock(side_effect=reactivate),
+    )
+    entry.runtime_data = coordinator
+    entry.add_update_listener(_async_options_updated)
+
+    with (
+        patch.object(
+            hass.config_entries,
+            "async_reload",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as reload_mock,
+        patch(
+            "custom_components.govee_ble_air_purifier."
+            "_remove_custom_auto_switch_registry_entry"
+        ) as remove_switch,
+    ):
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        if change == "edit":
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"], {CONF_CUSTOM_AUTO_ENABLED: True}
+            )
+            submission = _custom_auto_form_values([4, 6, 10, 16])
+        else:
+            submission = {CONF_CUSTOM_AUTO_ENABLED: False}
+
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], submission
+        )
+        assert result["type"] is FlowResultType.FORM
+        assert result["errors"] == {"base": "custom_auto_handoff_failed"}
+        assert entry.options == old_options
+        reload_mock.assert_not_awaited()
+        remove_switch.assert_not_called()
+        coordinator.async_activate_custom_auto.assert_awaited_once_with()
+
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], submission
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert handoff_attempts == 2
+    reload_mock.assert_awaited_once_with(entry.entry_id)
+    if change == "disable":
+        remove_switch.assert_called_once()
+    else:
+        remove_switch.assert_not_called()
+
+
+async def test_active_unchanged_settings_do_not_handoff_or_reload(
+    hass: HomeAssistant,
+) -> None:
+    """An enabled no-op leaves active policy ownership undisturbed."""
+    options = {
+        CONF_CUSTOM_AUTO_ENABLED: True,
+        CONF_CUSTOM_AUTO_PM25_BOUNDARIES: [3, 5, 9, 15],
+        CONF_CUSTOM_AUTO_UPSHIFT_CONFIRMATION_SECONDS: 3,
+        CONF_CUSTOM_AUTO_DOWNSHIFT_DELAYS_MINUTES: [7, 5, 5, 5],
+    }
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ADDRESS: "AA:BB:CC:DD:EE:FF", CONF_MODEL: "H7124"},
+        options=options,
+    )
+    entry.add_to_hass(hass)
+    entry.mock_state(hass, ConfigEntryState.LOADED)
+    controller = SimpleNamespace(snapshot=SimpleNamespace(active=True))
+    coordinator = SimpleNamespace(
+        custom_auto_controller=controller,
+        async_deactivate_custom_auto=AsyncMock(),
+        async_activate_custom_auto=AsyncMock(),
+    )
+    entry.runtime_data = coordinator
+    entry.add_update_listener(_async_options_updated)
+
+    with patch.object(
+        hass.config_entries,
+        "async_reload",
+        new_callable=AsyncMock,
+        return_value=True,
+    ) as reload_mock:
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {CONF_CUSTOM_AUTO_ENABLED: True}
+        )
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], _custom_auto_form_values([3, 5, 9, 15])
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options == options
+    assert controller.snapshot.active
+    coordinator.async_deactivate_custom_auto.assert_not_awaited()
+    coordinator.async_activate_custom_auto.assert_not_awaited()
+    reload_mock.assert_not_awaited()
+
+
+async def test_unchanged_disabled_options_do_not_handoff_or_reload(
+    hass: HomeAssistant,
+) -> None:
+    """The canonical disabled shape is also a persistence no-op."""
+    options = {CONF_CUSTOM_AUTO_ENABLED: False}
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ADDRESS: "AA:BB:CC:DD:EE:FF", CONF_MODEL: "H7124"},
+        options=options,
+    )
+    entry.add_to_hass(hass)
+    entry.mock_state(hass, ConfigEntryState.LOADED)
+    coordinator = SimpleNamespace(
+        custom_auto_controller=None,
+        async_deactivate_custom_auto=AsyncMock(),
+    )
+    entry.runtime_data = coordinator
+    entry.add_update_listener(_async_options_updated)
+
+    with patch.object(
+        hass.config_entries,
+        "async_reload",
+        new_callable=AsyncMock,
+        return_value=True,
+    ) as reload_mock:
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {CONF_CUSTOM_AUTO_ENABLED: False}
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options == options
+    coordinator.async_deactivate_custom_auto.assert_not_awaited()
+    reload_mock.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

@@ -77,7 +77,17 @@ async def _async_options_updated(
         disabling = old_controller is not None and not new_options.enabled
 
         if old_controller is not None and old_controller.snapshot.active:
-            await coordinator.async_deactivate_custom_auto()
+            try:
+                await coordinator.async_deactivate_custom_auto()
+            except Exception:  # noqa: BLE001
+                # An options flow performs this fallible handoff before commit.
+                # This path is defensive for other options writers: persisted
+                # values must still reload so storage and runtime converge.
+                _LOGGER.exception(
+                    "Custom Auto handoff failed after options were persisted "
+                    "for purifier model %s; continuing with reload",
+                    entry.data.get(CONF_MODEL, "unknown"),
+                )
 
         reloaded = await hass.config_entries.async_reload(entry.entry_id)
         if not reloaded:

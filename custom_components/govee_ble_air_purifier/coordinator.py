@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import logging
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,6 +42,24 @@ from .profiles import DeviceProfile
 from .protocol import GoveePurifierProtocol
 
 _LOGGER = logging.getLogger(__name__)
+
+
+async def _complete_despite_cancellation(
+    awaitable: Coroutine[Any, Any, None],
+) -> None:
+    """Finish one state transition before propagating caller cancellation."""
+    task = asyncio.create_task(awaitable)
+    cancelled: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as err:
+            if task.cancelled():
+                raise
+            cancelled = err
+    if cancelled is not None:
+        raise cancelled
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,7 +431,26 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
 
     async def async_set_power(self, on: bool) -> None:
         """Set purifier power and wait for matching applied state."""
-        await self._async_execute(SetPower(bool(on)))
+        if on:
+            await self._async_execute(SetPower(True))
+            return
+        async with self._custom_auto_control_lock:
+            controller = self.custom_auto_controller
+            confirmed_off = False
+            try:
+                if controller is not None:
+                    await _complete_despite_cancellation(
+                        controller.begin_power_off()
+                    )
+                await self._async_execute(SetPower(False))
+                confirmed_off = True
+            finally:
+                if controller is not None:
+                    await _complete_despite_cancellation(
+                        controller.finish_power_off(
+                            False if confirmed_off else self.data.power
+                        )
+                    )
 
     async def async_set_fan_mode(
         self,
@@ -636,6 +673,14 @@ class GoveeDataUpdateCoordinator(DataUpdateCoordinator[PurifierState]):
         controller = self.custom_auto_controller
         if controller is None:
             return
+        current_generation = self.client.connection_generation
+        if observation.generation != current_generation:
+            return
+        if observation.generation > controller.snapshot.connection_generation:
+            controller.set_connection(
+                available=False,
+                generation=current_generation,
+            )
         if isinstance(observation, AirQualityObservation):
             controller.observe_air_quality(observation)
         elif isinstance(observation, FanModeObservation):

@@ -366,6 +366,20 @@ async def test_invalid_updated_options_do_not_handoff_or_reload() -> None:
     hass.config_entries.async_reload.assert_not_awaited()
 
 
+async def test_external_update_handoff_failure_still_reloads_once() -> None:
+    """A post-persistence writer cannot leave runtime on the old options."""
+    coordinator, hass, entry = _runtime_entry(enabled=True, active=True)
+    entry.options = {CONF_CUSTOM_AUTO_ENABLED: False}
+    coordinator.async_deactivate_custom_auto.side_effect = RuntimeError(
+        "purifier unavailable"
+    )
+
+    await _async_options_updated(hass, entry)  # type: ignore[arg-type]
+
+    coordinator.async_deactivate_custom_auto.assert_awaited_once_with()
+    hass.config_entries.async_reload.assert_awaited_once_with("entry-id")
+
+
 async def test_disabled_restart_removes_stale_switch_only_after_forward() -> None:
     """Successful disabled startup closes the reload/removal crash window."""
     coordinator, hass, entry = _setup_objects()

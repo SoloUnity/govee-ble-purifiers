@@ -214,6 +214,9 @@ class CommandOperationController:
         self._superseded_fan_echoes: deque[tuple[int, bytes]] = deque(
             maxlen=_MAX_SUPERSEDED_FAN_ECHOES
         )
+        self._cancelled_fan_echoes: deque[tuple[int, bytes]] = deque(
+            maxlen=_MAX_SUPERSEDED_FAN_ECHOES
+        )
 
     @property
     def last_command_diagnostics(self) -> str | None:
@@ -421,6 +424,11 @@ class CommandOperationController:
         """Consume one exact 3a acknowledgement belonging to superseded work."""
         if not frame.startswith(b"\x3a\x05"):
             return False
+        if (generation, frame) in self._cancelled_fan_echoes:
+            # A cancelled multi-attempt command can produce more than one late
+            # exact echo. Keep rejecting all of them until an identical send
+            # explicitly takes ownership in this connection generation.
+            return True
         for stale in tuple(self._superseded_fan_echoes):
             if stale == (generation, frame):
                 self._superseded_fan_echoes.remove(stale)
@@ -430,17 +438,25 @@ class CommandOperationController:
     def clear_superseded_fan_echoes(self) -> None:
         """Forget stale-echo ownership at a connection lifecycle boundary."""
         self._superseded_fan_echoes.clear()
+        self._cancelled_fan_echoes.clear()
 
     def _retire_superseded_fan_echo_for_send(
         self, operation: _Operation, *, generation: int
     ) -> None:
         """Let a forced replacement own its matching echoes once sending starts."""
-        if not (
-            operation.force_fan_confirmation
-            and isinstance(operation.command, SetFanMode)
-        ):
+        if not isinstance(operation.command, SetFanMode):
             return
         echo = self._protocol.command_request(operation.command).frame
+        self._cancelled_fan_echoes = deque(
+            (
+                stale
+                for stale in self._cancelled_fan_echoes
+                if stale != (generation, echo)
+            ),
+            maxlen=_MAX_SUPERSEDED_FAN_ECHOES,
+        )
+        if not operation.force_fan_confirmation:
+            return
         self._superseded_fan_echoes = deque(
             (
                 stale
@@ -518,8 +534,22 @@ class CommandOperationController:
         if not self.pending:
             self.event.clear()
 
-    def cancel(self, operation: _Operation) -> None:
+    def cancel(
+        self, operation: _Operation, *, generation: int | None = None
+    ) -> None:
         """Cancel a caller-abandoned operation and remove it if still queued."""
+        if (
+            self.active is operation
+            and isinstance(operation.command, SetFanMode)
+            and operation.send_attempts > 0
+            and generation is not None
+        ):
+            stale = (
+                generation,
+                self._protocol.command_request(operation.command).frame,
+            )
+            if stale not in self._cancelled_fan_echoes:
+                self._cancelled_fan_echoes.append(stale)
         if not operation.future.done():
             operation.future.cancel()
         operation.cancel_event.set()

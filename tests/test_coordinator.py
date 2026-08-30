@@ -179,6 +179,7 @@ class FakeRuntimeClient:
         self.is_ready = False
         self.connection_generation = 1
         self.calls: list[tuple[object, ...]] = []
+        self.cancelled_commands: list[object] = []
         self.execute_error: Exception | None = None
         self.execute_gate: asyncio.Event | None = None
         self.start_check: Callable[[], None] | None = None
@@ -210,8 +211,12 @@ class FakeRuntimeClient:
         origin: CommandOrigin = CommandOrigin.HOME_ASSISTANT,
     ) -> None:
         self.calls.append(("execute", command, origin))
-        if self.execute_gate is not None:
-            await self.execute_gate.wait()
+        try:
+            if self.execute_gate is not None:
+                await self.execute_gate.wait()
+        except asyncio.CancelledError:
+            self.cancelled_commands.append(command)
+            raise
         if self.execute_error is not None:
             raise self.execute_error
 
@@ -530,6 +535,226 @@ async def test_physical_auto_redirects_and_manual_mode_yields_ownership(hass) ->
 
 
 @pytest.mark.asyncio
+async def test_initializing_current_generation_physical_manual_disables(hass) -> None:
+    coordinator, client = _runtime_coordinator(hass, enabled=True)
+    await coordinator.async_start()
+    coordinator.data = PurifierState(power=True)
+    coordinator.custom_auto_controller.set_powered(True)  # type: ignore[union-attr]
+    await coordinator.async_activate_custom_auto()
+    client.connection_generation = 2
+
+    coordinator._observation_updated(
+        FanModeObservation(
+            revision=1,
+            generation=2,
+            observed_at=1,
+            source=ObservationSource.PHYSICAL,
+            purpose=ObservationPurpose.UNSOLICITED,
+            mode=FanMode.MEDIUM,
+        )
+    )
+    coordinator._observation_updated(
+        FanModeObservation(
+            revision=2,
+            generation=1,
+            observed_at=2,
+            source=ObservationSource.PHYSICAL,
+            purpose=ObservationPurpose.UNSOLICITED,
+            mode=FanMode.AUTO,
+        )
+    )
+    await _flush()
+
+    snapshot = coordinator.custom_auto_snapshot
+    assert snapshot is not None and not snapshot.active
+    assert snapshot.connection_generation == 2
+    assert snapshot.last_physical_fan is not None
+    assert snapshot.last_physical_fan.mode is FanMode.MEDIUM
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_initializing_physical_auto_redirect_samples_once_at_ready(hass) -> None:
+    coordinator, client = _runtime_coordinator(hass, enabled=True)
+    await coordinator.async_start()
+    coordinator.data = PurifierState(power=True)
+    coordinator.custom_auto_controller.set_powered(True)  # type: ignore[union-attr]
+    await coordinator.async_activate_custom_auto()
+    client.connection_generation = 2
+    samples_before = client.calls.count(("sample",))
+
+    coordinator._observation_updated(
+        FanModeObservation(
+            revision=1,
+            generation=2,
+            observed_at=1,
+            source=ObservationSource.PHYSICAL,
+            purpose=ObservationPurpose.UNSOLICITED,
+            mode=FanMode.AUTO,
+        )
+    )
+    await _flush()
+    snapshot = coordinator.custom_auto_snapshot
+    assert snapshot is not None and snapshot.active
+    assert snapshot.auto_redirect_state == "pending"
+    assert client.calls.count(("sample",)) == samples_before
+
+    client.is_ready = True
+    client.state = coordinator.data
+    coordinator._availability_updated(True, None)
+    await _flush()
+    assert client.calls.count(("sample",)) == samples_before + 1
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_power_off_quiesces_custom_auto_command_before_power_write(hass) -> None:
+    coordinator, client = _runtime_coordinator(hass, enabled=True)
+    await coordinator.async_start()
+    client.is_ready = True
+    coordinator.data = PurifierState(power=True)
+    client.state = coordinator.data
+    coordinator._availability_updated(True, None)
+    coordinator._state_updated(coordinator.data)
+    await _flush()
+    await coordinator.async_activate_custom_auto()
+    client.execute_gate = asyncio.Event()
+    coordinator._observation_updated(
+        AirQualityObservation(
+            revision=1,
+            generation=1,
+            observed_at=asyncio.get_running_loop().time(),
+            source=ObservationSource.DEVICE,
+            purpose=ObservationPurpose.UNSOLICITED,
+            pm25=20,
+            filter_life=90,
+        )
+    )
+    await _flush()
+
+    power_off = asyncio.create_task(coordinator.async_set_power(False))
+    await _flush()
+    assert client.calls[-1] == (
+        "execute",
+        SetPower(False),
+        CommandOrigin.HOME_ASSISTANT,
+    )
+    snapshot = coordinator.custom_auto_snapshot
+    assert snapshot is not None and snapshot.active and snapshot.suspended
+    assert snapshot.command_tasks == 0
+    client.execute_gate.set()
+    await power_off
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_power_off_restores_active_controller_from_cached_power(
+    hass,
+) -> None:
+    coordinator, client = _runtime_coordinator(hass, enabled=True)
+    await coordinator.async_start()
+    client.is_ready = True
+    coordinator.data = PurifierState(power=True)
+    client.state = coordinator.data
+    coordinator._availability_updated(True, None)
+    coordinator._state_updated(coordinator.data)
+    await _flush()
+    await coordinator.async_activate_custom_auto()
+    await _flush()
+    samples_before = client.calls.count(("sample",))
+    client.execute_error = PurifierClientError("injected power failure")
+
+    with pytest.raises(HomeAssistantError, match="injected power failure"):
+        await coordinator.async_set_power(False)
+    await _flush()
+
+    snapshot = coordinator.custom_auto_snapshot
+    assert snapshot is not None and snapshot.active and not snapshot.suspended
+    assert client.calls.count(("sample",)) == samples_before + 1
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_begin_power_off_finishes_transition_and_propagates(
+    hass, monkeypatch
+) -> None:
+    coordinator, client = _runtime_coordinator(hass, enabled=True)
+    await coordinator.async_start()
+    client.is_ready = True
+    coordinator.data = PurifierState(power=True)
+    client.state = coordinator.data
+    coordinator._availability_updated(True, None)
+    coordinator._state_updated(coordinator.data)
+    await _flush()
+    await coordinator.async_activate_custom_auto()
+    controller = coordinator.custom_auto_controller
+    assert controller is not None
+    original_invalidate = controller._invalidate_operational  # noqa: SLF001
+    begin_entered = asyncio.Event()
+    release_begin = asyncio.Event()
+
+    async def blocked_invalidate(*, reset_policy: bool) -> None:
+        begin_entered.set()
+        await release_begin.wait()
+        await original_invalidate(reset_policy=reset_policy)
+
+    monkeypatch.setattr(controller, "_invalidate_operational", blocked_invalidate)
+    power_off = asyncio.create_task(coordinator.async_set_power(False))
+    await begin_entered.wait()
+    power_off.cancel()
+    await _flush()
+    assert not power_off.done()
+    assert not any(
+        call[0] == "execute" and call[1] == SetPower(False)
+        for call in client.calls
+    )
+
+    release_begin.set()
+    with pytest.raises(asyncio.CancelledError):
+        await power_off
+    await _flush()
+    snapshot = coordinator.custom_auto_snapshot
+    assert snapshot is not None and snapshot.active and not snapshot.suspended
+    assert snapshot.powered is True
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_power_off_command_safely_restores_and_propagates(
+    hass,
+) -> None:
+    coordinator, client = _runtime_coordinator(hass, enabled=True)
+    await coordinator.async_start()
+    client.is_ready = True
+    coordinator.data = PurifierState(power=True)
+    client.state = coordinator.data
+    coordinator._availability_updated(True, None)
+    coordinator._state_updated(coordinator.data)
+    await _flush()
+    await coordinator.async_activate_custom_auto()
+    samples_before = client.calls.count(("sample",))
+    client.execute_gate = asyncio.Event()
+
+    power_off = asyncio.create_task(coordinator.async_set_power(False))
+    while not any(
+        call[0] == "execute" and call[1] == SetPower(False)
+        for call in client.calls
+    ):
+        await asyncio.sleep(0)
+    power_off.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await power_off
+    await _flush()
+
+    snapshot = coordinator.custom_auto_snapshot
+    assert snapshot is not None and snapshot.active and not snapshot.suspended
+    assert snapshot.powered is True
+    assert client.calls.count(("sample",)) == samples_before + 1
+    assert client.cancelled_commands == [SetPower(False)]
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
 async def test_deactivate_handoff_power_availability_and_failure_truth(hass) -> None:
     coordinator, client = _runtime_coordinator(hass, enabled=True)
     await coordinator.async_start()
@@ -648,6 +873,7 @@ async def test_ha_superseded_inactive_state_never_retries_handoff(hass) -> None:
     await coordinator.async_start()
     client.is_ready = True
     coordinator.data = PurifierState(power=True)
+    client.state = coordinator.data
     coordinator._availability_updated(True, None)
     await _flush()
     await coordinator.async_activate_custom_auto()
@@ -753,6 +979,165 @@ async def test_power_off_suspends_without_yield_and_plain_on_preserves_intent(
     await _flush()
     snapshot = coordinator.custom_auto_snapshot
     assert snapshot is not None and snapshot.active and not snapshot.suspended
+    assert client.calls.count(("sample",)) == samples_before + 1
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_power_off_quiesces_active_automatic_send_before_power_command(
+    hass,
+) -> None:
+    coordinator, client = _runtime_coordinator(hass, enabled=True)
+    await coordinator.async_start()
+    client.is_ready = True
+    coordinator.data = PurifierState(power=True)
+    client.state = coordinator.data
+    coordinator._availability_updated(True, None)
+    coordinator._state_updated(coordinator.data)
+    await _flush()
+    await coordinator.async_activate_custom_auto()
+    client.execute_gate = asyncio.Event()
+    coordinator._observation_updated(
+        AirQualityObservation(
+            revision=1,
+            generation=1,
+            observed_at=asyncio.get_running_loop().time(),
+            source=ObservationSource.QUERY,
+            purpose=ObservationPurpose.ONE_SHOT,
+            pm25=20,
+            filter_life=90,
+        )
+    )
+    await _flush()
+
+    power_off = asyncio.create_task(coordinator.async_set_power(False))
+    await _flush()
+    assert client.cancelled_commands == [SetFanMode(FanMode.TURBO)]
+    assert client.calls[-1] == (
+        "execute",
+        SetPower(False),
+        CommandOrigin.HOME_ASSISTANT,
+    )
+    snapshot = coordinator.custom_auto_snapshot
+    assert snapshot is not None and snapshot.active and snapshot.suspended
+
+    client.execute_gate.set()
+    await power_off
+    assert coordinator.custom_auto_snapshot.powered is False  # type: ignore[union-attr]
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_power_off_restores_cached_on_state_and_fresh_barrier(
+    hass,
+) -> None:
+    coordinator, client = _runtime_coordinator(hass, enabled=True)
+    await coordinator.async_start()
+    client.is_ready = True
+    coordinator.data = PurifierState(power=True)
+    client.state = coordinator.data
+    coordinator._availability_updated(True, None)
+    coordinator._state_updated(coordinator.data)
+    await _flush()
+    await coordinator.async_activate_custom_auto()
+    samples_before = client.calls.count(("sample",))
+    client.execute_error = PurifierClientError("injected off failure")
+
+    with pytest.raises(HomeAssistantError, match="injected off failure"):
+        await coordinator.async_set_power(False)
+    await _flush()
+
+    snapshot = coordinator.custom_auto_snapshot
+    assert snapshot is not None and snapshot.active and not snapshot.suspended
+    assert snapshot.powered is True
+    assert client.calls.count(("sample",)) == samples_before + 1
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_new_generation_manual_during_initialization_permanently_yields(
+    hass,
+) -> None:
+    coordinator, client = _runtime_coordinator(hass, enabled=True)
+    await coordinator.async_start()
+    client.is_ready = True
+    coordinator.data = PurifierState(power=True)
+    coordinator._availability_updated(True, None)
+    coordinator._state_updated(coordinator.data)
+    await _flush()
+    await coordinator.async_activate_custom_auto()
+
+    client.connection_generation = 2
+    coordinator._observation_updated(
+        FanModeObservation(
+            revision=1,
+            generation=2,
+            observed_at=1,
+            source=ObservationSource.PHYSICAL,
+            purpose=ObservationPurpose.UNSOLICITED,
+            mode=FanMode.HIGH,
+        )
+    )
+    await _flush()
+    snapshot = coordinator.custom_auto_snapshot
+    assert snapshot is not None
+    assert snapshot.connection_generation == 2
+    assert not snapshot.available
+    assert not snapshot.active
+
+    coordinator._availability_updated(True, None)
+    await _flush()
+    assert not coordinator.custom_auto_snapshot.active  # type: ignore[union-attr]
+    await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_new_generation_auto_waits_for_ready_and_old_generation_is_ignored(
+    hass,
+) -> None:
+    coordinator, client = _runtime_coordinator(hass, enabled=True)
+    await coordinator.async_start()
+    client.is_ready = True
+    coordinator.data = PurifierState(power=True)
+    client.state = coordinator.data
+    coordinator._availability_updated(True, None)
+    coordinator._state_updated(coordinator.data)
+    await _flush()
+    await coordinator.async_activate_custom_auto()
+    samples_before = client.calls.count(("sample",))
+
+    client.connection_generation = 2
+    coordinator._observation_updated(
+        FanModeObservation(
+            revision=1,
+            generation=2,
+            observed_at=1,
+            source=ObservationSource.PHYSICAL,
+            purpose=ObservationPurpose.UNSOLICITED,
+            mode=FanMode.AUTO,
+        )
+    )
+    coordinator._observation_updated(
+        FanModeObservation(
+            revision=99,
+            generation=1,
+            observed_at=2,
+            source=ObservationSource.PHYSICAL,
+            purpose=ObservationPurpose.UNSOLICITED,
+            mode=FanMode.HIGH,
+        )
+    )
+    await _flush()
+    snapshot = coordinator.custom_auto_snapshot
+    assert snapshot is not None and snapshot.active and not snapshot.available
+    assert snapshot.auto_redirect_state == "pending"
+    assert client.calls.count(("sample",)) == samples_before
+
+    coordinator._availability_updated(True, None)
+    await _flush()
+    snapshot = coordinator.custom_auto_snapshot
+    assert snapshot is not None and snapshot.active and snapshot.available
+    assert snapshot.auto_redirect_state == "pending"
     assert client.calls.count(("sample",)) == samples_before + 1
     await coordinator.async_shutdown()
 

@@ -30,6 +30,15 @@ class DownshiftDwell:
 
 
 @dataclass(frozen=True, slots=True)
+class DeferredObservation:
+    """The latest accepted observation received while a command is pending."""
+
+    pm25: int
+    revision: int
+    observed_at: float
+
+
+@dataclass(frozen=True, slots=True)
 class CustomAutoPolicyState:
     """All state needed to evaluate the next event without side effects."""
 
@@ -38,7 +47,9 @@ class CustomAutoPolicyState:
     upshift: UpshiftConfirmation | None = None
     downshifts: tuple[DownshiftDwell, ...] = ()
     pending_target: FanMode | None = None
+    deferred_observation: DeferredObservation | None = None
     command_failed_revision: int | None = None
+    command_failed_target_level: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,7 +80,9 @@ def invalidate_policy_ownership(
         upshift=None,
         downshifts=(),
         pending_target=None,
+        deferred_observation=None,
         command_failed_revision=None,
+        command_failed_target_level=None,
     )
 
 
@@ -85,7 +98,9 @@ def rebase_confirmed_mode(
         upshift=None,
         downshifts=(),
         pending_target=None,
+        deferred_observation=None,
         command_failed_revision=None,
+        command_failed_target_level=None,
     )
 
 
@@ -105,20 +120,43 @@ def confirm_pending_target(
         confirmed_level=level,
         pending_target=None,
         command_failed_revision=None,
+        command_failed_target_level=None,
         downshifts=tuple(
             dwell for dwell in state.downshifts if dwell.target_level < level
         ),
     )
 
 
-def mark_command_failed(state: CustomAutoPolicyState) -> CustomAutoPolicyState:
+def reconcile_deferred_observation(
+    state: CustomAutoPolicyState, options: CustomAutoOptions
+) -> CustomAutoPolicyResult:
+    """Consume exactly one observation retained across command confirmation."""
+    deferred = state.deferred_observation
+    state = replace(state, deferred_observation=None)
+    if deferred is None:
+        return _result(state, options)
+    return _evaluate_accepted_observation(
+        state,
+        options,
+        desired=level_for_pm25(deferred.pm25, options),
+        revision=deferred.revision,
+        observed_at=deferred.observed_at,
+    )
+
+
+def mark_command_failed(
+    state: CustomAutoPolicyState, options: CustomAutoOptions
+) -> CustomAutoPolicyState:
     """Release a failed pending target but require a newer sample to retry."""
     if state.pending_target is None:
         return state
+    failed_level = _level_for_mode(state.pending_target, options)
     return replace(
         state,
         pending_target=None,
+        deferred_observation=None,
         command_failed_revision=state.last_revision,
+        command_failed_target_level=failed_level,
     )
 
 
@@ -249,18 +287,66 @@ def evaluate_observation(
             if desired <= dwell.target_level
         )
         return _result(
-            replace(state, downshifts=justified_downshifts), options
+            replace(
+                state,
+                downshifts=justified_downshifts,
+                deferred_observation=DeferredObservation(
+                    pm25, revision, float(observed_at)
+                ),
+            ),
+            options,
         )
+
+    return _evaluate_accepted_observation(
+        state,
+        options,
+        desired=desired,
+        revision=revision,
+        observed_at=observed_at,
+    )
+
+
+def _evaluate_accepted_observation(
+    state: CustomAutoPolicyState,
+    options: CustomAutoOptions,
+    *,
+    desired: int,
+    revision: int,
+    observed_at: float,
+) -> CustomAutoPolicyResult:
+    """Evaluate an observation whose revision and value are already accepted."""
 
     confirmed_level = state.confirmed_level
     if confirmed_level is None:
         return _emit(state, options, desired)
 
     if state.command_failed_revision is not None:
-        state = replace(state, command_failed_revision=None)
-        if desired != confirmed_level:
+        failed_level = state.command_failed_target_level
+        if failed_level is not None and failed_level < confirmed_level:
+            if desired <= failed_level:
+                return _emit(state, options, failed_level)
+            # A failed downshift must not turn a later upshift into an
+            # immediate retry. All no-longer-qualifying readings resume the
+            # normal hysteresis path below.
+        elif desired != confirmed_level:
+            # Preserve immediate newer-sample retry for failed upshifts.
             return _emit(state, options, desired)
-        return _result(replace(state, upshift=None, downshifts=()), options)
+        else:
+            return _result(
+                replace(
+                    state,
+                    upshift=None,
+                    downshifts=(),
+                    command_failed_revision=None,
+                    command_failed_target_level=None,
+                ),
+                options,
+            )
+        state = replace(
+            state,
+            command_failed_revision=None,
+            command_failed_target_level=None,
+        )
 
     if desired > confirmed_level:
         state = replace(state, downshifts=())
@@ -316,6 +402,5 @@ def _emit(
         upshift=None,
         downshifts=remaining_downshifts,
         pending_target=target,
-        command_failed_revision=None,
     )
     return _result(updated, options, target=target)

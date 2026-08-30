@@ -373,7 +373,9 @@ class ReliablePurifierClient:
             async with asyncio.timeout(self._timings.command_deadline):
                 await asyncio.shield(future)
         except TimeoutError as err:
-            self._command_operations.cancel(operation)
+            self._command_operations.cancel(
+                operation, generation=self._session_generation
+            )
             await asyncio.shield(operation.quiesced.wait())
             raise self._command_operations.failure_error(
                 operation,
@@ -384,7 +386,9 @@ class ReliablePurifierClient:
                 generation=self._session_generation,
             ) from err
         except asyncio.CancelledError:
-            self._command_operations.cancel(operation)
+            self._command_operations.cancel(
+                operation, generation=self._session_generation
+            )
             await asyncio.shield(operation.quiesced.wait())
             raise
         except CommandSuperseded:

@@ -71,10 +71,14 @@ class Callbacks:
         self.sample_gate = asyncio.Event()
         self.command_gate = asyncio.Event()
         self.command_failures = 0
+        self.sample_failures = 0
         self.command_cancelled = 0
 
     async def request_sample(self) -> None:
         self.samples += 1
+        if self.sample_failures:
+            self.sample_failures -= 1
+            raise RuntimeError("injected sample failure")
         if self.block_sample:
             await self.sample_gate.wait()
 
@@ -288,7 +292,7 @@ async def test_pending_target_deduplicates_and_failure_waits_for_new_sample() ->
 
 
 @pytest.mark.asyncio
-async def test_pending_in_flight_target_deduplicates_newer_samples() -> None:
+async def test_pending_high_reconciles_newer_turbo_sequentially() -> None:
     callbacks = Callbacks()
     callbacks.block_command = True
     controller, callbacks, _ = await _controller(
@@ -304,8 +308,50 @@ async def test_pending_in_flight_target_deduplicates_newer_samples() -> None:
     assert controller.snapshot.pending_target is FanMode.HIGH
     callbacks.command_gate.set()
     await _flush()
-    assert controller.snapshot.confirmed_mode is FanMode.HIGH
+    assert callbacks.commands == [
+        (FanMode.HIGH, CommandOrigin.CUSTOM_AUTO),
+        (FanMode.TURBO, CommandOrigin.CUSTOM_AUTO),
+    ]
+    assert controller.snapshot.confirmed_mode is FanMode.TURBO
     assert controller.snapshot.pending_target is None
+    await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_downshift_retries_matured_target_at_actor_level() -> None:
+    callbacks = Callbacks()
+    options = replace(_options(), downshift_delays_minutes=(7, 5, 5, 5))
+    controller, callbacks, clock = await _controller(
+        options=options, callbacks=callbacks
+    )
+    await _activate_and_confirm(controller, FanMode.TURBO, pm25=20)
+    callbacks.commands.clear()
+
+    controller.observe_air_quality(_air(2, 0, observed_at=0))
+    await _flush()
+    clock.advance(300)
+    await _flush()
+    callbacks.command_failures = 1
+    controller.observe_air_quality(_air(3, 0, observed_at=300))
+    await _flush()
+    assert callbacks.commands == [(FanMode.LOW, CommandOrigin.CUSTOM_AUTO)]
+    assert controller.snapshot.command_state == "failed"
+
+    clock.advance(301)
+    controller.observe_air_quality(_air(4, 0, observed_at=301))
+    await _flush()
+    assert callbacks.commands[-1] == (FanMode.LOW, CommandOrigin.CUSTOM_AUTO)
+    assert controller.snapshot.confirmed_mode is FanMode.LOW
+
+    clock.advance(420)
+    await _flush()
+    controller.observe_air_quality(_air(5, 0, observed_at=420))
+    await _flush()
+    assert callbacks.commands == [
+        (FanMode.LOW, CommandOrigin.CUSTOM_AUTO),
+        (FanMode.LOW, CommandOrigin.CUSTOM_AUTO),
+        (FanMode.SLEEP, CommandOrigin.CUSTOM_AUTO),
+    ]
     await controller.shutdown()
 
 
@@ -387,6 +433,152 @@ async def test_physical_auto_redirect_failure_is_bounded_diagnostic_state() -> N
     assert snapshot.last_physical_fan is not None
     assert snapshot.last_physical_fan.mode is FanMode.AUTO
     assert snapshot.last_physical_fan.source == "physical"
+    await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_redirect_recovers_from_unsolicited_sample_and_command() -> None:
+    callbacks = Callbacks()
+    controller, callbacks, _ = await _controller(
+        options=_options(upshift=0), callbacks=callbacks
+    )
+    await controller.activate()
+    await _flush()
+    callbacks.sample_failures = 1
+    controller.observe_fan_mode(
+        _fan(1, FanMode.AUTO, source=ObservationSource.PHYSICAL)
+    )
+    await _flush()
+    assert controller.snapshot.auto_redirect_state == "failed"
+
+    controller.observe_air_quality(_air(1, 20))
+    await _flush()
+
+    assert callbacks.commands == [(FanMode.TURBO, CommandOrigin.CUSTOM_AUTO)]
+    assert controller.snapshot.auto_redirect_state == "confirmed"
+    await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_redirect_command_failure_remains_failed() -> None:
+    callbacks = Callbacks()
+    callbacks.command_failures = 1
+    controller, _, _ = await _controller(
+        options=_options(upshift=0), callbacks=callbacks
+    )
+    await controller.activate()
+    await _flush()
+    callbacks.sample_failures = 1
+    controller.observe_fan_mode(
+        _fan(1, FanMode.AUTO, source=ObservationSource.PHYSICAL)
+    )
+    await _flush()
+    controller.observe_air_quality(_air(1, 20))
+    await _flush()
+
+    assert controller.snapshot.auto_redirect_state == "failed"
+    assert controller.snapshot.command_state == "failed"
+    await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_begin_power_off_quiesces_work_and_gates_fresh_observations() -> None:
+    callbacks = Callbacks()
+    callbacks.block_command = True
+    controller, callbacks, clock = await _controller(
+        options=_options(upshift=0), callbacks=callbacks
+    )
+    await controller.activate()
+    controller.observe_air_quality(_air(1, 20))
+    await _flush()
+    assert controller.snapshot.command_tasks == 1
+
+    await controller.begin_power_off()
+    assert controller.snapshot.active
+    assert controller.snapshot.suspended
+    assert controller.snapshot.command_tasks == 0
+    assert callbacks.command_cancelled == 1
+
+    controller.observe_air_quality(_air(2, 4, observed_at=clock.now))
+    clock.advance(600)
+    await _flush()
+    assert callbacks.commands == [(FanMode.TURBO, CommandOrigin.CUSTOM_AUTO)]
+
+    await controller.finish_power_off(False)
+    assert controller.snapshot.active
+    assert controller.snapshot.suspended
+    await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_power_off_restores_power_and_requires_fresh_sample() -> None:
+    controller, callbacks, _ = await _controller(options=_options(upshift=0))
+    await controller.activate()
+    samples_before = callbacks.samples
+
+    await controller.begin_power_off()
+    controller.observe_air_quality(_air(1, 20))
+    await _flush()
+    await controller.finish_power_off(True)
+    await _flush()
+
+    assert controller.snapshot.active
+    assert not controller.snapshot.suspended
+    assert callbacks.samples == samples_before + 1
+    assert callbacks.commands == []
+    await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_begin_power_off_cancels_pending_timer_without_later_send() -> None:
+    controller, callbacks, clock = await _controller(options=_options(upshift=30))
+    await _activate_and_confirm(controller, FanMode.SLEEP, pm25=0)
+    callbacks.commands.clear()
+    controller.observe_air_quality(_air(2, 20))
+    await _flush()
+    assert controller.snapshot.timer_tasks == 1
+
+    await controller.begin_power_off()
+    assert controller.snapshot.timer_tasks == 0
+    controller.observe_air_quality(_air(2, 20, observed_at=1))
+    clock.advance(60)
+    await _flush()
+
+    assert callbacks.commands == []
+    assert controller.snapshot.active
+    assert controller.snapshot.suspended
+    await controller.finish_power_off(False)
+    await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_quiesces_requeued_intent_until_fresh_current_sample() -> None:
+    callbacks = Callbacks()
+    callbacks.block_command = True
+    controller, callbacks, _ = await _controller(
+        options=_options(upshift=0), callbacks=callbacks
+    )
+    await controller.activate()
+    controller.observe_air_quality(_air(1, 20))
+    await _flush()
+    assert controller.snapshot.command_tasks == 1
+
+    controller.set_connection(available=False, generation=2)
+    await _flush()
+    assert callbacks.command_cancelled == 1
+    assert controller.snapshot.command_tasks == 0
+    controller.set_connection(available=True, generation=2)
+    await _flush()
+    assert callbacks.commands == [(FanMode.TURBO, CommandOrigin.CUSTOM_AUTO)]
+
+    controller.observe_air_quality(_air(1, 20, generation=2, observed_at=1))
+    callbacks.block_command = False
+    callbacks.command_gate.set()
+    await _flush()
+    assert callbacks.commands == [
+        (FanMode.TURBO, CommandOrigin.CUSTOM_AUTO),
+        (FanMode.TURBO, CommandOrigin.CUSTOM_AUTO),
+    ]
     await controller.shutdown()
 
 

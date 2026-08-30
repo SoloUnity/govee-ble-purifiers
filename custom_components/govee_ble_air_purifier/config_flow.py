@@ -8,6 +8,7 @@ from typing import Any, override
 import voluptuous as vol
 from homeassistant.config_entries import (
     ConfigEntry,
+    ConfigEntryState,
     ConfigFlow,
     ConfigFlowResult,
     OptionsFlow,
@@ -341,6 +342,55 @@ class GoveeBleAirPurifierConfigFlow(ConfigFlow, domain=DOMAIN):
 class GoveeBleAirPurifierOptionsFlow(OptionsFlow):
     """Edit per-entry Custom Auto options."""
 
+    def _async_install_setup_error_repair_listener(self) -> None:
+        """Reload once after valid options repair an entry that could not set up."""
+        if self.config_entry.state is not ConfigEntryState.SETUP_ERROR:
+            return
+
+        remove_listener = None
+
+        async def _async_reload_after_persist(hass, entry: ConfigEntry) -> None:
+            assert remove_listener is not None
+            remove_listener()
+            hass.async_create_task(
+                hass.config_entries.async_reload(entry.entry_id),
+                f"reload repaired {DOMAIN} entry {entry.entry_id}",
+            )
+
+        remove_listener = self.config_entry.add_update_listener(
+            _async_reload_after_persist
+        )
+
+    async def _async_handoff_active_controller(self) -> bool:
+        """Yield an active loaded controller before options are persisted."""
+        entry = self.config_entry
+        if entry.state is not ConfigEntryState.LOADED:
+            return True
+        coordinator = entry.runtime_data
+        controller = coordinator.custom_auto_controller
+        if controller is None or not controller.snapshot.active:
+            return True
+        try:
+            await coordinator.async_deactivate_custom_auto()
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception(
+                "Could not hand off active Custom Auto before saving options "
+                "for purifier model %s",
+                entry.data.get(CONF_MODEL, "unknown"),
+            )
+            try:
+                # Activation establishes a fresh-sample barrier, so a failed
+                # pre-commit edit cannot resume from stale cached PM2.5.
+                await coordinator.async_activate_custom_auto()
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception(
+                    "Could not reactivate Custom Auto after an options handoff "
+                    "failure for purifier model %s",
+                    entry.data.get(CONF_MODEL, "unknown"),
+                )
+            return False
+        return True
+
     async def _async_effective_options(
         self,
     ) -> tuple[CustomAutoOptions, bool]:
@@ -365,9 +415,17 @@ class GoveeBleAirPurifierOptionsFlow(OptionsFlow):
         if user_input is not None:
             if user_input.get(CONF_CUSTOM_AUTO_ENABLED, False):
                 return await self.async_step_custom_auto_settings()
-            return self.async_create_entry(
-                title="", data={CONF_CUSTOM_AUTO_ENABLED: False}
-            )
+            disabled_options = {CONF_CUSTOM_AUTO_ENABLED: False}
+            if disabled_options == self.config_entry.options:
+                return self.async_create_entry(title="", data=disabled_options)
+            if not await self._async_handoff_active_controller():
+                return self.async_show_form(
+                    step_id="init",
+                    data_schema=_enable_schema(effective.enabled),
+                    errors={"base": "custom_auto_handoff_failed"},
+                )
+            self._async_install_setup_error_repair_listener()
+            return self.async_create_entry(title="", data=disabled_options)
         return self.async_show_form(
             step_id="init",
             data_schema=_enable_schema(effective.enabled),
@@ -394,10 +452,19 @@ class GoveeBleAirPurifierOptionsFlow(OptionsFlow):
         if user_input is not None:
             normalized = _normalize_settings(user_input)
             try:
-                parse_custom_auto_options(normalized, defaults)
+                replacement = parse_custom_auto_options(normalized, defaults)
             except CustomAutoOptionsError as err:
                 errors["base"] = _settings_error(err)
             else:
+                if normalized == self.config_entry.options:
+                    return self.async_create_entry(title="", data=normalized)
+                if not await self._async_handoff_active_controller():
+                    return self.async_show_form(
+                        step_id="custom_auto_settings",
+                        data_schema=_settings_schema(replacement),
+                        errors={"base": "custom_auto_handoff_failed"},
+                    )
+                self._async_install_setup_error_repair_listener()
                 return self.async_create_entry(title="", data=normalized)
         return self.async_show_form(
             step_id="custom_auto_settings",
