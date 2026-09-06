@@ -384,7 +384,11 @@ def _parse_protocol(value: Any) -> ProtocolProfile:
             "20-byte strategy"
         )
     startup_strategy = protocol["startup_mode_strategy"]
-    if startup_strategy not in {"h7124_selector_00", "h7129_selector_pair"}:
+    if startup_strategy not in {
+        "h7124_selector_00",
+        "h7129_selector_pair",
+        "h7123_direct",
+    }:
         raise ProfileError("protocol.startup_mode_strategy is unknown")
 
     commands_raw = _object(protocol["commands"], path="protocol.commands")
@@ -422,6 +426,8 @@ def _parse_protocol(value: Any) -> ProtocolProfile:
             path=path,
         )
         expected_strategy, expected_prefix = registered[command]
+        if command == "fan_mode" and definition.get("strategy") == "fan_mode_33_v1":
+            expected_strategy, expected_prefix = "fan_mode_33_v1", b"\x33\x05"
         strategy = _string(definition["strategy"], path=f"{path}.strategy")
         prefix = _hex_bytes(definition["prefix"], path=f"{path}.prefix")
         if strategy != expected_strategy or prefix != expected_prefix:

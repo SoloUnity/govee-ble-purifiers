@@ -533,3 +533,10 @@ The established portions of `aa 05` are documented in the startup fan-mode
 section above. The meaning of `aa 05 01` outside H7129 manual category `01`
 remains unspecified. Bluetooth mode control uses `3a 05` and its exact
 acknowledgement, while `ee 05` reports physical fan-mode changes.
+
+## Additional experimental model observations
+
+The [H7123/H712C evidence record](h7123-h712c-evidence.md) documents dated
+application frames, command/readback observations, capability limits and
+unresolved connection behavior for the added profiles. It distinguishes
+observed device responses from reference vectors and untested hypotheses.

@@ -813,7 +813,7 @@ Hassfest, and HACS validation for a custom integration.
 The Govee purifier integration applies the general model as follows:
 
 - Before any Bluetooth work, setup loads the bundled draft 2020-12 schema and
-  all four model-profile JSON files atomically off the event loop. It resolves
+  all six model-profile JSON files atomically off the event loop. It resolves
   inheritance, performs structural and semantic validation, and publishes one
   immutable process-cached registry. Runtime setup passes the same exact
   profile instance through the coordinator, application channel, protocol, and
@@ -821,8 +821,8 @@ The Govee purifier integration applies the general model as follows:
   profile value into one immutable settings instance shared by the scanner
   environment and GATT transport.
 - `default` and `default-encrypted` are complete non-discoverable baselines.
-  Only `h7124 -> default` and `h7129 -> default-encrypted` are valid exact
-  lineages. Discovery uses exact profiles' explicit case-insensitive name
+  The exact lineages are `h7124 -> default`, `h712c -> default`,
+  `h7129 -> default-encrypted` and `h7123 -> default-encrypted`. Discovery uses exact profiles' explicit case-insensitive name
   prefixes; nameless traffic, near misses, and the baseline profiles never
   select a model.
 - Profile data owns model identity, GATT UUIDs, channel-strategy selection,
@@ -1203,3 +1203,25 @@ values are not universal Home Assistant constants.
 - [Test-before-setup rule](https://developers.home-assistant.io/docs/core/integration-quality-scale/rules/test-before-setup/)
 - [Home Assistant Core Bluetooth source](https://github.com/home-assistant/core/tree/dev/homeassistant/components/bluetooth)
 - [`bleak-retry-connector`](https://github.com/Bluetooth-Devices/bleak-retry-connector)
+
+## Experimental H712C/H7123 policy additions
+
+These profiles expose only validated power/fan controls. H712C has no Auto;
+H7123 has no Turbo. Entity speed conversion uses each profile's manual modes.
+Setup skips the Custom Auto opt-in and options abort with an explanatory
+message because no verified PM2.5 sensor is exposed. H7123 direct mode reports
+can acknowledge only the matching requested fan mode. See the
+[model evidence](h7123-h712c-evidence.md) for unresolved disconnects.
+
+## Resource and diagnostic limits
+
+The client queues at most 256 application frames. Overflow invalidates the
+current session, clears its queue and reports unavailable through the existing
+recovery path; further frames from that failed session are ignored. The shared
+setup identity cache retains at most 256 recently observed supported identities.
+Neither limit changes normal polling cadence or acknowledgement requirements.
+
+Exported diagnostics redact identifiers embedded in backend strings and raw
+20-byte frame samples, in addition to structured entry fields. Internal runtime
+records are unchanged. See [security review](security-review.md) for the threat
+model, dependency findings and protocol limits.

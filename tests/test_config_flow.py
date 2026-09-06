@@ -1699,3 +1699,37 @@ def test_manifest_disables_automatic_bluetooth_discovery() -> None:
 
     assert "bluetooth" not in manifest
     assert "bluetooth" in manifest["dependencies"]
+
+
+@pytest.mark.parametrize("model", ["H7123", "H712C"])
+async def test_added_models_options_do_not_offer_unverified_custom_auto(hass, model):
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ADDRESS: "AA:BB:CC:DD:EE:FF", CONF_MODEL: model},
+        options={CONF_CUSTOM_AUTO_ENABLED: False},
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "custom_auto_not_supported"
+    assert entry.options == {CONF_CUSTOM_AUTO_ENABLED: False}
+
+
+def test_setup_identity_cache_is_bounded_and_keeps_recent_names(hass):
+    """Rotating advertised addresses cannot accumulate an unbounded session cache."""
+    service = PurifierDiscoveryService(hass, get_profile_registry())
+    identities = {}
+    first = "AA:BB:CC:00:00:00"
+    for index in range(256):
+        service._remember_identity(
+            identities, address=f"AA:BB:CC:00:{index // 256:02X}:{index % 256:02X}",
+            name="GVH7124test",
+        )
+    service._remember_identity(identities, address=first, name="GVH7124updated")
+    service._remember_identity(
+        identities, address="AA:BB:CC:00:01:00", name="GVH7124new"
+    )
+    assert len(identities) == 256
+    assert discovery_module.unique_id_from_address(first) in identities
+    oldest = discovery_module.unique_id_from_address("AA:BB:CC:00:00:01")
+    assert oldest not in identities

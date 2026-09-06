@@ -362,8 +362,10 @@ def test_profile_artifacts_are_packaged_and_standalone_validator_passes() -> Non
         "schema.json",
         "default.json",
         "default-encrypted.json",
+        "h7123.json",
         "h7124.json",
         "h7129.json",
+        "h712c.json",
     }
     assert validate_profiles_main() == 0
 
@@ -382,3 +384,24 @@ def test_schema_closes_every_declared_object() -> None:
                 assert_closed(child)
 
     assert_closed(schema)
+
+
+@pytest.mark.parametrize("model", ["h7123", "h712c"])
+def test_added_profile_rejects_mismatched_identity(tmp_path, model):
+    directory = _copy_profiles(tmp_path)
+    path = directory / f"{model}.json"
+    document = json.loads(path.read_text())
+    document["identity"]["model"] = "H7124"
+    path.write_text(json.dumps(document))
+    with pytest.raises(ProfileError, match="mismatched model identity"):
+        load_profile_registry(directory)
+
+
+def test_h7123_rejects_plaintext_downgrade(tmp_path):
+    directory = _copy_profiles(tmp_path)
+    path = directory / "h7123.json"
+    document = json.loads(path.read_text())
+    document["channel"] = {"strategy": "plaintext", "negotiation": None}
+    path.write_text(json.dumps(document))
+    with pytest.raises(ProfileError, match="incompatible channel"):
+        load_profile_registry(directory)

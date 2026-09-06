@@ -16,6 +16,7 @@ class SupportStatus(StrEnum):
 
     BASELINE = "baseline"
     VERIFIED = "verified"
+    EXPERIMENTAL = "experimental"
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +200,15 @@ class DeviceProfile:
     def auto_parameter(self) -> int:
         """Compatibility property for protocol command assembly."""
         return self.protocol.auto_parameter
+
+    @property
+    def manual_modes(self) -> tuple[FanMode, ...]:
+        modes = (FanMode.SLEEP, FanMode.LOW, FanMode.MEDIUM, FanMode.HIGH)
+        return modes if self.model is Model.H7123 else modes + (FanMode.TURBO,)
+
+    @property
+    def supports_auto(self) -> bool:
+        return self.model is not Model.H712C
 
     def diagnostic_snapshot(
         self, *, requested_model: str | None = None

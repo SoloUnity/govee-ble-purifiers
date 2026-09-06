@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "profile_id": "h7123",
+  "extends": "default-encrypted",
+  "identity": {
+    "manufacturer": "Govee",
+    "model": "H7123",
+    "display_name": "Govee H7123",
+    "support_status": "experimental",
+    "advertised_name_prefixes": [
+      "ihoment_H7123_"
+    ]
+  },
+  "protocol": {
+    "auto_parameter": 20,
+    "request_catalog": [
+      {
+        "name": "capability_b2",
+        "frame": "33 b2 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 81",
+        "response": {
+          "kind": "value_byte",
+          "prefix": "33 b2",
+          "allowed_values": [
+            0,
+            1
+          ]
+        }
+      },
+      {
+        "name": "capability_b5",
+        "frame": "33 b5 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 86",
+        "response": {
+          "kind": "zero_payload",
+          "prefix": "33 b5"
+        }
+      },
+      {
+        "name": "device_state",
+        "frame": "aa 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ab",
+        "response": {
+          "kind": "prefix",
+          "prefix": "aa 01"
+        }
+      },
+      {
+        "name": "mode_data_00",
+        "frame": "aa 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 af",
+        "response": {
+          "kind": "prefix",
+          "prefix": "aa 05"
+        }
+      },
+      {
+        "name": "mode_data_01",
+        "frame": "aa 05 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ae",
+        "response": {
+          "kind": "prefix",
+          "prefix": "aa 05"
+        }
+      }
+    ],
+    "initialization_order": [
+      "capability_b2",
+      "capability_b5",
+      "device_state",
+      "mode_data_00",
+      "mode_data_01"
+    ],
+    "refresh_order": [
+      "device_state",
+      "mode_data_00",
+      "mode_data_01"
+    ],
+    "startup_mode_strategy": "h7123_direct"
+  },
+  "capabilities": {
+    "light": false,
+    "pm25": false,
+    "filter_life": false
+  }
+}

@@ -15,12 +15,19 @@ SCHEMA_VERSION: Final = 1
 PROFILE_FILENAMES: Final[tuple[str, ...]] = (
     "default.json",
     "default-encrypted.json",
+    "h7123.json",
+    "h712c.json",
     "h7124.json",
     "h7129.json",
 )
 ROOT_PROFILE_IDS: Final[frozenset[str]] = frozenset({"default", "default-encrypted"})
 EXACT_PROFILE_PARENTS: Final[Mapping[str, str]] = MappingProxyType(
-    {"h7124": "default", "h7129": "default-encrypted"}
+    {
+        "h7123": "default-encrypted",
+        "h712c": "default",
+        "h7124": "default",
+        "h7129": "default-encrypted",
+    }
 )
 PROFILE_DIR = Path(__file__).resolve().parent.parent / "model_profiles"
 
@@ -161,7 +168,7 @@ def load_effective_documents(
         sources[expected_id] = raw
 
     documents: list[EffectiveProfileDocument] = []
-    for profile_id in ("default", "default-encrypted", "h7124", "h7129"):
+    for profile_id in (Path(name).stem for name in PROFILE_FILENAMES):
         source = sources[profile_id]
         if profile_id in ROOT_PROFILE_IDS:
             effective = dict(source)

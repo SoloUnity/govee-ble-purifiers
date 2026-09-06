@@ -70,6 +70,7 @@ from .transactions import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_MAX_QUEUED_FRAMES = 256
 
 __all__ = [
     "AirQualityQueryCancelled",
@@ -139,7 +140,10 @@ class ReliablePurifierClient:
         self._runner: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._disconnected = asyncio.Event()
-        self._frame_queue: asyncio.Queue[ReceivedFrame] = asyncio.Queue()
+        self._frame_queue: asyncio.Queue[ReceivedFrame] = asyncio.Queue(
+            maxsize=_MAX_QUEUED_FRAMES
+        )
+        self._frame_queue_overflows = 0
         self._command_operations = CommandOperationController(
             self._timings,
             protocol,
@@ -247,6 +251,7 @@ class ReliablePurifierClient:
             "connection_cycles": self._connection_cycles,
             "recovery": self._recovery.snapshot(now=time.monotonic()).as_dict(),
             "plaintext_rx_count": self._plaintext_rx_count,
+            "frame_queue_overflows": self._frame_queue_overflows,
             "active_request": self._active_request,
             "last_error": self._last_error,
             "last_timeout_summary": self._last_timeout_summary,
@@ -1488,6 +1493,18 @@ class ReliablePurifierClient:
                 self._session_generation,
                 self._stopping.is_set(),
                 frame.hex(" "),
+            )
+            return
+        if self._disconnected.is_set():
+            return
+        if self._frame_queue.full():
+            # A lost acknowledgement must cause recovery, never false success.
+            self._frame_queue_overflows += 1
+            self._on_disconnected(generation, self._transport.generation)
+            while not self._frame_queue.empty():
+                self._frame_queue.get_nowait()
+            self._set_available(
+                False, PurifierClientError("Bluetooth notification queue overflow")
             )
             return
         if frame.startswith(b"\xee\x05"):

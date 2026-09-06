@@ -262,6 +262,10 @@ class GoveeBleAirPurifierConfigFlow(ConfigFlow, domain=DOMAIN):
                                 CONF_ADDRESS: address,
                                 CONF_MODEL: discovery.model,
                             }
+                            if discovery.model in ("H7123", "H712C"):
+                                return self._async_create_pending_entry(
+                                    {CONF_CUSTOM_AUTO_ENABLED: False}
+                                )
                             return await self.async_step_enable_custom_auto()
 
         options = self._discovery.discovery_options(discoveries)
@@ -439,6 +443,8 @@ class GoveeBleAirPurifierOptionsFlow(OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Offer the feature toggle before any settings."""
+        if self.config_entry.data[CONF_MODEL] in ("H7123", "H712C"):
+            return self.async_abort(reason="custom_auto_not_supported")
         effective, stored_options_invalid = await self._async_effective_options()
         if user_input is not None:
             if user_input.get(CONF_CUSTOM_AUTO_ENABLED, False):
@@ -474,10 +480,14 @@ class GoveeBleAirPurifierOptionsFlow(OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Edit complete normalized settings or report stable errors."""
+        if self.config_entry.data[CONF_MODEL] in ("H7123", "H712C"):
+            return self.async_abort(reason="custom_auto_not_supported")
         effective, stored_options_invalid = await self._async_effective_options()
         defaults = (
-            await async_get_profile_registry(self.hass)
-        ).for_model(self.config_entry.data[CONF_MODEL]).custom_auto_defaults
+            (await async_get_profile_registry(self.hass))
+            .for_model(self.config_entry.data[CONF_MODEL])
+            .custom_auto_defaults
+        )
         errors: dict[str, str] = (
             {"base": "stored_options_invalid"}
             if stored_options_invalid and user_input is None

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from ..frame import ApplicationFrame
-from ..models import DecodedEvent, ProtocolCommand
+from ..models import DecodedEvent, ProtocolCommand, SetFanMode
 from ..profiles import DeviceProfile
 from .codec import ProtocolCodec
 from .matcher import ResponseMatcher
@@ -64,11 +66,15 @@ class GoveePurifierProtocol:
 
         frame = self.encode(command)
         descriptor_name = name or type(command).__name__
-        return RequestDescriptor(
-            descriptor_name,
-            frame,
-            response_for_command(command, frame),
-        )
+        response = response_for_command(command, frame)
+        if (
+            self.profile.protocol.startup_mode_strategy == "h7123_direct"
+            and isinstance(command, SetFanMode)
+        ):
+            response = replace(
+                response, allowed_prefixes=response.allowed_prefixes + (b"\xaa\x05",)
+            )
+        return RequestDescriptor(descriptor_name, frame, response)
 
     # A short alias reads naturally at call sites constructing a transaction.
     request = command_request
