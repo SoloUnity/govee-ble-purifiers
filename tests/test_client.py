@@ -2457,3 +2457,45 @@ async def test_timeout_reports_unmatched_plaintext_sample(
     assert "received=1" in message
     assert "ignored=1" in message
     assert build_frame(b"\xaa\x01\x01").hex(" ") in message
+
+
+@pytest.mark.asyncio
+async def test_notification_flood_is_bounded_and_invalidates_session():
+    """A noisy peer cannot grow the queue or leave lost replies looking valid."""
+    client = make_client()
+    client._session_generation = 1
+    channel = SimpleNamespace(ready=True)
+
+    def invalidate():
+        channel.ready = False
+
+    channel.invalidate = invalidate
+    client._channel = channel
+    availability = []
+    client._availability_callback = lambda available, error: availability.append(
+        (available, error)
+    )
+    frame = build_frame(b"\xaa\x01\x01")
+    for _ in range(client._frame_queue.maxsize):
+        client._on_plaintext_frame(1, frame)
+    assert client._frame_queue.qsize() == 256
+    assert not client._disconnected.is_set()
+
+    client._on_plaintext_frame(1, frame)
+    assert client._disconnected.is_set()
+    assert not channel.ready
+    assert client._frame_queue.empty()
+    assert availability[-1][0] is False
+    assert "overflow" in str(availability[-1][1])
+    for _ in range(1000):
+        client._on_plaintext_frame(1, frame)
+    assert client._frame_queue.empty()
+    assert client.diagnostic_snapshot()["frame_queue_overflows"] == 1
+
+    # A newly negotiated generation can receive frames again.
+    client._session_generation = 2
+    client._disconnected.clear()
+    client._on_plaintext_frame(1, frame)
+    assert client._frame_queue.empty()
+    client._on_plaintext_frame(2, frame)
+    assert client._frame_queue.qsize() == 1

@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "profile_id": "h712c",
+  "extends": "default",
+  "identity": {
+    "manufacturer": "Govee",
+    "model": "H712C",
+    "display_name": "Govee H712C",
+    "support_status": "experimental",
+    "advertised_name_prefixes": [
+      "GVH712C"
+    ]
+  },
+  "protocol": {
+    "auto_parameter": 0,
+    "request_catalog": [
+      {
+        "name": "device_state",
+        "frame": "aa 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ab",
+        "response": {
+          "kind": "prefix",
+          "prefix": "aa 01"
+        }
+      },
+      {
+        "name": "mode_data_00",
+        "frame": "aa 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 af",
+        "response": {
+          "kind": "prefix_selector",
+          "prefix": "aa 05",
+          "selector": "00"
+        }
+      },
+      {
+        "name": "mode_data_01",
+        "frame": "aa 05 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ae",
+        "response": {
+          "kind": "prefix_selector",
+          "prefix": "aa 05",
+          "selector": "01"
+        }
+      }
+    ],
+    "initialization_order": [
+      "device_state",
+      "mode_data_00",
+      "mode_data_01"
+    ],
+    "refresh_order": [
+      "device_state",
+      "mode_data_00",
+      "mode_data_01"
+    ],
+    "commands": {
+      "fan_mode": {
+        "strategy": "fan_mode_33_v1",
+        "prefix": "33 05"
+      }
+    }
+  },
+  "capabilities": {
+    "light": false,
+    "pm25": false,
+    "filter_life": false
+  }
+}

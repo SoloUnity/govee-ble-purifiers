@@ -24,6 +24,7 @@ MANUAL_DISCOVERY_SCAN_DURATION = 10.0
 SELECTED_DEVICE_ADVERTISEMENT_TIMEOUT = 10
 SELECTED_ADVERTISEMENT_CHECK_INTERVAL = 0.25
 _SETUP_IDENTITY_CACHE = f"{DOMAIN}_setup_identity_cache"
+_MAX_CACHED_IDENTITIES = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,7 +109,11 @@ class PurifierDiscoveryService:
         if model is None or name is None:
             return identities.get(unique_id_from_address(address))
         identity = PurifierIdentity(name=name, model=model)
-        identities[unique_id_from_address(address)] = identity
+        normalized = unique_id_from_address(address)
+        identities.pop(normalized, None)
+        while len(identities) >= _MAX_CACHED_IDENTITIES:
+            identities.pop(next(iter(identities)))
+        identities[normalized] = identity
         return identity
 
     def _remember_ble_device_identity(

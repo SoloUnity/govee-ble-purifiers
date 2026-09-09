@@ -12,6 +12,7 @@ from ..models import (
     EchoEvent,
     FanMode,
     FanModeEvent,
+    Model,
     NegotiationEvent,
     NightLightColorEvent,
     NightLightStateEvent,
@@ -65,7 +66,9 @@ class ProtocolCodec:
             return build_frame(definition.prefix + bytes((int(command.on),)))
         if isinstance(command, SetFanMode):
             definition = self._require_command_strategy(
-                profile, "fan_mode", "fan_mode_v1"
+                profile,
+                "fan_mode",
+                "fan_mode_33_v1" if profile.model is Model.H712C else "fan_mode_v1",
             )
             return self._encode_fan_mode(command.mode, definition, profile)
         if isinstance(command, SetNightLightPower):
@@ -113,6 +116,10 @@ class ProtocolCodec:
             mode = FanMode(mode)
         except ValueError as err:
             raise ProtocolError(f"unsupported fan mode: {mode!r}") from err
+        if mode not in profile.manual_modes and not (
+            mode is FanMode.AUTO and profile.supports_auto
+        ):
+            raise ProtocolError("Fan mode is unsupported by this model")
         payload: dict[FanMode, tuple[int, int, int]] = {
             FanMode.LOW: (0x01, 0x01, 0x00),
             FanMode.MEDIUM: (0x01, 0x02, 0x00),
@@ -137,6 +144,8 @@ class ProtocolCodec:
             frame.data if isinstance(frame, ApplicationFrame) else validate_frame(frame)
         )
         prefix, command = data[:2]
+        if profile.model in (Model.H7123, Model.H712C) and command in (0x19, 0x1B):
+            return UnknownEvent(data, prefix=prefix, command=command)
 
         if data[:2] == b"\xaa\x01":
             return DeviceStateEvent(
@@ -144,6 +153,18 @@ class ProtocolCodec:
                 power=self._decode_bool(data[2]),
                 status_flags=data[4],
                 volatile_state=data[6],
+            )
+
+        if (
+            data[:2] == b"\xaa\x05"
+            and profile.protocol.startup_mode_strategy == "h7123_direct"
+        ):
+            return FanModeEvent(
+                data,
+                mode=self._decode_fan_mode(data, profile),
+                mode_code=data[2],
+                manual_level=data[3],
+                auto_parameter=data[5],
             )
 
         if data[:2] == b"\xaa\x05":
@@ -223,11 +244,7 @@ class ProtocolCodec:
         if mode_code == 0x03:
             # Only the model's default Auto parameter is documented. Do not
             # collapse unknown Quiet/High-Efficiency variants into it.
-            return (
-                FanMode.AUTO
-                if data[5] == profile.auto_parameter
-                else None
-            )
+            return FanMode.AUTO if data[5] == profile.auto_parameter else None
         return {0x05: FanMode.SLEEP, 0x07: FanMode.TURBO}.get(mode_code)
 
     @staticmethod

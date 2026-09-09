@@ -55,6 +55,13 @@ class GoveePurifierFan(GoveePurifierEntity, FanEntity):
     def __init__(self, entry: GoveeConfigEntry) -> None:
         """Initialize the fan."""
         super().__init__(entry, "fan")
+        self._manual_modes = entry.runtime_data.profile.manual_modes
+        self._attr_speed_count = len(self._manual_modes)
+        self._attr_preset_modes = (
+            ["manual", "auto"]
+            if entry.runtime_data.profile.supports_auto
+            else ["manual"]
+        )
         self._remove_custom_auto_listener: Callable[[], None] | None = None
 
     @override
@@ -90,16 +97,16 @@ class GoveePurifierFan(GoveePurifierEntity, FanEntity):
     def percentage(self) -> int | None:
         """Return the cached manual fan speed."""
         mode = self._state.fan_mode
-        if mode not in _MANUAL_MODES:
+        if mode not in self._manual_modes:
             return None
-        return ordered_list_item_to_percentage(_MANUAL_MODES, mode)
+        return ordered_list_item_to_percentage(self._manual_modes, mode)
 
     @property
     @override
     def preset_mode(self) -> str | None:
         """Return the cached preset mode."""
         mode = self._state.fan_mode
-        if mode in _MANUAL_MODES:
+        if mode in self._manual_modes:
             return _PRESET_MANUAL
         if mode is FanMode.AUTO:
             snapshot = self.coordinator.custom_auto_snapshot
@@ -110,11 +117,13 @@ class GoveePurifierFan(GoveePurifierEntity, FanEntity):
 
     def _fan_mode_for_preset(self, preset_mode: str) -> FanMode:
         """Resolve an entity preset to a documented physical fan mode."""
+        if preset_mode not in self._attr_preset_modes:
+            raise ValueError(f"Unsupported preset mode: {preset_mode}")
         if preset_mode == _PRESET_AUTO:
             return FanMode.AUTO
         if preset_mode == _PRESET_MANUAL:
             mode = self._state.fan_mode
-            return mode if mode in _MANUAL_MODES else FanMode.LOW
+            return mode if mode in self._manual_modes else FanMode.LOW
         raise ValueError(f"Unsupported preset mode: {preset_mode}")
 
     @override
@@ -130,7 +139,7 @@ class GoveePurifierFan(GoveePurifierEntity, FanEntity):
             if percentage == 0:
                 await self.async_turn_off()
                 return
-            mode = percentage_to_ordered_list_item(_MANUAL_MODES, percentage)
+            mode = percentage_to_ordered_list_item(self._manual_modes, percentage)
         elif preset_mode is not None:
             mode = self._fan_mode_for_preset(preset_mode)
 
@@ -148,11 +157,11 @@ class GoveePurifierFan(GoveePurifierEntity, FanEntity):
 
     @override
     async def async_set_percentage(self, percentage: int) -> None:
-        """Set one of the five manual fan levels."""
+        """Set one of the model's supported manual fan levels."""
         if percentage == 0:
             await self.async_turn_off()
             return
-        mode = percentage_to_ordered_list_item(_MANUAL_MODES, percentage)
+        mode = percentage_to_ordered_list_item(self._manual_modes, percentage)
         await self._async_run_operation(
             self.coordinator.async_apply_ha_fan_mode(
                 mode,

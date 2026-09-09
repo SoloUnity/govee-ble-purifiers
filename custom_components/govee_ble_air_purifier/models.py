@@ -13,6 +13,8 @@ from enum import StrEnum
 class Model(StrEnum):
     """Supported purifier model values retained in config entries."""
 
+    H7123 = "H7123"
+    H712C = "H712C"
     H7124 = "H7124"
     H7129 = "H7129"
 

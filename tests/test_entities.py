@@ -11,6 +11,7 @@ from custom_components.govee_ble_air_purifier.const import CONF_MODEL, DOMAIN
 from custom_components.govee_ble_air_purifier.fan import GoveePurifierFan
 from custom_components.govee_ble_air_purifier.light import GoveePurifierLight
 from custom_components.govee_ble_air_purifier.models import FanMode, PurifierState
+from custom_components.govee_ble_air_purifier.profiles import DeviceProfile
 from custom_components.govee_ble_air_purifier.sensor import (
     SENSORS,
     GoveePurifierSensor,
@@ -27,6 +28,7 @@ def _entry_and_coordinator(
     state: PurifierState,
 ) -> tuple[MockConfigEntry, MagicMock]:
     coordinator = MagicMock()
+    coordinator.profile = DeviceProfile.for_model("H7129")
     coordinator.data = state
     coordinator.last_update_success = True
     coordinator.client_available = True
@@ -404,3 +406,43 @@ async def test_switch_setup_adds_one_only_when_controller_exists() -> None:
     entities = add_entities.call_args.args[0]
     assert len(entities) == 1
     assert isinstance(entities[0], GoveePurifierCustomAutoSwitch)
+
+
+@pytest.mark.parametrize(
+    ("model", "mode", "percentage"),
+    [
+        ("H7123", FanMode.SLEEP, 25),
+        ("H7123", FanMode.LOW, 50),
+        ("H7123", FanMode.MEDIUM, 75),
+        ("H7123", FanMode.HIGH, 100),
+        ("H712C", FanMode.SLEEP, 20),
+        ("H712C", FanMode.LOW, 40),
+        ("H712C", FanMode.MEDIUM, 60),
+        ("H712C", FanMode.HIGH, 80),
+        ("H712C", FanMode.TURBO, 100),
+    ],
+)
+async def test_added_model_entity_speed_read_and_write(model, mode, percentage):
+    """Device-specific percentages round-trip through cached state and commands."""
+    entry, coordinator = _entry_and_coordinator(
+        PurifierState(power=True, fan_mode=mode)
+    )
+    coordinator.profile = DeviceProfile.for_model(model)
+    fan = GoveePurifierFan(entry)
+    assert fan.percentage == percentage
+    assert fan.preset_mode == "manual"
+    assert fan.speed_count == (4 if model == "H7123" else 5)
+    assert fan.preset_modes == (
+        ["manual", "auto"] if model == "H7123" else ["manual"]
+    )
+    await fan.async_set_percentage(percentage)
+    coordinator.async_apply_ha_fan_mode.assert_awaited_once_with(mode, power_on=False)
+
+
+async def test_h712c_rejects_auto_before_coordinator_call():
+    entry, coordinator = _entry_and_coordinator(PurifierState(power=True))
+    coordinator.profile = DeviceProfile.for_model("H712C")
+    fan = GoveePurifierFan(entry)
+    with pytest.raises(ValueError, match="Unsupported preset"):
+        await fan.async_set_preset_mode("auto")
+    coordinator.async_apply_ha_fan_mode.assert_not_awaited()

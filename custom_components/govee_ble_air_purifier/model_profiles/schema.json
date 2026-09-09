@@ -8,9 +8,9 @@
       "type": "object",
       "properties": {
         "manufacturer": {"type": "string", "minLength": 1},
-        "model": {"type": ["string", "null"], "enum": ["H7124", "H7129", null]},
+        "model": {"type": ["string", "null"], "enum": ["H7123", "H712C", "H7124", "H7129", null]},
         "display_name": {"type": "string", "minLength": 1},
-        "support_status": {"enum": ["baseline", "verified"]},
+        "support_status": {"enum": ["baseline", "verified", "experimental"]},
         "advertised_name_prefixes": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
       },
       "additionalProperties": false
@@ -95,7 +95,7 @@
         "checksum": {"const": "xor_0_18"},
         "frame_size": {"const": 20},
         "auto_parameter": {"type": "integer", "minimum": 0, "maximum": 255},
-        "startup_mode_strategy": {"enum": ["h7124_selector_00", "h7129_selector_pair"]},
+        "startup_mode_strategy": {"enum": ["h7124_selector_00", "h7129_selector_pair", "h7123_direct"]},
         "commands": {"$ref": "#/$defs/commands"},
         "request_catalog": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/request"}},
         "initialization_order": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
@@ -194,7 +194,7 @@
       "type": "object",
       "properties": {
         "schema_version": {"const": 1},
-        "profile_id": {"enum": ["h7124", "h7129"]},
+        "profile_id": {"enum": ["h7123", "h712c", "h7124", "h7129"]},
         "extends": {"enum": ["default", "default-encrypted"]},
         "identity": {"$ref": "#/$defs/identity"},
         "bluetooth": {"$ref": "#/$defs/bluetooth"},

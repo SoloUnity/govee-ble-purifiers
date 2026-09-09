@@ -1,7 +1,8 @@
 # Govee BLE Air Purifier
 
 A Home Assistant custom integration for private, local Bluetooth control of
-Govee H7124 and H7129 air purifiers. No Govee cloud account or user-entered
+Govee H7124/H7129 air purifiers, with experimental H712C/H7123 support.
+No Govee cloud account or user-entered
 Bluetooth address is required.
 
 The integration follows the captured Govee protocol closely while adding
@@ -14,6 +15,8 @@ restarts, and devices temporarily connected to the Govee app.
 | --- | --- | --- |
 | Govee H7124 | `GVH7124*` | Plaintext 20-byte frames |
 | Govee H7129 | `ihoment_H7129_*` | Fresh encrypted session for every BLE connection |
+| Govee H712C (experimental) | `GVH712C*` | Plaintext; power and five manual fan levels |
+| Govee H7123 (experimental) | `ihoment_H7123_*` | Fresh encrypted session; power, four manual levels and Auto |
 
 `*` means any sequence of characters. The advertised name determines the model;
 the Bluetooth address is used only as the stable device identity. The integration
@@ -21,17 +24,22 @@ does not guess a model from an address prefix.
 
 Other Govee models are not currently supported.
 
+H712C power and fan control were tested on two units. H7123 command/readback
+tests passed, but intermittent disconnects remain unresolved. See the
+[dated evidence and limitations](docs/h7123-h712c-evidence.md). These additions
+are development work based on upstream 0.3.26, not an upstream release.
+
 These identities and their runtime behavior come from validated profiles
-bundled with the integration. H7124 resolves through `h7124 -> default`; H7129
-resolves through `h7129 -> default-encrypted`. The complete baselines have no
+bundled with the integration. H7124 and H712C extend `default`; H7129 and H7123 extend `default-encrypted`. The complete baselines have no
 discoverable names and do not make an unknown purifier supported. Profiles are
 not user-editable configuration and are loaded only from the installed
 integration.
 
 ## Home Assistant entities
 
-Each configured purifier creates four core entities. Opting in to Custom Auto
-adds one switch:
+H7124/H7129 create four core entities. Opting in to Custom Auto adds one
+switch. H712C/H7123 expose only the fan (including power); unverified light,
+PM2.5 and filter-life entities are omitted and Custom Auto is unavailable:
 
 | Entity | Capabilities |
 | --- | --- |
@@ -45,8 +53,9 @@ Entities use the integration's cached push state and do not independently poll
 Bluetooth. Physical controls update Home Assistant when the purifier sends the
 corresponding notification.
 
-The fan exposes the purifier's physical modes through this Home Assistant UI
-mapping:
+H7124/H7129 expose the following physical modes. H712C uses the same manual
+percentages but has no Auto. H7123 uses Sleep/Low/Medium/High at
+25/50/75/100%, plus Auto, with no Turbo:
 
 | Physical mode | Percentage | Preset |
 | --- | ---: | --- |
@@ -642,7 +651,15 @@ dependencies.
 
 ### Local development
 
-Create a Python environment with the project dependencies, then run:
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the pinned Python 3.14 / Home
+Assistant 2026.9.0 environment and complete test suite. To install it:
+
+```bash
+python3.14 -m venv .venv
+.venv/bin/python -m pip install --require-hashes -r requirements-dev.txt
+```
+
+Then run:
 
 ```bash
 env PYTHONPATH=. .venv/bin/ruff check .
@@ -687,3 +704,6 @@ decoded ATT operation, and raw bytes.
 - [License](LICENSE)
 
 Release documentation reflects integration version 0.3.26.
+
+See the [security review](docs/security-review.md) for hardening changes,
+dependency advisories and Bluetooth protocol limitations.

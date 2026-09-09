@@ -12,6 +12,8 @@ config entry, URL, or user-provided path.
 | --- | --- | --- | --- |
 | `h7124` | `default` | `GVH7124` | Plaintext |
 | `h7129` | `default-encrypted` | `ihoment_H7129_` | Fresh H7129 session per connection |
+| `h712c` (experimental) | `default` | `GVH712C` | Plaintext |
+| `h7123` (experimental) | `default-encrypted` | `ihoment_H7123_` | Fresh encrypted session per connection |
 
 The two baselines are complete so exact profiles can contain small reviewed
 overrides. They have no model or advertised-name prefixes and can never be
@@ -41,7 +43,7 @@ session material, captures, or filesystem paths.
 
 ## Loading, inheritance, and selection
 
-Setup loads `schema.json` and all four profiles as one unit off the Home
+Setup loads `schema.json` and all six profiles as one unit off the Home
 Assistant event loop. It rejects duplicate JSON keys, validates the source
 envelopes, resolves inheritance, validates every complete effective profile,
 then publishes one immutable process-cached registry behind a lock. Runtime
@@ -51,7 +53,9 @@ raw dictionaries or reload files per connection.
 Only these parent relationships are accepted:
 
 - `h7124` extends `default`;
-- `h7129` extends `default-encrypted`.
+- `h7129` extends `default-encrypted`;
+- `h712c` extends `default`;
+- `h7123` extends `default-encrypted`.
 
 Objects merge recursively. Scalars replace parent values, and arrays replace
 the entire parent array. Multiple inheritance, derived-to-derived inheritance,
@@ -61,7 +65,7 @@ File name, `profile_id`, schema version, and parent must agree.
 Discovery matches only exact profiles' declared name prefixes. Matching is
 case-insensitive, and overlapping prefixes are rejected when the registry
 loads. Nameless advertisements and near misses do not select a model. Existing
-entries resolve their stored `H7124` or `H7129` value to the corresponding exact
+entries resolve their stored exact model value to the corresponding exact
 profile without migrating or rewriting entry data.
 
 There is deliberately no fallback after an artifact or exact-selection error.
@@ -142,3 +146,16 @@ The existing ownership, inheritance, exact-selection, and fail-closed rules are
 unchanged. In particular, mutable per-entry values live only in options; entry
 data continues to contain identity, and neither a baseline nor a malformed
 artifact can be used as a runtime fallback.
+
+## Experimental model differences
+
+H712C uses registered `fan_mode_33_v1` commands, five manual levels and no Auto.
+H7123 uses `h7123_direct` startup reports, four manual levels and Auto parameter
+`14`. Their exact identities are closed in the schema and registry; neither is
+a fallback for unknown traffic. Both disable unverified light, PM2.5 and filter
+capabilities and omit Custom Auto setup.
+
+See [runtime evidence and limitations](h7123-h712c-evidence.md). The strict
+acknowledgement rules and sole periodic `aa 01` query remain unchanged.
+The client now bounds notification buffering and the registry rejects identity/
+channel mismatches; see the [security review](security-review.md).

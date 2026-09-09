@@ -83,6 +83,9 @@
       "invalid_custom_auto_settings": "The Custom Auto settings are invalid.",
       "custom_auto_handoff_failed": "Could not return the purifier to its built-in Auto mode. The saved settings were not changed. Make sure the purifier is available and try again.",
       "stored_options_invalid": "The saved Custom Auto settings are invalid. Disable Custom Auto or enable it and save a complete replacement configuration."
+    },
+    "abort": {
+      "custom_auto_not_supported": "Custom Auto requires a verified PM2.5 sensor and is not supported on this model."
     }
   },
   "entity": {

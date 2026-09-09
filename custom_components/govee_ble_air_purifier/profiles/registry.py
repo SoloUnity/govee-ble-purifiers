@@ -10,7 +10,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, cast
 
-from ..models import Model
+from ..models import Model, SecurityMode
 from .artifacts import EXACT_PROFILE_PARENTS, ROOT_PROFILE_IDS, load_effective_documents
 from .errors import ProfileError, ProfileSelectionError
 from .parsing import parse_profile
@@ -25,7 +25,12 @@ class ProfileRegistry:
 
     def for_model(self, model: Model | str) -> DeviceProfile:
         """Resolve an existing config-entry model to its exact profile."""
-        selected = {Model.H7124: "h7124", Model.H7129: "h7129"}[Model(model)]
+        selected = {
+            Model.H7123: "h7123",
+            Model.H712C: "h712c",
+            Model.H7124: "h7124",
+            Model.H7129: "h7129",
+        }[Model(model)]
         try:
             return self.profiles[selected]
         except KeyError as err:
@@ -84,6 +89,17 @@ def load_profile_registry(directory: Path | None = None) -> ProfileRegistry:
             or not profile.identity.advertised_name_prefixes
         ):
             raise ProfileError(f"exact profile {profile_id!r} lacks model identity")
+        if profile.model.value.casefold() != profile_id:
+            raise ProfileError(
+                f"exact profile {profile_id!r} has mismatched model identity"
+            )
+        expected_security = (
+            SecurityMode.PLAINTEXT
+            if EXACT_PROFILE_PARENTS[profile_id] == "default"
+            else SecurityMode.H7129_SESSION
+        )
+        if profile.security is not expected_security:
+            raise ProfileError(f"exact profile {profile_id!r} has incompatible channel")
         for prefix in profile.identity.advertised_name_prefixes:
             folded = prefix.casefold()
             for existing, owner in prefixes.items():

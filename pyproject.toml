@@ -9,3 +9,7 @@ line-length = 88
 
 [tool.ruff.lint]
 select = ["B", "E", "F", "I", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# Existing public enum behavior is outside the model-support change.
+"custom_components/govee_ble_air_purifier/client.py" = ["UP042"]
